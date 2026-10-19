@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Optional
 
 import gi
@@ -12,11 +13,14 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gtk
 
 from . import APP_ID, NAME
+from . import clipboard
 from .account import Account
 
 CSS = """
 headerbar.natter-header { min-height: 38px; padding-top: 0; padding-bottom: 0; }
 headerbar.natter-header button { min-height: 28px; min-width: 28px; padding: 2px 6px; }
+.natter-drop { background: alpha(@accent_bg_color, 0.18); border: 3px dashed @accent_color; border-radius: 12px;
+               margin: 10px; color: @accent_color; }
 """
 
 
@@ -26,6 +30,14 @@ class AccountPage(Gtk.Overlay):
     def __init__(self, account: Account) -> None:
         super().__init__(child=account.view)
         self.account = account
+        # Where dragged files will go, while they're over the window.
+        self.drop_hint = Gtk.Label(css_classes=["title-2"], wrap=True, justify=Gtk.Justification.CENTER)
+        hint = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, halign=Gtk.Align.CENTER,
+                       valign=Gtk.Align.CENTER)
+        hint.append(Gtk.Image(icon_name="document-send-symbolic", pixel_size=64))
+        hint.append(self.drop_hint)
+        self.drop_zone = Adw.Bin(child=hint, css_classes=["natter-drop"], visible=False, can_target=False)
+        self.add_overlay(self.drop_zone)
         retry = Gtk.Button(label="Try Again", halign=Gtk.Align.CENTER, css_classes=["pill", "suggested-action"])
         retry.connect("clicked", lambda *_: account.reload())
         self.notice = Adw.StatusPage(icon_name="network-offline-symbolic", title="Can't Reach WhatsApp",
@@ -87,6 +99,7 @@ class Window(Adw.ApplicationWindow):
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         self._actions()
+        self._drops()
         self.connect("close-request", self._on_close)
         self.connect("notify::is-active", lambda *_: app.on_focus_changed(self.is_active()))
         for account in app.accounts:
@@ -116,6 +129,11 @@ class Window(Adw.ApplicationWindow):
 
     def _show_switcher(self) -> None:
         self.header.set_title_widget(self.switcher if len(self.pages) > 1 else self.title)
+
+    def focus_in_page(self) -> bool:
+        """Whether typing goes to the WhatsApp page (and not, say, an open dialog)."""
+        account, focus = self.account, self.get_focus()
+        return bool(account and focus and (focus is account.view or focus.is_ancestor(account.view)))
 
     @property
     def account(self) -> Optional[Account]:
@@ -174,7 +192,48 @@ class Window(Adw.ApplicationWindow):
             if target is not None:
                 shortcut.set_arguments(target)
             keys.add_shortcut(shortcut)
+        # Pictures and files on the clipboard; text falls through to WebKit's own paste.
+        keys.add_shortcut(Gtk.Shortcut(trigger=Gtk.ShortcutTrigger.parse_string("<Control>v|<Shift>Insert"),
+                                       action=Gtk.CallbackAction.new(lambda *_: self.app.paste())))
         self.add_controller(keys)
+
+    def _drops(self) -> None:
+        """Files and pictures dropped on the chat go through Natter, not WebKit: WhatsApp's page
+        runs sandboxed and can't read files from your folders, but Natter can hand them over."""
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.set_gtypes([Gdk.FileList, Gdk.Texture])
+        drop.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        drop.connect("enter", self._drag_enter)
+        drop.connect("leave", lambda *_: self._drag_hint(False))
+        drop.connect("drop", self._on_drop)
+        self.stack.add_controller(drop)
+
+    def _drag_enter(self, _target, _x, _y) -> Gdk.DragAction:
+        self._drag_hint(True)
+        return Gdk.DragAction.COPY
+
+    def _drag_hint(self, on: bool) -> None:
+        page = self.stack.get_visible_child()
+        if not isinstance(page, AccountPage):
+            return
+        chat = page.account.active_chat
+        page.drop_hint.set_label(f"Drop to send to {chat}" if chat else "Drop, then choose a chat")
+        page.drop_zone.set_visible(on)
+
+    def _on_drop(self, _target, value, _x, _y) -> bool:
+        self._drag_hint(False)
+        if isinstance(value, Gdk.FileList):
+            paths = [Path(f.get_path()) for f in value.get_files() if f.get_path()]
+            paths = [p for p in paths if p.is_file()]
+        elif isinstance(value, Gdk.Texture):
+            paths = [clipboard.save_picture(value, "Dropped image")]
+        else:
+            paths = []
+        if not paths:
+            self.toast("Only files can be dropped here (not folders)")
+            return False
+        self.app.send_files(paths)
+        return True
 
     def _switch_account(self, _action, param: GLib.Variant) -> None:
         index = param.get_int32()
@@ -215,14 +274,27 @@ class Window(Adw.ApplicationWindow):
     # ---- For checking how it looks ---------------------------------------------------------
 
     def save_snapshot(self, path: str) -> None:
-        paintable = Gtk.WidgetPaintable.new(self)
-        width, height = self.get_width(), self.get_height()
-        snapshot = Gtk.Snapshot()
-        paintable.snapshot(snapshot, width, height)
-        node = snapshot.to_node()
-        if node is None:
-            print("natter: nothing to snapshot yet")
-            return
-        texture = self.get_renderer().render_texture(node, Graphene.Rect().init(0, 0, width, height))
-        texture.save_to_png(path)
-        print(f"natter: saved {path}")
+        """Save the window's contents as a PNG. A widget paintable fills in on the next frame."""
+        content = self.get_content()  # a toplevel has no render node of its own
+        paintable = Gtk.WidgetPaintable.new(content)
+        content.queue_draw()
+
+        def save() -> bool:
+            width, height = content.get_width(), content.get_height()
+            snapshot = Gtk.Snapshot()
+            # The window paints the background behind the header bar; the content doesn't.
+            dark = Adw.StyleManager.get_default().get_dark()
+            background = Gdk.RGBA()
+            background.parse("#222226" if dark else "#fafafb")
+            snapshot.append_color(background, Graphene.Rect().init(0, 0, width, height))
+            paintable.snapshot(snapshot, width, height)
+            node = snapshot.to_node()
+            if node is None:
+                print("natter: nothing to snapshot yet")
+                return GLib.SOURCE_REMOVE
+            texture = self.get_renderer().render_texture(node, Graphene.Rect().init(0, 0, width, height))
+            texture.save_to_png(path)
+            print(f"natter: saved {path}")
+            return GLib.SOURCE_REMOVE
+
+        GLib.timeout_add(250, save)

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import base64
 import json
-import secrets
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -13,8 +13,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("WebKit", "6.0")
-gi.require_version("Soup", "3.0")
-from gi.repository import Gio, GLib, GObject, Gtk, Soup, WebKit
+from gi.repository import Gio, GLib, GObject, Gtk, WebKit
 
 from . import WHATSAPP_URL
 from .links import chat_link, is_whatsapp, unread_in
@@ -24,12 +23,37 @@ HERE = Path(__file__).resolve().parent
 BRIDGE = (HERE / "bridge.js").read_text()
 STYLE = (HERE / "style.css").read_text()
 WHATSAPP_PAGES = ["https://web.whatsapp.com/*"]
-SCHEME = "natter"
+CHUNK = 4 * 1024 * 1024  # bytes per call when handing a file to the page
+LARGEST = 256 * 1024 * 1024  # bigger than this: drag it into the window instead
 
-# WhatsApp Web checks the browser. WebKitGTK's own user agent says "Linux", which WhatsApp
-# treats as an unsupported Safari; this one is the Safari that WebKitGTK actually matches.
-USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-              "(KHTML, like Gecko) Version/26.0 Safari/605.1.15")
+# No user agent of Natter's own: WebKitGTK's site-specific quirks already present WhatsApp
+# Web with desktop Safari, and WebKit keeps that quirk current.
+
+
+# WebKit features Natter turns off: it only ever shows one site, so it has no pages to go
+# back to and nothing to swap processes for. (WhatsApp's cross-origin isolation headers still
+# make WebKit start a fresh process for it, leaving the first, blank one idle: ~100 MB of
+# cold memory that the background reclaim hands back.)
+FEATURES_OFF = ("ProcessSwapOnCrossSiteNavigation", "UsesBackForwardCache", "SpeechRecognition",
+                # WhatsApp's service worker passes every download through itself, and in WebKitGTK
+                # some arrive damaged: emoji sprite sheets drew as slivers, blanks and magnified
+                # squares. Without it they draw whole; it's only there for offline caching.
+                "ServiceWorkers")
+
+
+# NATTER_FEATURES_ON / NATTER_FEATURES_OFF (comma-separated identifiers) are for experiments.
+FEATURES_ON = tuple(f for f in (GLib.getenv("NATTER_FEATURES_ON") or "").split(",") if f)
+FEATURES_OFF = FEATURES_OFF + tuple(f for f in (GLib.getenv("NATTER_FEATURES_OFF") or "").split(",") if f)
+
+
+def _features(settings: WebKit.Settings, off=FEATURES_OFF, on=FEATURES_ON) -> None:
+    features = WebKit.Settings.get_all_features()
+    for i in range(features.get_length()):
+        feature = features.get(i)
+        if feature.get_identifier() in off:
+            settings.set_feature_enabled(feature, False)
+        elif feature.get_identifier() in on:
+            settings.set_feature_enabled(feature, True)
 
 
 def _set(settings: WebKit.Settings, **values) -> None:
@@ -37,39 +61,6 @@ def _set(settings: WebKit.Settings, **values) -> None:
     for name, value in values.items():
         if settings.find_property(name.replace("_", "-")) is not None:
             settings.set_property(name.replace("_", "-"), value)
-
-
-class Files:
-    """Local files offered to the page as natter://<token>/<name>, and nothing else."""
-
-    def __init__(self) -> None:
-        self.offered: dict[str, tuple[Path, float]] = {}
-
-    def offer(self, path: Path) -> str:
-        token = secrets.token_urlsafe(16)
-        self.offered[token] = (path, time.time() + 600)
-        return f"{SCHEME}://{token}/{GLib.uri_escape_string(path.name, None, False)}"
-
-    def serve(self, request: WebKit.URISchemeRequest) -> None:
-        token = urlparse(request.get_uri()).netloc
-        path, until = self.offered.get(token, (None, 0))
-        if path is None or until < time.time():
-            request.finish_error(GLib.Error.new_literal(Gio.io_error_quark(), "Not offered", Gio.IOErrorEnum.NOT_FOUND))
-            return
-        try:
-            gfile = Gio.File.new_for_path(str(path))
-            stream = gfile.read(None)
-            size = gfile.query_info("standard::size,standard::content-type", 0, None)
-        except GLib.Error as error:
-            request.finish_error(error)
-            return
-        kind = Gio.content_type_get_mime_type(size.get_content_type() or "") or "application/octet-stream"
-        response = WebKit.URISchemeResponse.new(stream, size.get_size())
-        response.set_content_type(kind)
-        headers = Soup.MessageHeaders.new(Soup.MessageHeadersType.RESPONSE)
-        headers.append("Access-Control-Allow-Origin", "https://web.whatsapp.com")
-        response.set_http_headers(headers)
-        request.finish_with_response(response)
 
 
 class Account(GObject.Object):
@@ -119,7 +110,7 @@ class Account(GObject.Object):
 
         settings = WebKit.Settings()
         _set(settings,
-             user_agent=USER_AGENT,
+             enable_site_specific_quirks=True,
              enable_developer_extras=bool(GLib.getenv("NATTER_DEBUG")),
              enable_media_stream=True,
              enable_webrtc=True,
@@ -134,6 +125,7 @@ class Account(GObject.Object):
              javascript_can_access_clipboard=True,
              javascript_can_open_windows_automatically=False,
              media_playback_requires_user_gesture=False)
+        _features(settings)
 
         self.view = WebKit.WebView(
             web_context=app.web_context,
@@ -215,13 +207,44 @@ class Account(GObject.Object):
         return True
 
     def attach(self, paths: list[Path], done: Optional[Callable[[bool], None]] = None) -> None:
+        """Put files in the open chat, which brings up WhatsApp's preview with a caption box.
+
+        WhatsApp's Content-Security-Policy keeps the page from fetching local files, so they go
+        in through Natter's own calls, CHUNK bytes at a time, base64-encoded.
+        """
+        finish = (lambda ok: done(bool(ok))) if done else (lambda ok: None)
         items = []
-        for path in paths:
+        for n, path in enumerate(paths):
+            try:
+                if path.stat().st_size > LARGEST:
+                    finish(False)
+                    return
+            except OSError:
+                finish(False)
+                return
             kind = Gio.content_type_guess(str(path), None)[0]
-            items.append({"url": self.app.files.offer(path), "name": path.name,
-                          "type": Gio.content_type_get_mime_type(kind) or ""})
-        self.run("return window.__natter ? await window.__natter.attach(items) : false",
-                 {"items": items}, lambda ok: done(bool(ok)) if done else None)
+            items.append({"id": f"{time.monotonic_ns()}-{n}", "name": path.name,
+                          "type": Gio.content_type_get_mime_type(kind) or "application/octet-stream"})
+
+        def pieces():
+            for item, path in zip(items, paths):
+                with open(path, "rb") as handle:
+                    while data := handle.read(CHUNK):
+                        yield item["id"], base64.b64encode(data).decode("ascii")
+
+        stream = pieces()
+
+        def step(_result=None) -> None:
+            try:
+                piece = next(stream)
+            except (StopIteration, OSError):
+                self.run("return window.__natter ? await window.__natter.attach(items) : false",
+                         {"items": items}, finish)
+                return
+            self.run("return window.__natter ? window.__natter.receive(id, chunk) : false",
+                     {"id": piece[0], "chunk": piece[1]}, step)
+
+        step()
 
     def set_class(self, name: str, on: bool) -> None:
         self.run("if (window.__natter) window.__natter.setClass(name, on)", {"name": name, "on": on})

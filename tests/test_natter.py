@@ -156,5 +156,44 @@ class DockMenuTest(unittest.TestCase):
         self.assertEqual(without_chat_actions(result).count("[Desktop Action"), 1)
 
 
+class SystemTest(unittest.TestCase):
+    def test_scope_detection(self):
+        from natter.system import in_own_scope, scope_name
+
+        base = Path("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice")
+        self.assertTrue(in_own_scope(base / "app-ada-io.natter.Natter-4242.scope"))  # Ada's launcher
+        self.assertTrue(in_own_scope(base / scope_name(4242)))  # our own
+        self.assertFalse(in_own_scope(base / "app-ada-com.anthropic.Claude-9571.scope"))  # started from Claude
+        self.assertFalse(in_own_scope(base / "vte-spawn-1234.scope"))  # a terminal
+        self.assertEqual(scope_name(7), "app-io.natter.Natter-7.scope")
+
+
+class ClipboardTest(unittest.TestCase):
+    def test_what_natter_pastes(self):
+        import gi
+
+        gi.require_version("Gdk", "4.0")
+        from gi.repository import Gdk
+
+        from natter.clipboard import has_pastable
+
+        def formats(*types):
+            return Gdk.ContentFormats.new(list(types))
+
+        self.assertEqual(has_pastable(formats("image/png")), "image")
+        self.assertEqual(has_pastable(formats("text/html", "image/png")), "image")  # an image copied from a browser
+        self.assertEqual(has_pastable(formats("x-special/gnome-copied-files", "text/uri-list", "text/plain")), "files")
+        self.assertIsNone(has_pastable(formats("text/plain", "text/plain;charset=utf-8")))
+        self.assertIsNone(has_pastable(formats("text/html", "text/plain")))
+
+
+class SearchTest(unittest.TestCase):
+    def test_ids_round_trip(self):
+        from natter.search import result_id, split_id
+
+        self.assertEqual(split_id(result_id("main", "Mum / Dad")), ("main", "Mum / Dad"))
+        self.assertEqual(split_id("account-2/Work"), ("account-2", "Work"))
+
+
 if __name__ == "__main__":
     unittest.main()

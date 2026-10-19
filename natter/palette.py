@@ -30,7 +30,7 @@ class Entry:
 
 
 class Palette(Adw.Dialog):
-    def __init__(self, app, files: Optional[list[Path]] = None) -> None:
+    def __init__(self, app, files: Optional[list[Path]] = None, query: str = "") -> None:
         self.app = app
         self.files = files or []
         if self.files:
@@ -69,6 +69,9 @@ class Palette(Adw.Dialog):
         keys.connect("key-pressed", self._on_key)
         self.entry.add_controller(keys)
         self.set_focus(self.entry)
+        if query:
+            self.entry.set_text(query)
+            self.entry.set_position(-1)
         self.refresh()
 
     # ---- What's listed ---------------------------------------------------------------------

@@ -23,6 +23,9 @@ def main() -> int:
         print(f"Natter needs GTK 4, libadwaita and WebKitGTK 6.0 for Python ({error}):", file=sys.stderr)
         print("  sudo apt-get install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-webkit-6.0", file=sys.stderr)
         return 1
+    from gi.repository import GLib
+
+    GLib.set_prgname("natter")
     from .app import main as run
 
     return run(sys.argv)

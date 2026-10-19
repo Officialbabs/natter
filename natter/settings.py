@@ -43,6 +43,7 @@ def _locale_language() -> str:
 DEFAULTS: dict[str, Any] = {
     "accounts": [{"id": "main", "name": "Personal"}],
     "run_in_background": True,
+    "light_background": True,
     "start_at_login": False,
     "tray_icon": True,
     "notifications": True,
@@ -55,6 +56,7 @@ DEFAULTS: dict[str, Any] = {
     "privacy_blur": False,
     "blur_when_away": False,
     "dock_recent_chats": True,
+    "search_provider": True,
     "spellcheck": True,
     "spell_languages": [_locale_language()],
     "download_dir": "",

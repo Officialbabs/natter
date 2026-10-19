@@ -82,6 +82,82 @@
     return true;
   }
 
+  // ---- Idle audio ---------------------------------------------------------------------------
+  // WhatsApp keeps a Web Audio context open. In WebKitGTK an open context keeps a GStreamer
+  // pipeline running, a few percent of CPU all day, so Natter suspends each context once
+  // nothing has played through it for a few seconds, and resumes it before anything plays.
+
+  const contexts = new Set();
+  let playing = 0;
+  let streams = 0;
+  const IDLE_MS = 30000;  // long enough that a burst of message sounds doesn't cycle the pipeline
+
+  function wake(context) {
+    if (context && context.state === "suspended") context.resume().catch(() => {});
+  }
+
+  function mediaPlaying() {
+    return [...document.querySelectorAll("audio, video")].some((m) => !m.paused && !m.ended);
+  }
+
+  function rest() {
+    if (playing > 0 || streams > 0 || mediaPlaying()) return;
+    contexts.forEach((context) => {
+      if (context.state === "running") context.suspend().catch(() => {});
+    });
+  }
+
+  const Context = window.AudioContext || window.webkitAudioContext;
+  if (Context) {
+    const Tracked = class extends Context {
+      constructor(...args) {
+        super(...args);
+        contexts.add(this);
+        this.addEventListener("statechange", () => { if (this.state === "closed") contexts.delete(this); });
+      }
+      createMediaStreamSource(stream) {
+        // The microphone (voice notes, calls): stay awake while its tracks are live.
+        streams++;
+        stream.getTracks().forEach((track) => track.addEventListener("ended", () => { streams = Math.max(0, streams - 1); }, { once: true }));
+        wake(this);
+        return super.createMediaStreamSource(stream);
+      }
+      createMediaElementSource(element) {
+        wake(this);
+        element.addEventListener("play", () => wake(this));
+        return super.createMediaElementSource(element);
+      }
+    };
+    window.AudioContext = Tracked;
+    if (window.webkitAudioContext) window.webkitAudioContext = Tracked;
+
+    // AudioBufferSourceNode has a start() of its own in some engines, so each kind is patched.
+    for (const Node of [window.AudioScheduledSourceNode, window.AudioBufferSourceNode,
+                        window.OscillatorNode, window.ConstantSourceNode]) {
+      if (!Node || !Object.prototype.hasOwnProperty.call(Node.prototype, "start")) continue;
+      const start = Node.prototype.start;
+      Node.prototype.start = function (...args) {
+        if (!this.__natterCounted) {
+          this.__natterCounted = true;
+          playing++;
+          this.addEventListener("ended", () => { playing = Math.max(0, playing - 1); }, { once: true });
+        }
+        wake(this.context);
+        return start.apply(this, args);
+      };
+    }
+    const play = HTMLMediaElement.prototype.play;
+    HTMLMediaElement.prototype.play = function (...args) {
+      contexts.forEach(wake);
+      return play.apply(this, args);
+    };
+    setInterval(rest, IDLE_MS);
+  }
+
+  function audio() {
+    return { contexts: [...contexts].map((c) => c.state), playing, streams, media: mediaPlaying() };
+  }
+
   // ---- The chat list ------------------------------------------------------------------------
   // WhatsApp only keeps the visible rows in the page. Each row's position comes from its
   // translateY (or aria-rowindex), so Natter can tell how recent the chat is.
@@ -117,11 +193,22 @@
     return rows.sort((a, b) => a[1] - b[1]);
   }
 
+  // Text with WhatsApp's emoji pictures put back as the characters they stand for.
+  function textOf(element) {
+    return [...element.childNodes].map((node) => {
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+      if (node.tagName === "IMG") return node.getAttribute("alt") || "";
+      return node.nodeType === Node.ELEMENT_NODE ? textOf(node) : "";
+    }).join("");
+  }
+
   function activeChat() {
     const header = document.querySelector("#main header");
     if (!header) return "";
-    const span = header.querySelector("span[title]") || header.querySelector('span[dir="auto"]');
-    return span ? (span.getAttribute("title") || span.textContent || "").trim() : "";
+    const title = header.querySelector('[data-testid="conversation-info-header-chat-title"]')
+      || header.querySelector("span[title]") || header.querySelector('span[dir="auto"]');
+    if (!title) return "";
+    return (title.getAttribute("title") || textOf(title)).replace(/\s+/g, " ").trim();
   }
 
   let lastRows = "";
@@ -240,46 +327,76 @@
   }
 
   // ---- Attaching files ----------------------------------------------------------------------
-  // Natter hands over natter:// links it made for the chosen files; they're dropped on the open
-  // chat as if dragged there, which brings up WhatsApp's own preview with a caption box.
+  // WhatsApp's Content-Security-Policy won't let the page fetch anything Natter could serve, so
+  // Natter hands files over itself, a few MB per call, and they're put back together here.
+  // Then they're pasted into the message box, which brings up WhatsApp's own preview with a
+  // caption box, whether they came from Ctrl+V, a drop, the dock or Send To.
+
+  const incoming = new Map();
+
+  // Files dragged in from outside are dropped through Natter, so the page doesn't see that
+  // drag: WebKit would show WhatsApp a drag of "Files" it can't read, WhatsApp would put up its
+  // drop zone for a drop that never comes, and then ignore the files Natter hands over.
+  for (const type of ["dragenter", "dragover", "dragleave", "drop"]) {
+    window.addEventListener(type, (event) => {
+      if (event.isTrusted && event.dataTransfer && [...event.dataTransfer.types].includes("Files")) {
+        event.stopImmediatePropagation();
+        if (type === "dragover") event.preventDefault();  // "a drop is welcome here"
+      }
+    }, true);
+  }
+
+  function fromBase64(text) {
+    if (Uint8Array.fromBase64) return Uint8Array.fromBase64(text);
+    const raw = atob(text);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    return bytes;
+  }
+
+  function receive(id, chunk) {
+    if (!incoming.has(id)) incoming.set(id, []);
+    incoming.get(id).push(fromBase64(chunk));
+    return true;
+  }
+
+  function pasteInto(composer, transfer) {
+    composer.focus();
+    return composer.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: transfer }));
+  }
 
   async function attach(items) {
-    const main = document.querySelector("#main");
-    if (!main) return false;
-    const files = [];
-    for (const item of items) {
-      const blob = await (await fetch(item.url)).blob();
-      files.push(new File([blob], item.name, { type: item.type || blob.type }));
-    }
+    const files = items.map((item) => new File(incoming.get(item.id) || [], item.name, { type: item.type }));
+    items.forEach((item) => incoming.delete(item.id));
+    const message = document.querySelector('#main footer [contenteditable="true"]');
+    if (!message) return false;
     const transfer = new DataTransfer();
     files.forEach((file) => transfer.items.add(file));
-    const box = main.getBoundingClientRect();
-    const at = { bubbles: true, cancelable: true, dataTransfer: transfer,
-                 clientX: box.left + box.width / 2, clientY: box.top + box.height / 2 };
-    main.dispatchEvent(new DragEvent("dragenter", at));
-    main.dispatchEvent(new DragEvent("dragover", at));
-    await sleep(250);
-    const zone = document.elementFromPoint(at.clientX, at.clientY) || main;
-    zone.dispatchEvent(new DragEvent("dragenter", at));
-    zone.dispatchEvent(new DragEvent("dragover", at));
-    zone.dispatchEvent(new DragEvent("drop", at));
-    await sleep(600);
-    if (document.querySelector('#app [role="dialog"], #app span[data-icon="send"], #app [data-icon="wds-ic-send-filled"]')) return true;
-    // No preview came up: paste them into the message box instead, which WhatsApp also takes.
-    const composer = document.querySelector('#main footer [contenteditable="true"]');
-    if (!composer) return false;
-    composer.focus();
-    composer.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: transfer }));
-    return true;
+    // Pasted into the message box, WhatsApp opens its preview. (A drop made by a script it
+    // accepts and then ignores.) A handler that takes the files cancels the event.
+    return !pasteInto(message, transfer);
   }
 
   // ---- Classes Natter's style sheet hangs off -----------------------------------------------
 
+  // WhatsApp sets <html>'s classes too and may replace them all, so Natter's are put back.
+  const wanted = new Set();
+
+  function applyClasses() {
+    const list = document.documentElement.classList;
+    wanted.forEach((name) => { if (!list.contains(name)) list.add(name); });
+  }
+
   function setClass(name, on) {
+    if (on) wanted.add(name); else wanted.delete(name);
     document.documentElement.classList.toggle(name, Boolean(on));
   }
 
-  window.__natter = { clickNotification, openChat, attach, setClass, activeChat, scan };
+  new MutationObserver(applyClasses).observe(document.documentElement, {
+    attributes: true, attributeFilter: ["class"],
+  });
+
+  window.__natter = { clickNotification, openChat, attach, receive, setClass, activeChat, scan, audio };
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", watch, { once: true });
   } else {

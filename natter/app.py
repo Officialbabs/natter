@@ -15,15 +15,21 @@ gi.require_version("WebKit", "6.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, WebKit
 
 from . import APP_ID, NAME, VERSION
-from .account import SCHEME, Account, Files
+from . import clipboard
+from .account import Account
 from .links import chat_link
 from .launcher import Badge, set_menu_chats
 from .notify import Notifier
+from .search import SearchProvider
 from .settings import AUTOSTART, CACHE, DATA, Settings
+from .system import Reclaimer, move_to_own_scope
 from .tray import MenuItem, Tray
 
 HERE = Path(__file__).resolve().parent
 ICONS = HERE.parent / "data" / "icons"
+MEMORY_LIMIT = 1024  # MB
+HIDDEN_BEFORE_RECLAIM = 90  # seconds hidden before Natter gives memory back
+RECLAIM_AGAIN = 15 * 60  # and again this often while it stays hidden
 
 
 class Natter(Adw.Application):
@@ -37,6 +43,7 @@ class Natter(Adw.Application):
         self.dev_url: Optional[str] = None
         self._held = False
         self._menu_update = 0
+        self._reclaim_timer = 0
         self.add_main_option("background", ord("b"), GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
                              "Start in the background, without opening the window", None)
         self.add_main_option("chat", ord("c"), GLib.OptionFlags.NONE, GLib.OptionArg.STRING,
@@ -60,26 +67,43 @@ class Natter(Adw.Application):
     # ---- Start-up --------------------------------------------------------------------------
 
     def do_startup(self) -> None:
+        # Only the first instance gets here. Group Natter's processes under a scope of its
+        # own before WebKit starts any (Ada's launcher already makes one; a terminal doesn't).
+        self.scope = move_to_own_scope()
         Adw.Application.do_startup(self)
         Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(str(ICONS))
         Gtk.Window.set_default_icon_name(APP_ID)
 
-        self.web_context = WebKit.WebContext()
-        self.web_context.set_cache_model(WebKit.CacheModel.DOCUMENT_VIEWER)
-        self.files = Files()
-        self.web_context.register_uri_scheme(SCHEME, self.files.serve)
-        security = self.web_context.get_security_manager()
-        security.register_uri_scheme_as_secure(SCHEME)
-        security.register_uri_scheme_as_cors_enabled(SCHEME)
+        # WebKit frees caches and collects garbage once a page passes a third of this limit.
+        # Measured with a real account: 1 GB cuts Natter from ~1.5 GB to ~1.1 GB at the same
+        # idle CPU; 640 MB made it collect constantly and end up bigger. 0 turns it off.
+        limit = int(GLib.getenv("NATTER_MEMORY_LIMIT") or MEMORY_LIMIT)
+        if limit:
+            pressure = WebKit.MemoryPressureSettings.new()
+            pressure.set_memory_limit(limit)
+            self.web_context = WebKit.WebContext(memory_pressure_settings=pressure)
+        else:
+            self.web_context = WebKit.WebContext()
+        # A disk cache, so WhatsApp's code (several MB) isn't downloaded again on every start, and
+        # a small memory cache. (DOCUMENT_VIEWER turns both off.)
+        self.web_context.set_cache_model(WebKit.CacheModel.DOCUMENT_BROWSER)
         self._apply_spelling()
 
         bus = self.get_dbus_connection()
         self.notifier = Notifier(self.settings, self._open_from_notification)
         self.badge = Badge(bus)
+        self.reclaimer = Reclaimer(on_done=self._reclaimed)
+        clipboard.tidy()
+        self.search = SearchProvider(self, bus)
         self._apply_tray()
         self._apply_background()
         self.settings.connect(self._on_setting)
         Gio.NetworkMonitor.get_default().connect("network-changed", self._on_network)
+        if self.get_flags() & Gio.ApplicationFlags.IS_SERVICE:
+            # Started over D-Bus (by a search, say) rather than from a launcher: with no command
+            # line coming, bring WhatsApp up hidden, as --background does, so it isn't an empty
+            # process the tray and notifications can't use.
+            GLib.idle_add(lambda: self.start_hidden() and False)
 
         for name, run, accels in [
             ("preferences", self.show_preferences, ["<Control>comma"]),
@@ -105,6 +129,31 @@ class Natter(Adw.Application):
         open_file.connect("activate", lambda _a, v: Gtk.FileLauncher.new(Gio.File.new_for_path(v.get_string()))
                           .launch(self.window, None, None, None))
         self.add_action(open_file)
+        if GLib.getenv("NATTER_DEBUG"):
+            # gdbus call --session --dest io.natter.Natter --object-path /io/natter/Natter \
+            #   --method org.gtk.Actions.Activate debug-snapshot "[<'/tmp/natter.png'>]" "{}"
+            snap = Gio.SimpleAction.new("debug-snapshot", GLib.VariantType("s"))
+            snap.connect("activate", lambda _a, v: self.window and self.window.save_snapshot(v.get_string()))
+            self.add_action(snap)
+            # ... debug-eval "[<'return navigator.userAgent'>]" "{}"  prints the result
+            run = Gio.SimpleAction.new("debug-eval", GLib.VariantType("s"))
+            run.connect("activate", lambda _a, v: self.window and self.window.account and self.window.account.run(
+                v.get_string(), None, lambda value: print("natter: eval →", value, flush=True)))
+            self.add_action(run)
+            # debug-page-snapshot "[<'/tmp/page.png'>]": WebKit paints the page itself (not the screen).
+            page = Gio.SimpleAction.new("debug-page-snapshot", GLib.VariantType("s"))
+            page.connect("activate", lambda _a, v: self.window and self.window.account and self._page_snapshot(
+                self.window.account, v.get_string()))
+            self.add_action(page)
+            # debug-attach "[<'/path/file.png'>]": what Ctrl+V does with a picture once it's read.
+            attach = Gio.SimpleAction.new("debug-attach", GLib.VariantType("s"))
+            attach.connect("activate", lambda _a, v: self.window and self.window.account and self.window.account.attach(
+                [Path(v.get_string())], lambda ok: print("natter: attached:", ok, flush=True)))
+            self.add_action(attach)
+            # debug-drop "[<'/path/file.pdf'>]": what dropping that file on the chat does.
+            dropped = Gio.SimpleAction.new("debug-drop", GLib.VariantType("s"))
+            dropped.connect("activate", lambda _a, v: self.send_files([Path(v.get_string())]))
+            self.add_action(dropped)
 
     def _build(self) -> None:
         for info in self.settings["accounts"]:
@@ -112,6 +161,8 @@ class Natter(Adw.Application):
         from .window import Window
 
         self.window = Window(self)
+        self.window.connect("notify::visible", lambda w, _p: self._on_window_visible(w.get_visible()))
+        self._on_window_visible(False)  # started hidden (--background) counts as hidden; showing cancels it
         self._show_unread()
         self._update_menu_chats()
 
@@ -119,6 +170,7 @@ class Natter(Adw.Application):
         account = Account(self, info, url=self.dev_url)
         account.connect("unread-changed", lambda *_: self._show_unread())
         account.connect("chats-changed", lambda *_: self._update_menu_chats())
+        account.connect("state-changed", lambda a: a.ready and self._update_menu_chats())
         account.connect("notify-message", self._on_notify_message)
         account.connect("unnotify", lambda a, page_id: self.notifier.withdraw_page(a.id, page_id))
         account.connect("download-done", self._on_download)
@@ -166,11 +218,16 @@ class Natter(Adw.Application):
 
     # ---- Chats -----------------------------------------------------------------------------
 
-    def go_to_chat(self, files: Optional[list[Path]] = None) -> None:
+    def go_to_chat(self, files: Optional[list[Path]] = None, query: str = "") -> None:
         from .palette import Palette
 
         self.present_window()
-        Palette(self, files).present(self.window)
+        Palette(self, files, query).present(self.window)
+
+    def start_hidden(self) -> None:
+        """Bring WhatsApp up without a window: started for a search, say."""
+        if self.window is None:
+            self._build()
 
     def go_to(self, account: Optional[Account], name: str, files: Optional[list[Path]] = None) -> None:
         if account is None:
@@ -192,6 +249,48 @@ class Natter(Adw.Application):
         account.open_link(f"https://wa.me/{digits}")
         if files:
             account.when_ready(lambda: GLib.timeout_add(1500, lambda: account.attach(files) and False))
+
+    def _page_snapshot(self, account: Account, path: str) -> None:
+        def done(view, result) -> None:
+            try:
+                view.get_snapshot_finish(result).save_to_png(path)
+                print(f"natter: saved page {path}", flush=True)
+            except GLib.Error as error:
+                print(f"natter: page snapshot failed: {error.message}", flush=True)
+
+        account.view.get_snapshot(WebKit.SnapshotRegion.VISIBLE, WebKit.SnapshotOptions.NONE, None, done)
+
+    def paste(self, force: bool = False) -> bool:
+        """Ctrl+V in the page. True when Natter takes it (pictures, files); False leaves it to WebKit."""
+        window = self.window
+        account = window.account if window else None
+        if account is None or not (force or window.focus_in_page()):
+            return False
+
+        def got(paths: list[Path]) -> None:
+            if paths:
+                self.send_files(paths)
+            else:
+                account.view.execute_editing_command(WebKit.EDITING_COMMAND_PASTE)
+
+        return clipboard.read(window.get_clipboard(), got)
+
+    def send_files(self, paths: list[Path]) -> None:
+        """Files pasted or dropped on the window: into the open chat, or ask which chat."""
+        window = self.window
+        account = window.account if window else None
+        if account is None or not paths:
+            return
+        if not account.active_chat:
+            self.go_to_chat(paths)
+            return
+        def done(ok: bool) -> None:
+            if GLib.getenv("NATTER_DEBUG"):
+                print(f"natter: {len(paths)} file(s) → taken: {ok}", flush=True)
+            if not ok:
+                window.toast("WhatsApp didn't take the files")
+
+        account.attach(paths, done)
 
     # ---- Unread, notifications, focus -----------------------------------------------------
 
@@ -242,6 +341,27 @@ class Natter(Adw.Application):
             for account in self.accounts:
                 if account.failed:
                     account.reload()
+
+    # ---- Memory while hidden --------------------------------------------------------------
+
+    def _on_window_visible(self, visible: bool) -> None:
+        if self._reclaim_timer:
+            GLib.source_remove(self._reclaim_timer)
+            self._reclaim_timer = 0
+        if visible:
+            self.reclaimer.stop()
+        elif self.settings["light_background"] and self.reclaimer.available:
+            self._reclaim_timer = GLib.timeout_add_seconds(HIDDEN_BEFORE_RECLAIM, self._reclaim)
+
+    def _reclaim(self) -> bool:
+        self.reclaimer.start()
+        self._reclaim_timer = GLib.timeout_add_seconds(RECLAIM_AGAIN, self._reclaim)
+        return GLib.SOURCE_REMOVE
+
+    def _reclaimed(self, before: int, after: int) -> bool:
+        if GLib.getenv("NATTER_DEBUG"):
+            print(f"natter: gave back {(before - after) >> 20} MB ({before >> 20} → {after >> 20} MB)", flush=True)
+        return GLib.SOURCE_REMOVE
 
     # ---- Dock menu and tray ---------------------------------------------------------------
 
@@ -333,6 +453,8 @@ class Natter(Adw.Application):
             self._apply_spelling()
         elif key == "dock_recent_chats":
             self._update_menu_chats()
+        elif key == "light_background" and self.window:
+            self._on_window_visible(self.window.get_visible())
         elif key == "blur_when_away" and self.window:
             self.on_focus_changed(self.window.is_active())
 

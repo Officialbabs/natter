@@ -1,0 +1,49 @@
+<!doctype html>
+<!-- WhatsApp's emoji picker, rebuilt for checking that WebKit draws the emoji whole: 32 px spans
+     showing one tile of a 200 px WebP sprite scaled to 160 px, in rows of a virtualised list
+     (each row a list item placed with a transform) inside a scrolling box, inside an
+     overflow-hidden grid with an identity transform. Same sprite also shown small, as in chat
+     names. The sprite URL can be swapped for a local copy with ?sprite=file:///…/85.webp -->
+<html><head><meta charset="utf-8"><title>Emoji check</title>
+<style>
+  body { margin: 0; background: #1d1f1f; color: #ddd; font: 14px sans-serif; }
+  .names { padding: 8px 12px; }
+  .emojik { display: inline-block; width: 32px; height: 32px; margin: 6px;
+            background-size: 160px 160px; background-repeat: repeat; }
+  .names .emojik { width: 20px; height: 20px; margin: 0 2px; background-size: 100px 100px; vertical-align: middle; }
+  .app { transform: matrix(1, 0, 0, 1, 0, 0); overflow: hidden; width: 560px; height: 360px; }
+  .grid { transform: matrix(1, 0, 0, 1, 0, 0); overflow: hidden; height: 360px; }
+  .scroller { overflow: hidden scroll; height: 313px; }
+  .content { position: relative; overflow: hidden; height: 7296px; }
+  .row { position: absolute; left: 0; right: 0; height: 44px; }
+</style></head>
+<body>
+<div class="names" id="names"></div>
+<div class="app" role="application"><div class="grid" role="grid"><div class="scroller" id="scroller"><div class="content" id="content"></div></div></div></div>
+<script>
+  // ?sprites=<folder URL>&count=N spreads the cells over N sprite sheets (0.webp … N-1.webp),
+  // the way the real picker uses one sheet per batch of emoji.
+  const params = new URLSearchParams(location.search);
+  const folder = params.get("sprites");
+  const count = Number(params.get("count") || 1);
+  const sprite = (n) => folder ? `${folder}/${n % count}.webp`
+    : (params.get("sprite") || "https://web.whatsapp.com/emoji/v1/16/0/2/sprite/a/40/85.webp");
+  const make = (tile, n) => {
+    const s = document.createElement("span");
+    s.className = "emojik";
+    s.style.backgroundImage = `url("${sprite(Math.floor(n / 3))}")`;
+    s.style.backgroundPosition = `-${(n % 5) * tile}px -${(Math.floor(n / 5) % 5) * tile}px`;
+    return s;
+  };
+  const names = document.getElementById("names");
+  for (let n = 0; n < 12; n++) names.appendChild(make(20, n));
+  const content = document.getElementById("content");
+  for (let r = 0; r < Number(params.get("rows") || 40); r++) {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.setAttribute("role", "listitem");
+    row.style.transform = `matrix(1, 0, 0, 1, 0, ${r * 44})`;
+    for (let c = 0; c < 12; c++) row.appendChild(make(32, r * 12 + c));
+    content.appendChild(row);
+  }
+</script></body></html>

@@ -37,9 +37,13 @@ class Preferences(Adw.PreferencesDialog):
         running.add(self._switch("run_in_background", "Keep Running When Closed",
                                  "Closing the window leaves Natter in the tray, still notifying you"))
         running.add(self._switch("start_at_login", "Start at Login", "Starts hidden, ready to notify you"))
+        running.add(self._switch("light_background", "Use Less Memory in the Background",
+                                 "While the window is closed, Natter hands memory it isn't using back to the system"))
         running.add(self._switch("tray_icon", "Tray Icon", "Shows the unread count; click it to open Natter"))
         running.add(self._switch("dock_recent_chats", "Recent Chats in Dock Menu",
                                  "Right-click Natter's dock icon to jump straight to a chat"))
+        running.add(self._switch("search_provider", "Chats in Desktop Search",
+                                 "Lets the desktop's search find chats by name, on desktops that ask apps for results"))
         page.add(running)
 
         look = Adw.PreferencesGroup(title="Text")
