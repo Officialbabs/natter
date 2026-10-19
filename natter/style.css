@@ -1,0 +1,29 @@
+/* Natter's additions to WhatsApp Web. Each rule hangs off a class Natter sets on <html>. */
+
+/* Privacy blur: names, pictures and messages stay blurred until the pointer is over them. */
+html.natter-blur #pane-side [role="listitem"],
+html.natter-blur #pane-side [role="row"],
+html.natter-blur #main header,
+html.natter-blur #main [role="row"],
+html.natter-blur #main .message-in,
+html.natter-blur #main .message-out,
+html.natter-blur footer [contenteditable="true"] {
+  filter: blur(7px);
+  transition: filter 120ms ease-out;
+}
+html.natter-blur #pane-side [role="listitem"]:hover,
+html.natter-blur #pane-side [role="row"]:hover,
+html.natter-blur #main header:hover,
+html.natter-blur #main [role="row"]:hover,
+html.natter-blur #main .message-in:hover,
+html.natter-blur #main .message-out:hover,
+html.natter-blur footer [contenteditable="true"]:hover,
+html.natter-blur footer [contenteditable="true"]:focus {
+  filter: none;
+}
+
+/* While Natter's window is in the background, nothing in it is readable. */
+html.natter-away #app {
+  filter: blur(16px) saturate(0.6);
+  transition: filter 160ms ease-out;
+}

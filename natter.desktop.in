@@ -1,0 +1,16 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Natter
+GenericName=WhatsApp Client
+Comment=WhatsApp that feels like part of your desktop
+Exec=@EXEC@ %U
+Icon=io.natter.Natter
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=whatsapp;chat;messages;messenger;wa;
+MimeType=x-scheme-handler/whatsapp;
+StartupWMClass=io.natter.Natter
+StartupNotify=true
+SingleMainWindow=true
+X-GNOME-UsesNotifications=true

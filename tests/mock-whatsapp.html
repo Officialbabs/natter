@@ -1,0 +1,98 @@
+<!doctype html>
+<!-- A stand-in for WhatsApp Web with the same landmarks Natter's bridge looks for:
+     #side with a search box, #pane-side with virtualised rows, #main with a header and composer.
+     Run Natter against it with:  bin/natter --url file://$PWD/tests/mock-whatsapp.html -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>(3) WhatsApp</title>
+<style>
+  body { margin: 0; font: 14px system-ui, sans-serif; background: #f0f2f5; color: #111b21; }
+  @media (prefers-color-scheme: dark) { body { background: #111b21; color: #e9edef; } }
+  #app { display: flex; height: 100vh; }
+  #side { width: 340px; border-right: 1px solid #8884; display: flex; flex-direction: column; }
+  #search { margin: 10px; padding: 8px 12px; border-radius: 8px; background: #8882; min-height: 1.2em; outline: none; }
+  #pane-side { position: relative; flex: 1; overflow-y: auto; }
+  #grid { position: relative; }
+  [role="listitem"] { position: absolute; left: 0; right: 0; height: 64px; display: flex; align-items: center;
+                      gap: 12px; padding: 0 12px; box-sizing: border-box; cursor: pointer; }
+  [role="listitem"]:hover { background: #8881; }
+  .avatar { width: 44px; height: 44px; border-radius: 50%; background: #2ec27e; flex: none; }
+  .preview { opacity: .65; font-size: 13px; }
+  #main { flex: 1; display: flex; flex-direction: column; }
+  #main header { padding: 14px 16px; font-weight: 600; border-bottom: 1px solid #8884; }
+  #messages { flex: 1; padding: 16px; }
+  .message-in, .message-out { max-width: 60%; padding: 6px 10px; border-radius: 8px; margin: 4px 0; background: #8882; }
+  .message-out { margin-left: auto; background: #2ec27e44; }
+  footer { padding: 10px; }
+  footer [contenteditable] { padding: 10px; border-radius: 8px; background: #8882; outline: none; }
+  #drop { display: none; position: absolute; inset: 0; background: #2ec27e55; align-items: center; justify-content: center; }
+  #preview { display: none; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="side">
+    <div id="search" contenteditable="true" role="textbox" title="Search"></div>
+    <div id="pane-side"><div id="grid" aria-label="Chat list" role="grid"></div></div>
+  </div>
+  <div id="main" style="position: relative">
+    <header><span dir="auto" title="Mum">Mum</span></header>
+    <div id="messages">
+      <div class="message-in">Did you eat?</div>
+      <div class="message-out">Yes mum</div>
+    </div>
+    <footer><div contenteditable="true" role="textbox" title="Type a message"></div></footer>
+    <div id="drop">Drop files here</div>
+    <div id="preview" role="dialog"><span data-icon="send"></span><span id="preview-names"></span></div>
+  </div>
+</div>
+<script>
+  // 40 chats; only the first 12 are ever in the page, like WhatsApp's virtualised list.
+  const CHATS = ["Mum", "Work Team", "Ana Souza", "Football Sunday", "Dad", "Joana", "Landlord", "Book Club",
+    ...Array.from({ length: 32 }, (_, i) => `Old Friend ${i + 1}`)];
+  const grid = document.getElementById("grid");
+  const search = document.getElementById("search");
+  function render() {
+    const query = search.textContent.trim().toLowerCase();
+    const list = query ? CHATS.filter((c) => c.toLowerCase().includes(query)) : CHATS;
+    grid.replaceChildren();
+    grid.style.height = list.length * 64 + "px";
+    list.slice(0, 12).forEach((name, i) => {
+      const row = document.createElement("div");
+      row.setAttribute("role", "listitem");
+      row.style.transform = `translateY(${i * 64}px)`;
+      row.innerHTML = `<div class="avatar"></div><div><div><span dir="auto" title="${name}">${name}</span></div>
+        <div class="preview"><span title="secret last message from ${name}">secret last message</span></div></div>`;
+      row.addEventListener("mousedown", () => open(name));
+      grid.appendChild(row);
+    });
+  }
+  function open(name) {
+    setTimeout(() => { document.querySelector("#main header").innerHTML = `<span dir="auto" title="${name}">${name}</span>`; }, 120);
+  }
+  search.addEventListener("input", () => setTimeout(render, 150));
+  render();
+
+  // Dropping files shows a "preview" like WhatsApp's.
+  const main = document.getElementById("main");
+  main.addEventListener("dragenter", (e) => { e.preventDefault(); document.getElementById("drop").style.display = "flex"; });
+  document.getElementById("drop").addEventListener("dragover", (e) => e.preventDefault());
+  document.getElementById("drop").addEventListener("drop", (e) => {
+    e.preventDefault();
+    document.getElementById("drop").style.display = "none";
+    document.getElementById("preview").style.display = "block";
+    document.getElementById("preview-names").textContent = [...e.dataTransfer.files].map((f) => `${f.name} (${f.size} bytes)`).join(", ");
+    window.droppedFiles = [...e.dataTransfer.files].map((f) => [f.name, f.size, f.type]);
+  });
+
+  // A message notification, the way WhatsApp makes one.
+  window.fakeMessage = (from, text) => {
+    const n = new Notification(from, { body: text, tag: from.toLowerCase().replace(/\W/g, "") + "@c.us",
+      icon: "data:image/svg+xml;base64," + btoa('<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="#e66100"/></svg>') });
+    n.onclick = () => { window.focus(); open(from); window.clickedNotification = from; };
+    return n.id ?? true;
+  };
+</script>
+</body>
+</html>
