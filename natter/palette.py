@@ -104,6 +104,10 @@ class Palette(Adw.Dialog):
                 ("Keyboard Shortcuts", "preferences-desktop-keyboard-shortcuts-symbolic",
                  lambda: app.activate_action("shortcuts", None)),
                 ("Reload WhatsApp", "view-refresh-symbolic", lambda: app.window.account and app.window.account.reload()),
+                *([("Voice Call", "call-start-symbolic", lambda: app.activate_action("call", None)),
+                   ("Video Call", "camera-video-symbolic", lambda: app.activate_action("video-call", None))]
+                  if app.can_call else
+                  [("Call in Browser", "call-start-symbolic", lambda: app.activate_action("call-in-browser", None))]),
                 ("Add Account", "list-add-symbolic", lambda: app.activate_action("add-account", None)),
             ]
             for account in app.accounts if several else []:

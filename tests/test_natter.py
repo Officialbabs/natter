@@ -14,7 +14,7 @@ ENTRY = """[Desktop Entry]
 Type=Application
 Name=Natter
 Exec=/home/me/.local/bin/natter %U
-Icon=io.natter.Natter
+Icon=io.github.Officialbabs.Natter
 """
 
 
@@ -47,6 +47,18 @@ class SettingsTest(Temp):
         path = self.dir / "s.json"
         path.write_text("{not json")
         self.assertEqual(Settings(path)["zoom"], 1.0)
+
+    def test_new_keys_and_private_file(self):
+        settings = Settings(self.dir / "s.json")
+        self.assertEqual(settings["appearance"], "system")
+        self.assertTrue(settings["hardware_acceleration"])
+        self.assertFalse(settings["sw_cleared"])
+        self.assertFalse(settings["first_run_done"])
+        with self.assertRaises(KeyError):
+            settings["notify_sound"]  # sounds follow WhatsApp's own setting
+        settings["appearance"] = "dark"
+        self.assertEqual((self.dir / "s.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["s.json"])  # no .tmp left behind
 
     def test_quiet_hours(self):
         self.assertTrue(quiet_at("22:00", "07:00", time(23, 30)))
@@ -88,6 +100,14 @@ class ChatsTest(Temp):
         chats = ChatIndex(self.dir / "c.json")
         chats.add([("Mum", 0)], when=1000)
         self.assertEqual(json.loads((self.dir / "c.json").read_text()), {"Mum": 1000.0})
+
+    def test_saved_whole_and_private(self):
+        path = self.dir / "c.json"
+        path.write_text("{}")
+        path.chmod(0o644)  # as older Natters wrote it
+        ChatIndex(path).add([("Mum", 0)], when=1000)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["c.json"])
 
     def test_ranking(self):
         chats = [Chat("Ana Souza", 10), Chat("Banana Club", 30), Chat("Joana", 20), Chat("Bob", 5)]
@@ -139,10 +159,13 @@ class DockMenuTest(unittest.TestCase):
         self.assertEqual(exec_quote("100% $cash"), '"100%% \\\\$cash"')
 
     def test_actions_are_added_and_replaced(self):
+        from natter.launcher import chat_key
+
         once = with_chat_actions(ENTRY, [("main", "Mum"), ("work", "Team Chat")])
         self.assertIn("Actions=chat-0;chat-1;", once)
         self.assertIn("[Desktop Action chat-1]\nName=Team Chat\n"
-                      'Exec=/home/me/.local/bin/natter --account work --chat "Team Chat"', once)
+                      f"Exec=/home/me/.local/bin/natter --account work --chat-id {chat_key('work', 'Team Chat')}",
+                      once)
         twice = with_chat_actions(once, [("main", "Dad")])
         self.assertIn("Actions=chat-0;", twice)
         self.assertNotIn("Team Chat", twice)
@@ -158,14 +181,16 @@ class DockMenuTest(unittest.TestCase):
 
 class SystemTest(unittest.TestCase):
     def test_scope_detection(self):
+        from natter import APP_ID
         from natter.system import in_own_scope, scope_name
 
         base = Path("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice")
-        self.assertTrue(in_own_scope(base / "app-ada-io.natter.Natter-4242.scope"))  # Ada's launcher
+        self.assertTrue(in_own_scope(base / f"app-ada-{APP_ID}-4242.scope"))  # Ada's launcher
         self.assertTrue(in_own_scope(base / scope_name(4242)))  # our own
         self.assertFalse(in_own_scope(base / "app-ada-com.anthropic.Claude-9571.scope"))  # started from Claude
         self.assertFalse(in_own_scope(base / "vte-spawn-1234.scope"))  # a terminal
-        self.assertEqual(scope_name(7), "app-io.natter.Natter-7.scope")
+        escaped = APP_ID.replace("-", "\\x2d")  # systemd's escape for "-" inside a name part
+        self.assertEqual(scope_name(7), f"app-{escaped}-7.scope")
 
 
 class ClipboardTest(unittest.TestCase):

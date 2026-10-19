@@ -24,12 +24,52 @@ headerbar.natter-header button { min-height: 28px; min-width: 28px; padding: 2px
 """
 
 
-class AccountPage(Gtk.Overlay):
-    """An account's page, with a notice over it when WhatsApp can't be reached."""
+SHORTCUTS = [
+    ("Natter", [("Go to chat, or message a number", "<Control>k"),
+                ("Privacy blur", "<Control><Shift>b"),
+                ("Switch account", "<Control>1"),
+                ("Preferences", "<Control>comma"),
+                ("Hide window", "<Control>w"),
+                ("Quit", "<Control>q")]),
+    ("View", [("Zoom in", "<Control>plus"), ("Zoom out", "<Control>minus"),
+              ("Reset zoom", "<Control>0"), ("Reload WhatsApp", "<Control>r")]),
+    ("WhatsApp", [("New chat", "<Control><Alt>n"), ("Search chats", "<Control><Alt>slash"),
+                  ("Next chat", "<Control><Alt><Shift>bracketright"),
+                  ("Previous chat", "<Control><Alt><Shift>bracketleft"),
+                  ("Archive chat", "<Control><Alt>e"), ("Mute chat", "<Control><Alt><Shift>m")]),
+]
 
-    def __init__(self, account: Account) -> None:
+
+def shortcuts_dialog() -> Adw.Dialog:
+    """The keyboard shortcuts. Adw.ShortcutsDialog is new in libadwaita 1.8; older ones get a list."""
+    if hasattr(Adw, "ShortcutsDialog"):
+        dialog = Adw.ShortcutsDialog()
+        for title, rows in SHORTCUTS:
+            section = Adw.ShortcutsSection(title=title)
+            for label, accel in rows:
+                section.add(Adw.ShortcutsItem(title=label, accelerator=accel))
+            dialog.add(section)
+        return dialog
+    page = Adw.PreferencesPage()
+    for title, rows in SHORTCUTS:
+        group = Adw.PreferencesGroup(title=title)
+        for label, accel in rows:
+            row = Adw.ActionRow(title=label)
+            row.add_suffix(Gtk.ShortcutLabel(accelerator=accel, valign=Gtk.Align.CENTER))
+            group.add(row)
+        page.add(group)
+    view = Adw.ToolbarView(content=page)
+    view.add_top_bar(Adw.HeaderBar())
+    return Adw.Dialog(title="Keyboard Shortcuts", content_width=460, content_height=620, child=view)
+
+
+class AccountPage(Gtk.Overlay):
+    """An account's page, with a notice over it when WhatsApp can't be reached or keeps stopping."""
+
+    def __init__(self, account: Account, settings) -> None:
         super().__init__(child=account.view)
         self.account = account
+        self.settings = settings
         # Where dragged files will go, while they're over the window.
         self.drop_hint = Gtk.Label(css_classes=["title-2"], wrap=True, justify=Gtk.Justification.CENTER)
         hint = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, halign=Gtk.Align.CENTER,
@@ -38,18 +78,33 @@ class AccountPage(Gtk.Overlay):
         hint.append(self.drop_hint)
         self.drop_zone = Adw.Bin(child=hint, css_classes=["natter-drop"], visible=False, can_target=False)
         self.add_overlay(self.drop_zone)
-        retry = Gtk.Button(label="Try Again", halign=Gtk.Align.CENTER, css_classes=["pill", "suggested-action"])
+        retry = Gtk.Button(label="Try Again", css_classes=["pill", "suggested-action"])
         retry.connect("clicked", lambda *_: account.reload())
-        self.notice = Adw.StatusPage(icon_name="network-offline-symbolic", title="Can't Reach WhatsApp",
-                                     child=retry, visible=False, css_classes=["background"])
+        self.software = Gtk.Button(label="Turn Off Hardware Acceleration", css_classes=["pill"])
+        self.software.connect("clicked", lambda *_: self._turn_off_acceleration())
+        buttons = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, halign=Gtk.Align.CENTER)
+        buttons.append(retry)
+        buttons.append(self.software)
+        self.notice = Adw.StatusPage(child=buttons, visible=False, css_classes=["background"])
         self.add_overlay(self.notice)
         account.connect("state-changed", lambda *_: self._show_state())
 
     def _show_state(self) -> None:
-        failed = self.account.failed
-        self.notice.set_visible(failed is not None)
-        if failed:
-            self.notice.set_description(f"{failed}\nNatter tries again as soon as you're back online.")
+        account = self.account
+        if account.crashing:
+            self.notice.set_icon_name("dialog-warning-symbolic")
+            self.notice.set_title("WhatsApp Keeps Stopping")
+            self.notice.set_description("Its page closed three times in two minutes, so Natter stopped reopening it.")
+        elif account.failed:
+            self.notice.set_icon_name("network-offline-symbolic")
+            self.notice.set_title("Can't Reach WhatsApp")
+            self.notice.set_description(f"{account.failed}\nNatter tries again as soon as you're back online.")
+        self.software.set_visible(bool(account.crashing) and self.settings["hardware_acceleration"])
+        self.notice.set_visible(bool(account.crashing or account.failed))
+
+    def _turn_off_acceleration(self) -> None:
+        self.settings["hardware_acceleration"] = False  # Natter turns it off for every account
+        self.account.reload()
 
 
 class Window(Adw.ApplicationWindow):
@@ -62,7 +117,7 @@ class Window(Adw.ApplicationWindow):
         self.pages: dict[str, Adw.ViewStackPage] = {}
 
         self.stack = Adw.ViewStack(vexpand=True)
-        self.stack.connect("notify::visible-child", lambda *_: app.on_page_changed())
+        self.stack.connect("notify::visible-child", lambda *_: (app.on_page_changed(), self._show_call()))
         self.switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
         self.title = Adw.WindowTitle(title=NAME)
 
@@ -73,6 +128,8 @@ class Window(Adw.ApplicationWindow):
         menu = Gio.Menu()
         section = Gio.Menu()
         section.append("_Add Account", "app.add-account")
+        if app.calls is not None:
+            section.append("_Set Up Calls…", "app.call-window")
         section.append("_Reload", "win.reload")
         menu.append_section(None, section)
         section = Gio.Menu()
@@ -87,6 +144,17 @@ class Window(Adw.ApplicationWindow):
                                             tooltip_text="Main Menu"))
         self.header.pack_end(Gtk.ToggleButton(icon_name="view-conceal-symbolic", action_name="app.privacy-blur",
                                               tooltip_text="Privacy Blur (Ctrl+Shift+B)"))
+        # Calls: with WhatsApp calling from its own page (rtc.py), its call buttons in the chat are
+        # the ones to use, so the header has none. Otherwise Natter's call window, else the browser.
+        self.call: Optional[Gtk.Button] = None
+        if app.calls is not None:
+            self.call = Gtk.Button(icon_name="call-start-symbolic", tooltip_text="Voice Call",
+                                   action_name="app.call", visible=False)
+        elif not app.calls_in_page:
+            self.call = Gtk.Button(icon_name="call-start-symbolic", tooltip_text="Call in Browser",
+                                   action_name="app.call-in-browser", visible=False)
+        if self.call is not None:
+            self.header.pack_end(self.call)
 
         self.toasts = Adw.ToastOverlay(child=self.stack)
         view = Adw.ToolbarView(content=self.toasts)
@@ -102,8 +170,6 @@ class Window(Adw.ApplicationWindow):
         self._drops()
         self.connect("close-request", self._on_close)
         self.connect("notify::is-active", lambda *_: app.on_focus_changed(self.is_active()))
-        for account in app.accounts:
-            self.add_account(account)
 
         snapshot = os.environ.get("NATTER_SNAPSHOT")
         if snapshot:
@@ -113,8 +179,11 @@ class Window(Adw.ApplicationWindow):
     # ---- Accounts --------------------------------------------------------------------------
 
     def add_account(self, account: Account) -> None:
-        page = self.stack.add_titled_with_icon(AccountPage(account), account.id, account.name, "user-available-symbolic")
+        page = self.stack.add_titled_with_icon(AccountPage(account, self.app.settings), account.id, account.name,
+                                               "user-available-symbolic")
         self.pages[account.id] = page
+        for signal in ("state-changed", "chats-changed"):
+            account.connect(signal, lambda a: a is self.account and self._show_call())
         self._show_switcher()
 
     def remove_account(self, account: Account) -> None:
@@ -145,14 +214,22 @@ class Window(Adw.ApplicationWindow):
             self.stack.set_visible_child_name(account.id)
         account.view.grab_focus()
 
-    def show_unread(self, total: int) -> None:
+    def show_status(self, total: int) -> None:
+        """The unread count, and whether an account needs linking, in the title and on each tab."""
         for account in self.app.accounts:
             page = self.pages.get(account.id)
             if page is not None:
                 page.set_badge_number(account.unread)
-                page.set_needs_attention(account.unread > 0)
-        self.title.set_subtitle(f"{total} unread" if total else "")
+                page.set_needs_attention(account.unread > 0 or account.needs_link)
+        linking = any(a.needs_link for a in self.app.accounts)
+        self.title.set_subtitle("Needs linking" if linking else f"{total} unread" if total else "")
         self.set_title(f"({total}) {NAME}" if total else NAME)
+
+    def _show_call(self) -> None:
+        if self.call is None:
+            return
+        account = self.account
+        self.call.set_visible(bool(account and account.active_chat and not account.needs_link))
 
     # ---- Actions ---------------------------------------------------------------------------
 
@@ -247,7 +324,7 @@ class Window(Adw.ApplicationWindow):
 
     def toast(self, title: str, button: Optional[str] = None, action: Optional[str] = None,
               target: Optional[GLib.Variant] = None, timeout: int = 4) -> None:
-        toast = Adw.Toast(title=title, timeout=timeout)
+        toast = Adw.Toast(title=title, timeout=timeout, use_markup=False)
         if button and action:
             toast.set_button_label(button)
             toast.set_action_name(action)
@@ -265,17 +342,20 @@ class Window(Adw.ApplicationWindow):
 
     def _on_close(self, _window) -> bool:
         self.remember_size()
+        self.app.settle_first_run()  # a new Natter started at login decides now whether closing quits
         if self.app.settings["run_in_background"]:
             self.set_visible(False)
-            return True
-        self.app.quit()
+            self.app.window_closed()
+        else:
+            self.app.quit_natter()
         return True
 
     # ---- For checking how it looks ---------------------------------------------------------
 
     def save_snapshot(self, path: str) -> None:
         """Save the window's contents as a PNG. A widget paintable fills in on the next frame."""
-        content = self.get_content()  # a toplevel has no render node of its own
+        # A toplevel has no render node of its own. Its child holds the content and any open dialog.
+        content = Gtk.Window.get_child(self)
         paintable = Gtk.WidgetPaintable.new(content)
         content.queue_draw()
 

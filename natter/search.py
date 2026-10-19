@@ -9,14 +9,15 @@ Only chat names Natter has seen in WhatsApp's list are searched, never messages.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable
 
 from gi.repository import Gio, GLib
 
-from . import APP_ID
-from .settings import rank, score
+from . import APP_ID, OBJECT_PATH
+from .launcher import menu_name
+from .settings import Chat, rank, score
 
-PATH = "/" + APP_ID.replace(".", "/") + "/SearchProvider"
+PATH = OBJECT_PATH + "/SearchProvider"
 LIMIT = 8
 
 XML = """
@@ -59,9 +60,21 @@ def split_id(identifier: str) -> tuple[str, str]:
 
 
 class SearchProvider:
-    def __init__(self, app, bus: Gio.DBusConnection) -> None:
-        self.app = app
+    """Answers the desktop's search with chats by name.
+
+    `chats()` lists (account id, account name, Chat) for every account, from what Natter keeps on
+    disk, so a search never starts WhatsApp. `open_chat(account_id, name)` and
+    `launch_search(query)` act on what the user picked; `enabled()` says whether search is on.
+    """
+
+    def __init__(self, bus: Gio.DBusConnection, chats: Callable[[], list[tuple[str, str, Chat]]],
+                 open_chat: Callable[[str, str], None], launch_search: Callable[[str], None],
+                 enabled: Callable[[], bool]) -> None:
         self.bus = bus
+        self.chats = chats
+        self.open_chat = open_chat
+        self.launch_search = launch_search
+        self.enabled = enabled
         info = Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0]
         self._id = bus.register_object(PATH, info, self._on_call, None, None)
 
@@ -69,33 +82,41 @@ class SearchProvider:
         self.bus.unregister_object(self._id)
 
     def search(self, terms: list[str]) -> list[str]:
-        if not self.app.settings["search_provider"]:
-            return []
-        self.app.start_hidden()  # started by the desktop just for this: chats load from disk
         query = " ".join(terms).strip()
-        if not query:
+        if not query or not self.enabled():
             return []
-        chats = [(c, a) for a in self.app.accounts for c in a.chats.recent()]
-        owner = {id(c): a for c, a in chats}
+        found = self.chats()
+        owner = {id(chat): account_id for account_id, _name, chat in found}
         # Desktop search wants sure hits: names that contain what was typed, not letters in order.
-        ranked = [c for c in rank(query, [c for c, _ in chats]) if score(query, c.name) >= 2]
-        return [result_id(owner[id(c)].id, c.name) for c in ranked[:LIMIT]]
+        ranked = [c for c in rank(query, [chat for _a, _n, chat in found]) if score(query, c.name) >= 2]
+        return [result_id(owner[id(c)], c.name) for c in ranked[:LIMIT]]
 
     def metas(self, identifiers: list[str]) -> list[dict]:
-        several = len(self.app.accounts) > 1
+        accounts = {account_id: account_name for account_id, account_name, _chat in self.chats()}
+        several = len(accounts) > 1
         found = []
         for identifier in identifiers:
             account_id, name = split_id(identifier)
-            account = self.app.account_by_id(account_id)
-            if account is None:
+            if account_id not in accounts:
                 continue
             found.append({
                 "id": GLib.Variant("s", identifier),
-                "name": GLib.Variant("s", name),
-                "description": GLib.Variant("s", f"WhatsApp chat · {account.name}" if several else "WhatsApp chat"),
+                "name": GLib.Variant("s", menu_name(name)),
+                "description": GLib.Variant("s", f"WhatsApp chat · {menu_name(accounts[account_id])}" if several
+                                            else "WhatsApp chat"),
                 "gicon": GLib.Variant("s", APP_ID),
             })
         return found
+
+    def _activate(self, account_id: str, name: str) -> bool:
+        # Only chats Natter offered: anything on the bus can call this.
+        if any(a == account_id and chat.name == name for a, _n, chat in self.chats()):
+            self.open_chat(account_id, name)
+        return GLib.SOURCE_REMOVE
+
+    def _launch(self, query: str) -> bool:
+        self.launch_search(query)
+        return GLib.SOURCE_REMOVE
 
     def _on_call(self, _bus, _sender, _path, _iface, method: str, params: GLib.Variant, invocation) -> None:
         args = params.unpack()
@@ -106,11 +127,10 @@ class SearchProvider:
         elif method == "GetResultMetas":
             invocation.return_value(GLib.Variant("(aa{sv})", (self.metas(args[0]),)))
         elif method == "ActivateResult":
-            account_id, name = split_id(args[0])
             invocation.return_value(None)
-            GLib.idle_add(lambda: self.app.go_to(self.app.account_by_id(account_id), name) and False)
+            GLib.idle_add(self._activate, *split_id(args[0]))
         elif method == "LaunchSearch":
             invocation.return_value(None)
-            GLib.idle_add(lambda: self.app.go_to_chat(query=" ".join(args[0])) and False)
+            GLib.idle_add(self._launch, " ".join(args[0]))
         else:
             invocation.return_error_literal(Gio.dbus_error_quark(), Gio.DBusError.UNKNOWN_METHOD, method)

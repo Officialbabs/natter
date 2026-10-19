@@ -22,6 +22,16 @@ def is_whatsapp(uri: str) -> bool:
     return parsed.scheme == "https" and parsed.hostname in WHATSAPP_HOSTS
 
 
+def same_site(uri: str, page: str) -> bool:
+    """Whether `uri` is on the site of `page` (the --url one): same scheme and host, or for files the same file."""
+    here, there = urlparse(uri or ""), urlparse(page or "")
+    if not here.scheme or here.scheme != there.scheme:
+        return False
+    if here.scheme == "file":
+        return here.path == there.path
+    return bool(here.netloc) and here.netloc == there.netloc
+
+
 def chat_link(uri: str) -> Optional[str]:
     """The WhatsApp Web address that opens a wa.me / whatsapp:// / api.whatsapp.com link."""
     parsed = urlparse(uri.strip())
@@ -45,3 +55,13 @@ def chat_link(uri: str) -> Optional[str]:
         return None
     params = {k: v for k, v in (("phone", phone), ("text", text)) if v}
     return WHATSAPP_URL + "send?" + urlencode(params)
+
+
+def short_link(uri: str) -> Optional[str]:
+    """The wa.me form of a WhatsApp chat link, the way links to chats appear in messages."""
+    target = chat_link(uri)
+    if target is None:
+        return None
+    query = dict(parse_qsl(urlparse(target).query))
+    link = "https://wa.me/" + query.get("phone", "")
+    return link + ("?" + urlencode({"text": query["text"]}) if query.get("text") else "")

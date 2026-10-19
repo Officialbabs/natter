@@ -1,0 +1,51 @@
+# Natter as a Flatpak. Build and install it for yourself from a checkout:
+#
+#   flatpak-builder --user --install --force-clean build-flatpak packaging/io.github.Officialbabs.Natter.yml
+#
+# GNOME's runtime already has everything Natter uses (Python, PyGObject, GTK 4, libadwaita,
+# WebKitGTK 6.0, libsoup 3, GStreamer, and the H.264/AAC codecs through the freedesktop
+# codecs-extra extension), so Natter itself is only Python files: meson.build copies them to
+# /app/share/natter, byte-compiles them, and installs the launcher, desktop file, icons,
+# metainfo, D-Bus service and search provider.
+id: io.github.Officialbabs.Natter
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: natter
+
+finish-args:
+  # The window: Wayland, or X11 where there's no Wayland. X11 needs shared memory.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # WhatsApp Web.
+  - --share=network
+  # Voice messages: playing them, and the microphone for recording them.
+  - --socket=pulseaudio
+  # GPU rendering for WebKit.
+  - --device=dri
+  # Where WhatsApp's downloads go, unless you pick another folder in Preferences.
+  - --filesystem=xdg-download
+  # Not here: org.freedesktop.Notifications. Inside the sandbox notify.py sends notifications
+  # through GNotification (the notification portal), which replaces a chat's notification in
+  # place by id and carries the sender's picture, so it needs no permission.
+  # The tray icon. The StatusNotifierItem spec has items own org.kde.StatusNotifierItem-<pid>-<n>,
+  # but Flathub doesn't allow owning those names, so inside the sandbox Natter registers its
+  # item with the watcher under its unique bus name, which hosts accept too.
+  - --talk-name=org.kde.StatusNotifierWatcher
+  # Not here: com.canonical.Unity, for the unread badge on the dock icon. In the Flatpak the
+  # tray shows the count instead.
+  # Start at login and running in the background go through the Background portal, the
+  # file chooser through its portal: neither needs a permission here.
+
+modules:
+  - name: natter
+    buildsystem: meson
+    sources:
+      # This checkout. For Flathub, this becomes a git source with a tag and commit.
+      - type: dir
+        path: ..
+        skip:
+          - .git
+          - .flatpak-builder
+          - build-flatpak

@@ -12,17 +12,48 @@ from datetime import time as clock
 from pathlib import Path
 from typing import Any, Optional
 
-from . import APP_ID
+from . import APP_ID, DEFAULT_APP_ID, OLD_APP_ID
+
+
+def folder_name(app_id: str = APP_ID) -> str:
+    """Natter's folder under each XDG folder: "natter", or one of its own for a lab instance."""
+    if app_id in (DEFAULT_APP_ID, OLD_APP_ID):
+        return "natter"  # the same folders before and after the rename: sessions carry over
+    return "natter-" + app_id.rsplit(".", 1)[-1].lower()
 
 
 def _xdg(var: str, fallback: str) -> Path:
     return Path(os.environ.get(var) or Path.home() / fallback)
 
 
-CONFIG = _xdg("XDG_CONFIG_HOME", ".config") / "natter"
-DATA = _xdg("XDG_DATA_HOME", ".local/share") / "natter"
-CACHE = _xdg("XDG_CACHE_HOME", ".cache") / "natter"
+FOLDER = folder_name()
+CONFIG = _xdg("XDG_CONFIG_HOME", ".config") / FOLDER
+DATA = _xdg("XDG_DATA_HOME", ".local/share") / FOLDER
+CACHE = _xdg("XDG_CACHE_HOME", ".cache") / FOLDER
 AUTOSTART = _xdg("XDG_CONFIG_HOME", ".config") / "autostart" / f"{APP_ID}.desktop"
+
+
+def private_folder(path: Path) -> Path:
+    """`path` made if needed, readable by this user only (WhatsApp sessions live under it)."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.stat().st_mode & 0o077:
+        path.chmod(0o700)
+    return path
+
+
+def write_private(path: Path, text: str) -> None:
+    """Replace `path` with `text` all at once, readable by this user only.
+
+    A crash or a full disk mid-write leaves the old file, never half of the new one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as out:
+        os.fchmod(out.fileno(), 0o600)  # a .tmp left over from before may have looser permissions
+        out.write(text)
+        out.flush()
+        os.fsync(out.fileno())
+    tmp.replace(path)
 
 
 def _downloads() -> str:
@@ -35,9 +66,24 @@ def _downloads() -> str:
     return found or str(Path.home() / "Downloads")
 
 
-def _locale_language() -> str:
-    lang = os.environ.get("LANG", "en_US").split(".")[0]
-    return lang if re.fullmatch(r"[a-z]{2,3}(_[A-Z]{2})?", lang) else "en_US"
+def spell_languages(names: Optional[list[str]] = None) -> list[str]:
+    """The user's languages the way spell-check dictionaries are named: "pt_BR", "en".
+
+    A bare language goes when a regional one of it is there already ("pt_BR" covers "pt").
+    """
+    if names is None:
+        try:
+            from gi.repository import GLib
+
+            names = GLib.get_language_names()
+        except Exception:
+            names = [os.environ.get("LANG", "")]
+    found: list[str] = []
+    for name in names:
+        if re.fullmatch(r"[a-z]{2,3}(_[A-Z]{2})?", name) and name not in found:
+            found.append(name)
+    found = [n for n in found if "_" in n or not any(f.startswith(n + "_") for f in found)]
+    return found or ["en_US"]
 
 
 DEFAULTS: dict[str, Any] = {
@@ -49,7 +95,6 @@ DEFAULTS: dict[str, Any] = {
     "notifications": True,
     "notify_sender": True,
     "notify_preview": True,
-    "notify_sound": True,
     "quiet_hours": False,
     "quiet_start": "22:00",
     "quiet_end": "07:00",
@@ -58,19 +103,30 @@ DEFAULTS: dict[str, Any] = {
     "dock_recent_chats": True,
     "search_provider": True,
     "spellcheck": True,
-    "spell_languages": [_locale_language()],
+    "spell_languages": spell_languages(),
     "download_dir": "",
     "zoom": 1.0,
     "width": 1180,
     "height": 780,
     "maximized": False,
+    "appearance": "system",  # "system", "light" or "dark"
+    "hardware_acceleration": True,
+    "calls_ring": True,  # keep the linked call window running, so calls ring
+    "calls_linked": False,  # internal: the call window has been linked once
+    "sw_cleared": False,  # whether WhatsApp's old service-worker data has been cleared, once
+    "first_run_done": False,
 }
 
 
 class Settings:
     """Natter's preferences: a dict with defaults, saved on every change."""
 
-    def __init__(self, path: Path = CONFIG / "settings.json") -> None:
+    def __init__(self, path: Optional[Path] = None) -> None:
+        if path is None:
+            # Natter's own settings: its folders come first, private.
+            for folder in (CONFIG, DATA, CACHE):
+                private_folder(folder)
+            path = CONFIG / "settings.json"
         self.path = path
         self.values: dict[str, Any] = {}
         try:
@@ -100,10 +156,7 @@ class Settings:
         self._listeners.append(listener)
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.values, indent=2, sort_keys=True))
-        tmp.replace(self.path)
+        write_private(self.path, json.dumps(self.values, indent=2, sort_keys=True))
 
     @property
     def download_dir(self) -> Path:
@@ -179,8 +232,7 @@ class ChatIndex:
         return self.add([(name, 0)])
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.chats))
+        write_private(self.path, json.dumps(self.chats))
 
     def recent(self, limit: int = 0) -> list[Chat]:
         ordered = [Chat(n, s) for n, s in sorted(self.chats.items(), key=lambda kv: -kv[1])]

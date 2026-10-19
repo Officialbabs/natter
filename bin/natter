@@ -1,13 +1,44 @@
 #!/usr/bin/python3
-"""Run Natter from wherever this checkout lives.
+"""Run Natter.
 
 A Python script rather than a shell wrapper, so the process is called "natter" in task
-managers instead of "python3".
+managers instead of "python3". Installed copies (install.sh, meson) get the Python that has
+PyGObject on the first line, and the folder holding the natter package in NATTER_DIR.
 """
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+NATTER_DIR = ""  # empty: the checkout this script is in
+DEFAULT_APP_ID = "io.github.Officialbabs.Natter"
+
+
+def menu_entry(app_id):
+    """Natter's installed .desktop file, if there is one."""
+    homes = [os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")]
+    homes += (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+    for home in homes:
+        entry = os.path.join(home, "applications", app_id + ".desktop")
+        if os.path.isfile(entry):
+            return entry
+    return None
+
+
+# Desktops tell an app's processes apart from background ones by GIO_LAUNCHED_DESKTOP_FILE,
+# which GLib sets when an app is opened from its menu entry (Ada's Task Manager reads it
+# from /proc). Started from a terminal or script it's missing; set it and start again, once,
+# since a process's own environment in /proc is the one it started with.
+if (os.environ.get("NATTER_APP_ID") or DEFAULT_APP_ID) == DEFAULT_APP_ID and "GIO_LAUNCHED_DESKTOP_FILE" not in os.environ:
+    entry = menu_entry(DEFAULT_APP_ID)
+    if entry:
+        os.environ["GIO_LAUNCHED_DESKTOP_FILE"] = entry
+        os.environ["GIO_LAUNCHED_DESKTOP_FILE_PID"] = str(os.getpid())
+        try:
+            # The script itself, not the interpreter, so the process is still called "natter".
+            os.execv(os.path.abspath(sys.argv[0]), [sys.argv[0]] + sys.argv[1:])
+        except OSError:
+            pass  # run as we are
+
+sys.path.insert(0, NATTER_DIR or os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from natter.__main__ import main  # noqa: E402
 

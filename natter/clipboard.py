@@ -16,7 +16,7 @@ import gi
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, GLib
 
-from .settings import CACHE
+from .settings import CACHE, private_folder
 
 PASTED = CACHE / "pasted"
 FILE_TYPES = ("x-special/gnome-copied-files", "application/vnd.portal.files", "text/uri-list")
@@ -34,8 +34,7 @@ def has_pastable(formats: Gdk.ContentFormats) -> Optional[str]:
 
 def save_picture(texture: Gdk.Texture, what: str) -> Path:
     """A picture that came without a file (pasted, or dragged from a browser) saved as a PNG."""
-    PASTED.mkdir(parents=True, exist_ok=True)
-    path = PASTED / time.strftime(f"{what} %Y-%m-%d at %H.%M.%S.png")
+    path = private_folder(PASTED) / time.strftime(f"{what} %Y-%m-%d at %H.%M.%S.png")
     texture.save_to_png(str(path))
     return path
 

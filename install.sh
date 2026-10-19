@@ -1,64 +1,206 @@
 #!/bin/sh
-# Natter installer: launcher, menu entry, icons, whatsapp:// links. `./install.sh --uninstall` removes them.
+# Natter for one user, run from this checkout: the `natter` command, the menu entry, icons,
+# desktop search and whatsapp:// links. `./install.sh --uninstall` removes them. Either stops
+# while Natter runs, unless --force is given too.
+# (Distribution packages and the Flatpak install with meson.build instead.)
 set -e
+APP_ID=io.github.Officialbabs.Natter
+OLD_APP_ID=io.natter.Natter  # Natter's id before the rename: an install of it is moved over
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
+BIN="$HOME/.local/bin"
+LAUNCHER="$BIN/natter"
+APPS="$DATA/applications"
+ENTRY="$APPS/$APP_ID.desktop"
 ICONS="$DATA/icons/hicolor/scalable/apps"
-ENTRY="$DATA/applications/io.natter.Natter.desktop"
-SEARCH="$DATA/gnome-shell/search-providers/io.natter.Natter.search-provider.ini"
-SERVICE="$DATA/dbus-1/services/io.natter.Natter.service"
+SEARCH="$DATA/gnome-shell/search-providers"
+SERVICES="$DATA/dbus-1/services"
+AUTOSTART="$CONFIG/autostart"
 
-if [ "$1" = "--uninstall" ]; then
-    rm -f "$HOME/.local/bin/natter" "$ENTRY" "$ICONS/io.natter.Natter.svg" "$ICONS/io.natter.Natter-unread.svg" \
-          "$CONFIG/autostart/io.natter.Natter.desktop" "$SEARCH" "$SERVICE"
-    command -v update-desktop-database >/dev/null && update-desktop-database -q "$DATA/applications" || true
-    echo "Natter removed. Your WhatsApp sessions and settings are still in $DATA/natter and $CONFIG/natter;"
-    echo "delete those folders too to sign out everywhere."
+# $1 made safe as the replacement in a sed s|…|…| command.
+sed_escape() { printf '%s\n' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+
+# $1 as one argument of a desktop entry's Exec=: quoted when it needs to be, then escaped
+# again as a string value, as the Desktop Entry spec says.
+exec_quote() {
+    case "$1" in
+        *[!A-Za-z0-9_./+-]*)
+            printf '"%s"' "$(printf '%s\n' "$1" | sed -e 's/[\\"`$]/\\&/g' -e 's/\\/\\\\/g' -e 's/%/%%/g')" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# $1 as one argument of a D-Bus service's Exec=, which D-Bus splits the way a shell does.
+shell_quote() { printf "'%s'" "$(printf '%s\n' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# $1 as a Python string literal.
+py_quote() { printf '"%s"' "$(printf '%s\n' "$1" | sed -e 's/[\\"]/\\&/g')"; }
+
+# Everything an install under the id $1 puts in place, but the autostart entry.
+remove_installed() {
+    rm -f "$APPS/$1.desktop" "$ICONS/$1.svg" "$ICONS/$1-unread.svg" \
+          "$SEARCH/$1.search-provider.ini" "$SERVICES/$1.service"
+}
+
+# An install from before the rename: its entry, icons and search files go, and its autostart
+# entry moves to the new name, starting the new launcher.
+retire_old() {
+    remove_installed "$OLD_APP_ID"
+    if [ -f "$AUTOSTART/$OLD_APP_ID.desktop" ]; then
+        sed -e "s|^Exec=.*|Exec=$(sed_escape "$EXEC") --background|" -e "s|^Icon=.*|Icon=$(sed_escape "$ICONS/$APP_ID.svg")|" \
+            "$AUTOSTART/$OLD_APP_ID.desktop" > "$AUTOSTART/$APP_ID.desktop"
+        rm -f "$AUTOSTART/$OLD_APP_ID.desktop"
+    fi
+}
+
+refresh_caches() {
+    if command -v update-desktop-database >/dev/null; then update-desktop-database -q "$APPS" || true; fi
+    if command -v gtk-update-icon-cache >/dev/null; then gtk-update-icon-cache -q -t "$DATA/icons/hicolor" 2>/dev/null || true; fi
+}
+
+# Whether a Natter with the id $1 is running: it owns that name on the session bus.
+running() {
+    command -v gdbus >/dev/null &&
+        gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+            --method org.freedesktop.DBus.NameHasOwner "$1" 2>/dev/null | grep -q true
+}
+
+UNINSTALL=""
+FORCE=""
+for arg in "$@"; do
+    case "$arg" in
+        --uninstall) UNINSTALL=1 ;;
+        --force) FORCE=1 ;;
+        *) echo "Usage: $0 [--uninstall] [--force]" >&2; exit 2 ;;
+    esac
+done
+
+# A running Natter rewrites its menu entry as its recent chats change, and one from before the
+# rename holds the WhatsApp session the new one would open: it has to quit first.
+if [ -z "$FORCE" ]; then
+    for id in "$OLD_APP_ID" "$APP_ID"; do
+        if running "$id"; then
+            echo "Natter ($id) is running. Quit it first (Quit in its tray menu, or Ctrl+Q in its window),"
+            echo "then run this again. To go ahead while it runs: $0${*:+ $*} --force"
+            exit 1
+        fi
+    done
+fi
+
+if [ -n "$UNINSTALL" ]; then
+    rm -f "$LAUNCHER" "$AUTOSTART/$APP_ID.desktop" "$AUTOSTART/$OLD_APP_ID.desktop"
+    remove_installed "$APP_ID"
+    remove_installed "$OLD_APP_ID"
+    refresh_caches
+    echo "Natter removed. Your WhatsApp sessions and settings are still in $DATA/natter and $CONFIG/natter"
+    echo "(and a cache in ${XDG_CACHE_HOME:-$HOME/.cache}/natter); delete those folders too to sign out everywhere."
     exit 0
 fi
 
-python3 -c 'import gi; gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); gi.require_version("WebKit", "6.0")' 2>/dev/null || {
-    echo "Natter needs PyGObject with GTK 4, libadwaita and WebKitGTK 6.0:"
-    echo "  sudo apt-get install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-webkit-6.0"
-    echo "For calls, also: gstreamer1.0-plugins-bad gstreamer1.0-nice"
+# The Python to run Natter with: the system's own first, since that's the one distributions
+# give PyGObject to, then the first python3 on PATH. The check is Natter's own start-up check.
+CHECK='import sys; sys.path.insert(0, sys.argv[1]); from natter.__main__ import check; sys.exit(check())'
+PYTHON=""
+for candidate in /usr/bin/python3 "$(command -v python3 || true)"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ] && "$candidate" -c "$CHECK" "$HERE" >/dev/null 2>&1; then
+        PYTHON="$candidate"
+        break
+    fi
+done
+if [ -z "$PYTHON" ]; then
+    first="$(command -v python3 || true)"
+    if [ -z "$first" ]; then
+        echo "Natter needs Python 3 with PyGObject, GTK 4, libadwaita and WebKitGTK 6.0."
+    else
+        "$first" -c "$CHECK" "$HERE" || true  # says what's missing, and how to install it here
+    fi
     exit 1
-}
+fi
 
 # Who opens whatsapp:// links now, asked before Natter's entry joins the list.
 handler=""
-command -v xdg-mime >/dev/null && handler="$(xdg-mime query default x-scheme-handler/whatsapp 2>/dev/null)"
+if command -v xdg-mime >/dev/null; then
+    handler="$(xdg-mime query default x-scheme-handler/whatsapp 2>/dev/null || true)"
+fi
 
-echo "==> Installing launcher, icons and menu entry"
-mkdir -p "$HOME/.local/bin" "$DATA/applications" "$ICONS"
-ln -sf "$HERE/bin/natter" "$HOME/.local/bin/natter"
-cp "$HERE/data/icons/hicolor/scalable/apps/"*.svg "$ICONS/"
+echo "==> Installing the natter command (with $PYTHON)"
+mkdir -p "$BIN"
+# A copy rather than a link, so it can name its Python and this checkout. mv replaces the link
+# that older installers made, not the file it pointed at.
+sed -e "1s|.*|#!$(sed_escape "$PYTHON")|" \
+    -e "s|^NATTER_DIR = \"\".*|NATTER_DIR = $(sed_escape "$(py_quote "$HERE")")|" \
+    "$HERE/bin/natter" > "$LAUNCHER.new"
+chmod 755 "$LAUNCHER.new"
+mv -f "$LAUNCHER.new" "$LAUNCHER"
+"$PYTHON" -m compileall -q "$HERE/natter" >/dev/null 2>&1 || true
+case ":$PATH:" in
+    *":$BIN:"*) ;;
+    *) echo "Note: $BIN isn't on your PATH, so typing 'natter' in a terminal won't find it. The menu entry works anyway." ;;
+esac
+
+echo "==> Installing the menu entry, icons and desktop search"
+EXEC="$(exec_quote "$LAUNCHER")"
+mkdir -p "$APPS" "$ICONS" "$SEARCH" "$SERVICES"
+cp "$HERE/data/icons/hicolor/scalable/apps/$APP_ID.svg" "$HERE/data/icons/hicolor/scalable/apps/$APP_ID-unread.svg" "$ICONS/"
+# The icon by its full path: Ada's shell (Qt) doesn't find icons by name in ~/.local/share/icons,
+# which has no index.theme.
+sed -e "s|@EXEC@|$(sed_escape "$EXEC")|" -e "s|^Icon=.*|Icon=$(sed_escape "$ICONS/$APP_ID.svg")|" \
+    "$HERE/natter.desktop.in" > "$ENTRY.new"
 # Keep the recent-chat actions Natter already wrote, if any.
-sed -e "s|@EXEC@|$HOME/.local/bin/natter|" "$HERE/natter.desktop.in" > "$ENTRY.new"
 if [ -f "$ENTRY" ] && grep -q '^\[Desktop Action chat-' "$ENTRY"; then
     grep '^Actions=' "$ENTRY" >> "$ENTRY.new" || true
-    sed -n '/^\[Desktop Action chat-/,$p' "$ENTRY" | sed '1s/^/\n/' >> "$ENTRY.new"
+    { echo; sed -n '/^\[Desktop Action chat-/,$p' "$ENTRY"; } >> "$ENTRY.new"
 fi
 mv "$ENTRY.new" "$ENTRY"
+# Desktop search: the provider file desktops look for (AutoStart=false: only a running Natter
+# is asked), and the D-Bus service behind its bus name.
+cp "$HERE/data/$APP_ID.search-provider.ini" "$SEARCH/"
+sed -e "s|@EXEC@|$(sed_escape "$(shell_quote "$LAUNCHER")")|" "$HERE/data/$APP_ID.service.in" > "$SERVICES/$APP_ID.service"
 
-# Desktop search: the provider file desktops look for, and a D-Bus service so a search can
-# start Natter (hidden) when it isn't running.
-mkdir -p "$(dirname "$SEARCH")" "$(dirname "$SERVICE")"
-cp "$HERE/data/io.natter.Natter.search-provider.ini" "$SEARCH"
-sed -e "s|@EXEC@|$HOME/.local/bin/natter|" "$HERE/data/io.natter.Natter.service.in" > "$SERVICE"
-command -v update-desktop-database >/dev/null && update-desktop-database -q "$DATA/applications" || true
-command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t "$DATA/icons/hicolor" 2>/dev/null || true
+retire_old
+refresh_caches
+# Ada's background allow list names apps by id: an entry for the old one no longer counts.
+LIFECYCLE="$CONFIG/os-ai/lifecycle.ini"
+if [ -f "$LIFECYCLE" ] && grep -qF "$OLD_APP_ID" "$LIFECYCLE"; then
+    echo "Note: $LIFECYCLE names $OLD_APP_ID. Replace it with $APP_ID there, so Ada lets Natter run in the background."
+fi
 
-# whatsapp:// links: take them only if no other app had them (ZapZap, say), and say so
-# explicitly, since Natter's entry in ~/.local would otherwise win on its own.
+# whatsapp:// links: take them only if no other app had them (ZapZap, say) or the old Natter
+# did, and say so explicitly, since Natter's entry in ~/.local would otherwise win on its own.
 if command -v xdg-mime >/dev/null; then
-    if [ -z "$handler" ] || [ "$handler" = "io.natter.Natter.desktop" ]; then
-        xdg-mime default io.natter.Natter.desktop x-scheme-handler/whatsapp
-    else
-        xdg-mime default "$handler" x-scheme-handler/whatsapp
-        echo "whatsapp:// links still open in $handler. To open them in Natter instead:"
-        echo "  xdg-mime default io.natter.Natter.desktop x-scheme-handler/whatsapp"
-    fi
+    case "$handler" in
+        "" | "$APP_ID.desktop" | "$OLD_APP_ID.desktop")
+            xdg-mime default "$APP_ID.desktop" x-scheme-handler/whatsapp ;;
+        *)
+            xdg-mime default "$handler" x-scheme-handler/whatsapp
+            echo "whatsapp:// links still open in $handler. To open them in Natter instead:"
+            echo "  xdg-mime default $APP_ID.desktop x-scheme-handler/whatsapp" ;;
+    esac
+fi
+
+# WhatsApp's videos and voice messages play through GStreamer: say if codecs are missing, or
+# if they couldn't be checked.
+"$PYTHON" -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from natter.system import media_report
+missing, hint = media_report()
+if missing:
+    print("Some WhatsApp media needs codecs GStreamer lacks here:", ", ".join(missing))
+    if hint:
+        print("  " + hint)
+elif hint:
+    print(hint)
+' "$HERE" 2>/dev/null || true
+
+# Again at the end: an old Natter still running (--force) may have written its entries back.
+retire_old
+refresh_caches
+# Both would open the same WhatsApp sessions, so the old one has to go before the new one starts.
+if running "$OLD_APP_ID"; then
+    echo "Natter from before the rename is still running. Quit it (Quit in its tray menu, or Ctrl+Q)"
+    echo "before opening the new one: both would use the same WhatsApp session."
 fi
 
 echo "Done. Open Natter from your apps, or run 'natter'."

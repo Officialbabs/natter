@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.Officialbabs.Natter</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>Natter</name>
+  <summary>Unofficial WhatsApp client that fits your desktop</summary>
+  <developer id="io.github.officialbabs">
+    <name>Natter contributors</name>
+  </developer>
+
+  <description>
+    <p>
+      Natter shows WhatsApp Web in a native GTK and libadwaita window and connects it to the
+      rest of your desktop: notifications, the tray, the dock and the keyboard.
+    </p>
+    <p>
+      Natter is unofficial. It isn’t made by, endorsed by or affiliated with WhatsApp or Meta.
+      It runs the real WhatsApp Web, the same way your browser would, and you link it to your
+      phone the same way.
+    </p>
+    <ul>
+      <li>One notification per chat, with the sender’s picture; clicking it opens that chat</li>
+      <li>Quiet hours, and an unread count in the tray and on the dock icon</li>
+      <li>Ctrl+K jumps to any chat by name, or messages a phone number you haven’t saved</li>
+      <li>Paste or drop pictures and files into a chat, or send them from the file manager</li>
+      <li>wa.me and whatsapp:// links open in Natter</li>
+      <li>A privacy blur that hides names, pictures and messages until you point at them</li>
+      <li>Several accounts, each with its own session</li>
+      <li>Keeps running in the background, and gives memory back while its window is closed</li>
+    </ul>
+    <p>
+      Voice and video calls open in your web browser: they need WebRTC, which the WebKit that
+      Natter is built on doesn’t offer.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.Officialbabs.Natter.desktop</launchable>
+  <provides>
+    <binary>natter</binary>
+    <dbus type="user">io.github.Officialbabs.Natter</dbus>
+  </provides>
+
+  <url type="homepage">https://github.com/Officialbabs/natter</url>
+  <url type="bugtracker">https://github.com/Officialbabs/natter/issues</url>
+  <url type="vcs-browser">https://github.com/Officialbabs/natter</url>
+
+  <categories>
+    <category>Network</category>
+    <category>InstantMessaging</category>
+    <category>Chat</category>
+  </categories>
+  <keywords>
+    <keyword>whatsapp</keyword>
+    <keyword>chat</keyword>
+    <keyword>messenger</keyword>
+  </keywords>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+    <internet>always</internet>
+  </requires>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>touch</control>
+  </supports>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#8ff0a4</color>
+    <color type="primary" scheme_preference="dark">#26a269</color>
+  </branding>
+
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+    <content_attribute id="social-audio">intense</content_attribute>
+    <content_attribute id="social-contacts">intense</content_attribute>
+    <content_attribute id="social-location">intense</content_attribute>
+  </content_rating>
+
+  <releases>
+    <release version="0.1.0" date="2026-10-19">
+      <description>
+        <p>
+          First release as io.github.Officialbabs.Natter, with a Flatpak, and support for
+          GNOME, KDE Plasma, Xfce, Sway and Ada.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>
