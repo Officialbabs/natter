@@ -10,7 +10,7 @@ import gi
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import GdkPixbuf, Gio, GLib
 
-from . import APP_ID, NAME, OBJECT_PATH
+from . import APP_ID, DEFAULT_APP_ID, NAME, OBJECT_PATH
 from .launcher import menu_name
 from .system import in_sandbox
 
@@ -111,12 +111,25 @@ MENU_XML = """
 </node>
 """
 
-ICON = APP_ID
-ICON_UNREAD = f"{APP_ID}-unread"
+# Named by the default id: a separate instance (NATTER_APP_ID) has no icons of its own.
+ICON = DEFAULT_APP_ID
+ICON_UNREAD = f"{DEFAULT_APP_ID}-unread"
 
 
-def tray_host_available(bus: Gio.DBusConnection) -> bool:
+def icon_names(desktop: str) -> tuple[str, str]:
+    """The icon names to give the panel, without and with unread messages, on the desktop that
+    XDG_CURRENT_DESKTOP names. Panels draw tray icons in one colour, their text's, and symbolic
+    icons let Natter's match. Ada's panel is the exception: it shows them in its Background apps
+    card, at 28 px beside the app's name, where the app's own colours are right."""
+    if any(name.strip().lower() == "ada" for name in desktop.split(":")):
+        return ICON, ICON_UNREAD
+    return f"{ICON}-symbolic", f"{ICON_UNREAD}-symbolic"
+
+
+def tray_host_available(bus: Optional[Gio.DBusConnection]) -> bool:
     """Whether a panel on this desktop shows tray icons (asks the watcher, waiting up to 500 ms)."""
+    if bus is None:
+        return False  # no session bus to ask on, so no panel to show one either
     try:
         reply = bus.call_sync(WATCHER, WATCHER_PATH, "org.freedesktop.DBus.Properties", "Get",
                               GLib.Variant("(ss)", (WATCHER, "IsStatusNotifierHostRegistered")),
@@ -138,6 +151,19 @@ def argb(pixbuf: GdkPixbuf.Pixbuf) -> bytes:
     return bytes(out)
 
 
+def byte_array(data: bytes) -> GLib.Variant:
+    """An "ay" Variant made in one go. Made from Python bytes, PyGObject builds one child Variant
+    per byte: about 50 ms for a 15 KB icon on this laptop, several times that on a slow core."""
+    return GLib.Variant.new_from_bytes(GLib.VariantType("ay"), GLib.Bytes.new(data), True)
+
+
+def pixmap_variant(drawn: list[tuple[int, int, bytes]]) -> GLib.Variant:
+    """The a(iiay) of IconPixmap and AttentionIconPixmap."""
+    return GLib.Variant.new_array(GLib.VariantType("(iiay)"), [
+        GLib.Variant.new_tuple(GLib.Variant("i", width), GLib.Variant("i", height), byte_array(data))
+        for width, height, data in drawn])
+
+
 def pixmaps(svg: str) -> list[tuple[int, int, bytes]]:
     """The icon drawn at the sizes panels use, for panels that can't find it by name."""
     drawn = []
@@ -152,18 +178,26 @@ def pixmaps(svg: str) -> list[tuple[int, int, bytes]]:
 
 class MenuItem:
     def __init__(self, label: str = "", run: Optional[Callable[[], None]] = None, *, separator: bool = False,
-                 enabled: bool = True) -> None:
+                 enabled: bool = True, children: Optional[list["MenuItem"]] = None) -> None:
         self.label, self.run, self.separator, self.enabled = menu_name(label), run, separator, enabled
+        self.children = children or []  # a submenu
 
     def key(self) -> tuple:
         """What the panel sees of it, to tell whether a menu changed."""
-        return (self.separator, self.label, self.enabled and self.run is not None)
+        return (self.separator, self.label, self.active, tuple(child.key() for child in self.children))
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and (self.run is not None or bool(self.children))
 
     def props(self) -> dict:
         if self.separator:
             return {"type": GLib.Variant("s", "separator")}
-        return {"label": GLib.Variant("s", self.label.replace("_", "__")),
-                "enabled": GLib.Variant("b", self.enabled and self.run is not None)}
+        props = {"label": GLib.Variant("s", self.label.replace("_", "__")),
+                 "enabled": GLib.Variant("b", self.active)}
+        if self.children:
+            props["children-display"] = GLib.Variant("s", "submenu")
+        return props
 
 
 class Tray:
@@ -189,12 +223,39 @@ class Tray:
         self.revision = 1
         self.items: Optional[dict[int, MenuItem]] = None  # this revision's menu, by id
         self.next_id = 1
+        self.parents: dict[int, int] = {}  # item id -> its submenu's parent (0: the menu itself)
         self.host: Optional[bool] = None
         self.watcher = False
         self.service: Optional[str] = None  # the bus name the watcher knows the item by
         apps = os.path.join(icon_path, "hicolor", "scalable", "apps")
-        self.pixmaps = pixmaps(os.path.join(apps, f"{ICON}.svg"))
-        self.unread_pixmaps = pixmaps(os.path.join(apps, f"{ICON_UNREAD}.svg"))
+        # Made once: a panel asks for every property each time the icon changes (GetAll: one
+        # _item_prop call per property). Built afresh on each call, the pixmaps held Natter's main
+        # thread, and so every key press and click meant for WhatsApp, for 2-5 s each time the
+        # unread count changed, starting the moment WhatsApp's chat list appeared.
+        self.pixmaps = pixmap_variant(pixmaps(os.path.join(apps, f"{ICON}.svg")))
+        self.unread_pixmaps = pixmap_variant(pixmaps(os.path.join(apps, f"{ICON_UNREAD}.svg")))
+        # Panels that find no icon by these names show the pixmaps, the colour icon, instead.
+        self.icon, self.unread_icon = icon_names(os.environ.get("XDG_CURRENT_DESKTOP", ""))
+        no_pixmaps = GLib.Variant.new_array(GLib.VariantType("(iiay)"), [])
+        self._properties: dict[str, Callable[[], GLib.Variant]] = {
+            "Category": lambda: GLib.Variant("s", "Communications"),
+            "Id": lambda: GLib.Variant("s", APP_ID),
+            "Title": lambda: GLib.Variant("s", NAME),
+            "Status": lambda: GLib.Variant("s", self._status()),
+            "WindowId": lambda: GLib.Variant("i", 0),
+            "IconName": lambda: GLib.Variant("s", self.unread_icon if self.unread else self.icon),
+            "IconThemePath": lambda: GLib.Variant("s", self.icon_path),
+            "IconPixmap": lambda: self.unread_pixmaps if self.unread else self.pixmaps,
+            "OverlayIconName": lambda: GLib.Variant("s", ""),
+            "AttentionIconName": lambda: GLib.Variant("s", self.unread_icon),
+            "AttentionIconPixmap": lambda: self.unread_pixmaps,
+            "ToolTip": lambda: GLib.Variant.new_tuple(
+                GLib.Variant("s", self.icon), no_pixmaps, GLib.Variant("s", NAME),
+                GLib.Variant("s", f"{self.unread} unread message{'s' if self.unread != 1 else ''}"
+                             if self.unread else "No unread messages")),
+            "ItemIsMenu": lambda: GLib.Variant("b", False),
+            "Menu": lambda: GLib.Variant("o", MENU_PATH),
+        }
         self._ids = [
             bus.register_object(ITEM_PATH, Gio.DBusNodeInfo.new_for_xml(ITEM_XML).interfaces[0],
                                 self._item_call, self._item_prop, None),
@@ -286,24 +347,8 @@ class Tray:
     # ---- org.kde.StatusNotifierItem --------------------------------------------------------
 
     def _item_prop(self, _bus, _sender, _path, _iface, name: str) -> Optional[GLib.Variant]:
-        tip = f"{self.unread} unread" if self.unread else "No unread messages"
-        values = {
-            "Category": GLib.Variant("s", "Communications"),
-            "Id": GLib.Variant("s", APP_ID),
-            "Title": GLib.Variant("s", NAME),
-            "Status": GLib.Variant("s", self._status()),
-            "WindowId": GLib.Variant("i", 0),
-            "IconName": GLib.Variant("s", ICON_UNREAD if self.unread else ICON),
-            "IconThemePath": GLib.Variant("s", self.icon_path),
-            "IconPixmap": GLib.Variant("a(iiay)", self.unread_pixmaps if self.unread else self.pixmaps),
-            "OverlayIconName": GLib.Variant("s", ""),
-            "AttentionIconName": GLib.Variant("s", ICON_UNREAD),
-            "AttentionIconPixmap": GLib.Variant("a(iiay)", self.unread_pixmaps),
-            "ToolTip": GLib.Variant("(sa(iiay)ss)", (ICON, [], NAME, tip)),
-            "ItemIsMenu": GLib.Variant("b", False),
-            "Menu": GLib.Variant("o", MENU_PATH),
-        }
-        return values.get(name)
+        make = self._properties.get(name)
+        return make() if make else None
 
     def _item_call(self, _bus, _sender, _path, _iface, method: str, params: GLib.Variant, invocation) -> None:
         invocation.return_value(None)
@@ -329,18 +374,28 @@ class Tray:
         return self.items
 
     def _number(self, items: list[MenuItem]) -> dict[int, MenuItem]:
-        """Ids never reused, so a click meant for an older menu can't land on another item."""
+        """Ids never reused, so a click meant for an older menu can't land on another item.
+        Submenus' items are numbered too, after their parent; `self.parents` says whose they are."""
         numbered = {}
-        for item in items:
-            numbered[self.next_id] = item
-            self.next_id += 1
+
+        def number(level: list[MenuItem], parent: int) -> None:
+            for item in level:
+                item_id = self.next_id
+                self.next_id += 1
+                numbered[item_id] = item
+                self.parents[item_id] = parent
+                number(item.children, item_id)
+
+        self.parents = {}
+        number(items, 0)
         return numbered
 
     def _about_to_show(self) -> bool:
         """The menu is opening: build it again, and say whether that changed it."""
         fresh = self.build_menu()
         if self.items is not None:
-            if [item.key() for item in fresh] == [item.key() for item in self.items.values()]:
+            shown = [item.key() for i, item in self.items.items() if self.parents.get(i) == 0]
+            if [item.key() for item in fresh] == shown:  # keys include submenus
                 return False
             self.refresh()
         self.items = self._number(fresh)
@@ -356,10 +411,16 @@ class Tray:
 
     def _layout(self, parent: int) -> GLib.Variant:
         items = self._menu()
-        if parent in items:
-            return GLib.Variant("(ia{sv}av)", (parent, items[parent].props(), []))
-        children = [GLib.Variant("(ia{sv}av)", (i, item.props(), [])) for i, item in items.items()]
-        return GLib.Variant("(ia{sv}av)", (0, {"children-display": GLib.Variant("s", "submenu")}, children))
+
+        def node(item_id: int) -> GLib.Variant:
+            children = [node(i) for i, owner in self.parents.items() if owner == item_id]
+            props = items[item_id].props() if item_id else {"children-display": GLib.Variant("s", "submenu")}
+            return GLib.Variant("(ia{sv}av)", (item_id, props, children))
+
+        if parent and parent not in items:
+            # A submenu of an older revision: nothing, rather than the whole menu in its place.
+            return GLib.Variant("(ia{sv}av)", (parent, {}, []))
+        return node(parent)
 
     def _menu_call(self, _bus, _sender, _path, _iface, method: str, params: GLib.Variant, invocation) -> None:
         args = params.unpack()

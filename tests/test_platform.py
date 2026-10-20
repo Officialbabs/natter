@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 from unittest import mock
 
-from natter import DEFAULT_APP_ID, OLD_APP_ID, VERSION, distro, system
+from natter import DEFAULT_APP_ID, NAME, OLD_APP_ID, VERSION, distro, system
 from natter.__main__ import FLOORS, explain, too_old
 from natter.distro import DESKTOP, GST_PYTHON, MEDIA, image_based, install_hint, os_release, package_manager
 from natter.settings import folder_name, private_folder, spell_languages, write_private
@@ -360,7 +360,7 @@ class VersionGateTest(unittest.TestCase):
                                   "WebKitGTK": (2, 42, 0), "PyGObject": (3, 42, 0)}), [])  # exactly the floor
         self.assertEqual(too_old({"GTK": (4, 22, 4), "libadwaita": (1, 9, 1), "WebKitGTK": (2, 52, 6)}), [])
         self.assertEqual(too_old({"GTK": (5, 0, 0)}), [])  # a newer major with a lower minor
-        self.assertEqual(too_old({"GTK": (4, 12, 4)}), ["GTK is 4.12.4; Natter needs 4.14 or newer"])
+        self.assertEqual(too_old({"GTK": (4, 12, 4)}), [f"GTK is 4.12.4; {NAME} needs 4.14 or newer"])
         self.assertEqual(len(too_old({"WebKitGTK": (2, 41, 99), "PyGObject": (3, 40, 1),
                                       "libadwaita": (1, 4, 0)})), 3)
 
@@ -559,6 +559,8 @@ class PackagingTest(unittest.TestCase):
     def test_data_files_carry_the_app_id(self):
         for name in [f"icons/hicolor/scalable/apps/{DEFAULT_APP_ID}.svg",
                      f"icons/hicolor/scalable/apps/{DEFAULT_APP_ID}-unread.svg",
+                     f"icons/hicolor/symbolic/apps/{DEFAULT_APP_ID}-symbolic.svg",
+                     f"icons/hicolor/symbolic/apps/{DEFAULT_APP_ID}-unread-symbolic.svg",
                      f"{DEFAULT_APP_ID}.search-provider.ini", f"{DEFAULT_APP_ID}.service.in",
                      f"{DEFAULT_APP_ID}.metainfo.xml"]:
             self.assertTrue((DATA / name).is_file(), name)
@@ -586,6 +588,13 @@ class PackagingTest(unittest.TestCase):
         meson = (ROOT / "meson.build").read_text()
         self.assertIn(f"version: '{VERSION}'", meson)
         self.assertIn(f"app_id = '{DEFAULT_APP_ID}'", meson)
+
+    def test_names_agree(self):
+        """The name the menu, the software centre and the installer show is the window's."""
+        self.assertIn(f"\nName={NAME}\n", (ROOT / "natter.desktop.in").read_text())
+        metainfo = ElementTree.parse(DATA / f"{DEFAULT_APP_ID}.metainfo.xml").getroot()
+        self.assertEqual(metainfo.findtext("name"), NAME)
+        self.assertIn(f'\nAPP_NAME="{NAME}" ', (ROOT / "install.sh").read_text())
 
     def test_installers_agree(self):
         install = (ROOT / "install.sh").read_text()

@@ -1,8 +1,8 @@
 // Natter's bridge into WhatsApp Web. Runs before WhatsApp's own scripts, in the page.
 //
 // Up to Natter: notifications (with the sender's picture, opening the right chat), the chat list
-// for Ctrl+K and the dock menu, which chat is open, whether WhatsApp wants a phone linked, and
-// clicks on the call buttons. Down from Natter: window.__natter.* calls.
+// for Ctrl+K and the dock menu, which chat is open, whether WhatsApp wants a phone linked, clicks
+// on the call buttons, and how WhatsApp looks (read only). Down from Natter: window.__natter.* calls.
 (() => {
   "use strict";
   if (window.__natter) return;
@@ -111,7 +111,9 @@
   // what's live now (a sound not yet ended, a microphone track still on), not a tally that a
   // missed event would leave stuck.
 
-  const contexts = new Set();
+  // Contexts are held weakly: one WhatsApp drops without close() can still be collected.
+  const contexts = new Set();  // WeakRefs to AudioContexts
+  const rested = new WeakSet();  // contexts Natter suspended (the only ones its play() wakes)
   const sources = new Set();  // started source nodes that haven't ended
   const streams = new Set();  // microphone streams (voice notes, calls) feeding a context
   const elements = new Set();  // <audio>/<video> played through a context
@@ -119,7 +121,17 @@
   const IDLE_MS = 30000;  // long enough that a burst of message sounds doesn't cycle the pipeline
 
   function wake(context) {
-    if (context && context.state === "suspended") context.resume().catch(() => {});
+    if (!context) return;
+    rested.delete(context);
+    if (context.state === "suspended") context.resume().catch(() => {});
+  }
+
+  function eachContext(visit) {
+    for (const ref of contexts) {
+      const context = ref.deref();
+      if (!context || context.state === "closed") contexts.delete(ref);
+      else visit(context);
+    }
   }
 
   function playingSources() {
@@ -135,6 +147,11 @@
   }
 
   function mediaPlaying() {
+    // Elements no longer in the page and done playing go: each holds its context and a
+    // GStreamer player with its decoded media.
+    elements.forEach((element) => {
+      if (!element.isConnected && (element.paused || element.ended)) elements.delete(element);
+    });
     return [...elements, ...document.querySelectorAll("audio, video")].some((m) => !m.paused && !m.ended);
   }
 
@@ -149,8 +166,11 @@
 
   function rest() {
     if (performance.now() - lastStart < IDLE_MS || playingSources() || liveStreams() || mediaPlaying() || calling()) return;
-    contexts.forEach((context) => {
-      if (context.state === "running" && !callContexts.has(context)) context.suspend().catch(() => {});
+    eachContext((context) => {
+      if (context.state === "running" && !callContexts.has(context)) {
+        rested.add(context);
+        context.suspend().catch(() => {});
+      }
     });
   }
 
@@ -159,8 +179,9 @@
     const Tracked = class extends Context {
       constructor(...args) {
         super(...args);
-        contexts.add(this);
-        this.addEventListener("statechange", () => { if (this.state === "closed") contexts.delete(this); });
+        const ref = new WeakRef(this);
+        contexts.add(ref);
+        this.addEventListener("statechange", () => { if (this.state === "closed") contexts.delete(ref); });
       }
       createMediaStreamSource(stream) {
         streams.add(stream);
@@ -215,6 +236,9 @@
         if (!sources.has(this)) {
           sources.add(this);
           this.addEventListener("ended", () => sources.delete(this), { once: true });
+          // A one-shot sound silenced by disconnect() rather than stop() never ends: it goes
+          // once it would have, so it can't keep the contexts awake for good.
+          if (this.buffer && !this.loop) setTimeout(() => sources.delete(this), this.buffer.duration * 1000 + 2000);
         }
         return result;
       };
@@ -222,59 +246,110 @@
     const play = HTMLMediaElement.prototype.play;
     HTMLMediaElement.prototype.play = function (...args) {
       lastStart = performance.now();
-      contexts.forEach(wake);
+      eachContext((context) => { if (rested.has(context)) wake(context); });  // only what Natter suspended
       return play.apply(this, args);
     };
     setInterval(rest, IDLE_MS);
   }
 
   function audio() {
-    return { contexts: [...contexts].map((c) => c.state), sources: playingSources(), streams: liveStreams(),
-             media: mediaPlaying(), idle: Math.round(performance.now() - lastStart) };
+    const states = [];
+    eachContext((context) => states.push(context.state));
+    return { contexts: states, sources: playingSources(), streams: liveStreams(), media: mediaPlaying(),
+             elements: elements.size, idle: Math.round(performance.now() - lastStart),
+             rtc: window.__natterRtc ? window.__natterRtc.counts() : null };
+  }
+
+  // ---- Where things are in WhatsApp's page ----------------------------------------------------
+  // Every WhatsApp selector Natter leans on, in one table, likeliest candidate first. A redesign
+  // breaks these before anything else; canary() checks them against the live page once the chat
+  // list is up, so a layout change turns up in Natter's log by name instead of as features
+  // quietly gone.
+
+  const WHERE = {
+    "app": ["#app"],                                       // everything WhatsApp draws
+    "pane": ["#pane-side"],                                // the chat list
+    "row": ['[role="listitem"]', '[role="row"]'],          // one chat in the list
+    "row-name": ['[data-testid="cell-frame-title"] span[title]', "span[title]"],  // in a row
+    "side": ["#side"],                                     // the panel with the list and search
+    "search": ['#side [contenteditable="true"][role="textbox"]', '#side [contenteditable="true"]',
+               '#side input[type="text"], #side input[type="search"], #side input[role="textbox"]'],
+    "chips": ['[role="tab"][aria-selected]', "button[aria-pressed]"],  // filter chips, in #side
+    "header": ["#main header"],                            // the open chat's header
+    "header-name": ['[data-testid="conversation-info-header-chat-title"]', "span[title]",
+                    'span[dir="auto"]'],                   // the chat's name, in the header
+    "link-screen": ["#app canvas", "#app [data-ref]", "#app [data-link-code]"],  // the QR screen
+  };
+
+  function find(key, root = document) {
+    for (const candidate of WHERE[key]) {
+      const found = root.querySelector(candidate);
+      if (found) return found;
+    }
+    return null;
   }
 
   // ---- The chat list ------------------------------------------------------------------------
   // WhatsApp only keeps the visible rows in the page. Each row's position comes from its
   // translateY (or aria-rowindex), so Natter can tell how recent the chat is.
 
-  const ROWS = '[role="listitem"], [role="row"]';
+  const ROWS = WHERE.row.join(", ");
+  const CHIPS = WHERE.chips.join(", ");
 
   function nameOf(row) {
     // The name is in the row's title cell. Other titled spans hold the last message, which
     // Natter never reads; the title comes first when the cell isn't marked.
-    const span = row.querySelector('[data-testid="cell-frame-title"] span[title]') || row.querySelector("span[title]");
+    const span = find("row-name", row);
     const name = span && span.getAttribute("title");
     return name ? plainName(name) : "";
   }
 
-  function positionOf(row, fallback) {
+  // WhatsApp's list is virtual: each row sits at translateY(place × row height). The row height
+  // is the smallest gap between rows, read from their styles: asking the row for its height
+  // (offsetHeight) made the page lay itself out again on every scan, while WhatsApp was busiest.
+  function offsetOf(row) {
+    const match = /translateY\((-?[\d.]+)px\)/.exec(row.style.transform || "");
+    return match ? Number(match[1]) : NaN;
+  }
+
+  function rowHeight(offsets) {
+    const sorted = offsets.filter(Number.isFinite).sort((a, b) => a - b);
+    let height = Infinity;
+    for (let i = 1; i < sorted.length; i++) {
+      const gap = sorted[i] - sorted[i - 1];
+      if (gap > 1 && gap < height) height = gap;
+    }
+    return Number.isFinite(height) ? height : NaN;
+  }
+
+  function positionOf(row, offset, height, fallback) {
     const index = Number(row.getAttribute("aria-rowindex"));
     if (index > 0) return index - 1;
-    const match = /translateY\((-?[\d.]+)px\)/.exec(row.style.transform || "");
-    const height = row.offsetHeight;
-    const position = match && height > 0 ? Math.round(Number(match[1]) / height) : NaN;
+    const position = Number.isFinite(offset) && height > 0 ? Math.round(offset / height) : NaN;
     return Number.isFinite(position) ? Math.max(0, position) : fallback;
   }
 
   function chatRows() {
-    const list = document.getElementById("pane-side");
+    const list = find("pane");
     if (!list) return [];
-    const rows = [];
+    const found = [];
     list.querySelectorAll(ROWS).forEach((row, i) => {
       if (row.parentElement && row.parentElement.closest(ROWS)) return;  // a nested row
       const name = nameOf(row);
-      if (name) rows.push([name, positionOf(row, i)]);
+      if (name) found.push([name, row, offsetOf(row), i]);
     });
+    const height = rowHeight(found.map((entry) => entry[2]));
+    const rows = found.map(([name, row, offset, i]) => [name, positionOf(row, offset, height, i)]);
     return rows.sort((a, b) => a[1] - b[1]).slice(0, 200);
   }
 
   // The list is in recency order only with no search typed and the first filter chip ("All")
   // chosen. Chips are told by their selected state and place, not by their words.
   function filtered() {
-    const side = document.getElementById("side");
+    const side = find("side");
     if (!side) return false;
-    const chips = [...side.querySelectorAll('[role="tab"][aria-selected], button[aria-pressed]')]
-      .filter((chip) => !chip.closest("#pane-side"));
+    const chips = [...side.querySelectorAll(CHIPS)]
+      .filter((chip) => !chip.closest(WHERE.pane.join(", ")));
     return chips.some((chip) => {
       if (chip.getAttribute("aria-selected") !== "true" && chip.getAttribute("aria-pressed") !== "true") return false;
       const group = chip.closest('[role="tablist"]') || side;
@@ -292,10 +367,9 @@
   }
 
   function activeChat() {
-    const header = document.querySelector("#main header");
+    const header = find("header");
     if (!header) return "";
-    const title = header.querySelector('[data-testid="conversation-info-header-chat-title"]')
-      || header.querySelector("span[title]") || header.querySelector('span[dir="auto"]');
+    const title = find("header-name", header);
     if (!title) return "";
     return plainName((title.getAttribute("title") || textOf(title)).replace(/\s+/g, " "));
   }
@@ -303,8 +377,40 @@
   // WhatsApp's link screen (a QR code, or a code to type on the phone), told by its parts rather
   // than its words: no chat list, and a canvas or WhatsApp's data-ref (the QR's payload).
   function linkScreen() {
-    return !document.getElementById("pane-side")
-      && Boolean(document.querySelector("#app canvas, #app [data-ref], #app [data-link-code]"));
+    return !find("pane") && Boolean(document.querySelector(WHERE["link-screen"].join(", ")));
+  }
+
+  // ---- The canary ---------------------------------------------------------------------------
+  // Which WHERE entries still match the live page, told once the chat list is up (the rows need
+  // a moment to arrive) and again whenever Python asks. What can't be judged right now — an
+  // empty list, no open chat — is left out rather than called missing.
+
+  let canaryTold = false;
+
+  function canary() {
+    const found = [];
+    const missing = [];
+    const judge = (key, ok) => (ok ? found : missing).push(key);
+    judge("app", Boolean(find("app")));
+    const pane = find("pane");
+    if (!pane) {
+      // The link screen has no list; anything else without one is loading or a redesign.
+      judge("link-screen", linkScreen());
+      return { found, missing };
+    }
+    found.push("pane");
+    const side = find("side");
+    judge("side", Boolean(side));
+    judge("search", Boolean(find("search")));
+    if (side) judge("chips", Boolean(side.querySelector(CHIPS)));
+    const row = find("row", pane);
+    if (row || pane.querySelector("span[title]")) {  // an empty list can't be judged
+      judge("row", Boolean(row));
+      if (row) judge("row-name", Boolean(find("row-name", row)));
+    }
+    const header = find("header");
+    if (header) judge("header-name", Boolean(find("header-name", header)));
+    return { found, missing };
   }
 
   // ---- Calls --------------------------------------------------------------------------------
@@ -321,7 +427,7 @@
 
   function enableCalls() {
     if (typeof window.RTCPeerConnection === "function") return;  // WhatsApp's own buttons work
-    const header = document.querySelector("#main header");
+    const header = find("header");
     if (!header) return;
     header.querySelectorAll('button, [role="button"]').forEach((button) => {
       if (!callKind(button)) return;
@@ -335,7 +441,7 @@
 
   // With calls working in the page (rtc.js), Natter's call buttons press WhatsApp's own.
   function startCall(video) {
-    const header = document.querySelector("#main header");
+    const header = find("header");
     if (!header) return "no-chat";
     const button = [...header.querySelectorAll('button, [role="button"]')]
       .find((b) => callKind(b) === (video ? "video" : "voice"));
@@ -371,9 +477,9 @@
   const layout = new MutationObserver(() => { rewatch(); queueScan(); });
 
   function rewatch() {
-    const app = document.getElementById("app") || document.body;
-    const pane = document.getElementById("pane-side");
-    const header = document.querySelector("#main header");
+    const app = find("app") || document.body;
+    const pane = find("pane");
+    const header = find("header");
     // #main's parent stays while chats open and close, so #main coming back is seen there.
     const home = header ? header.closest("#main").parentElement
       : watched.home && watched.home.isConnected ? watched.home : null;
@@ -417,10 +523,15 @@
       lastActive = active;
       post({ type: "active", name: active });
     }
-    const ready = Boolean(document.getElementById("pane-side"));
+    const ready = Boolean(find("pane"));
     if (ready !== lastReady) {
       lastReady = ready;
       post({ type: "ready", ready });
+      if (ready) reportLook();
+      if (ready && !canaryTold) {
+        canaryTold = true;
+        setTimeout(() => post({ type: "canary", ...canary() }), 10000);
+      }
     }
     const state = ready ? "chats" : linkScreen() ? "needs-link" : "";
     if (state && state !== lastState) {
@@ -439,12 +550,15 @@
     if (!document.body) return setTimeout(watch, 500);
     rewatch();
     queueScan();
+    watchLook();
   }
 
   // ---- Opening a chat -----------------------------------------------------------------------
 
   function rowFor(name) {
-    for (const span of document.querySelectorAll("#pane-side span[title]")) {
+    const pane = find("pane");
+    if (!pane) return null;
+    for (const span of pane.querySelectorAll("span[title]")) {
       if (plainName(span.getAttribute("title")) === name) {
         const row = span.closest(ROWS);
         if (row && nameOf(row) === name) return span;
@@ -465,9 +579,7 @@
   }
 
   function searchBox() {
-    return document.querySelector('#side [contenteditable="true"][role="textbox"]')
-      || document.querySelector('#side [contenteditable="true"]')
-      || document.querySelector('#side input[type="text"], #side input[type="search"], #side input[role="textbox"]');
+    return find("search");
   }
 
   function setSearch(text) {
@@ -520,9 +632,13 @@
   // A wa.me link, clicked the way one in a message is, so WhatsApp can open its chat without a
   // reload. Says whether anything in the page took the click; if nothing did, the click goes
   // nowhere and Natter loads the link's address instead.
+  // Links WhatsApp opens itself when one is clicked in its page: chats (wa.me), group invites
+  // (its "Join group" preview) and channels.
+  const PAGE_LINKS = /^https:\/\/(wa\.me\/|chat\.whatsapp\.com\/|whatsapp\.com\/channel\/)/;
+
   function openLink(href) {
     const url = new URL(href);
-    if (url.protocol !== "https:" || url.hostname !== "wa.me") return false;
+    if (!PAGE_LINKS.test(url.href)) return false;
     const link = document.createElement("a");
     link.href = url.href;
     link.rel = "noopener noreferrer";
@@ -592,13 +708,65 @@
     if (parts.some((part) => !part)) return false;
     const files = items.map((item, i) => new File(parts[i], item.name, { type: item.type }));
     if (files.some((file, i) => file.size !== items[i].size)) return false;  // a piece went missing
-    const message = document.querySelector('#main footer [contenteditable="true"]');
-    if (!message) return false;
+    return handOver(files);
+  }
+
+  // WhatsApp's preview (picture, video or document, with a caption box) opens in the middle
+  // drawer, over the chat. While it's open the chat's message box drops files (its attach
+  // command does nothing when a middle drawer exists), so they go in through the preview's own
+  // "Add file" input instead: the handler of its + button and of a drop on it, any kind of file.
+  // WhatsApp's attach menu adds its inputs to <body> itself; the preview's sits inside it.
+  function previewPicker() {
+    const drawer = document.querySelector('[data-testid="drawer-middle"]');
+    const inDrawer = drawer && drawer.querySelector('input[type="file"][multiple]');
+    if (inDrawer) return inDrawer;
+    return [...document.querySelectorAll('#app input[type="file"][multiple]')]
+      .find((input) => input.parentElement !== document.body) || null;
+  }
+
+  function handOver(files) {
     const transfer = new DataTransfer();
     files.forEach((file) => transfer.items.add(file));
+    const picker = previewPicker();
+    if (picker) {
+      picker.files = transfer.files;
+      picker.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    }
+    const message = document.querySelector('#main footer [contenteditable="true"]');
+    if (!message) return false;
     // Pasted into the message box, WhatsApp opens its preview. (A drop made by a script it
     // accepts and then ignores.) A handler that takes the files cancels the event.
     return !pasteInto(message, transfer);
+  }
+
+  // Files straight from disk: Natter clicks an input of its own (WebKit counts a script Natter
+  // runs as the user's doing), WebKit asks Natter which files, and Natter answers with the ones
+  // dropped or pasted (account.py). They're never copied through Natter or the page, however big.
+  // null: WebKit never asked (Natter then sends them piece by piece).
+  const PICK_TAG = "application/x-natter-files";
+  const PICK_WAIT_MS = 3000;
+
+  function pick() {
+    return new Promise((resolve) => {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.multiple = true;
+      input.accept = PICK_TAG;
+      input.style.display = "none";
+      let settled = false;
+      const settle = (value) => {
+        if (settled) return;
+        settled = true;
+        input.remove();
+        resolve(value);
+      };
+      input.addEventListener("change", () => settle(input.files.length ? handOver([...input.files]) : false), { once: true });
+      input.addEventListener("cancel", () => settle(false), { once: true });
+      document.documentElement.appendChild(input);
+      input.click();
+      setTimeout(() => settle(null), PICK_WAIT_MS);
+    });
   }
 
   // ---- Classes Natter's style sheet hangs off -----------------------------------------------
@@ -620,8 +788,54 @@
     attributes: true, attributeFilter: ["class"],
   });
 
+  // ---- How WhatsApp looks (read only) -------------------------------------------------------
+  // Natter's theme (themes.py) redefines WhatsApp's colour names on <body> and #main, and leaves
+  // <html>'s alone, so those still say what WhatsApp itself draws. Natter is told whether they're
+  // there, whether they're dark, whether WhatsApp's own dark class agrees, and which style WebKit
+  // tells the page. If the names are gone, or the class doesn't follow them, Natter takes its
+  // theme off the page; if WhatsApp has a light or dark look of its own, Natter says so (app.py,
+  // page_look_changed). This only reads: it changes nothing in the page and stores nothing.
+
+  const LOOK_SETTLE_MS = 2000;  // WhatsApp's dark class follows a change of style a moment later
+  const darkStyle = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+  let lastLook = "";
+  let lookTimer = 0;
+
+  function look() {
+    const rgb = getComputedStyle(document.documentElement).getPropertyValue("--WDS-surface-default-RGB").trim();
+    const parts = rgb ? rgb.split(",").map((part) => Number(part.trim())) : [];
+    const tokens = parts.length === 3 && parts.every((n) => Number.isFinite(n) && n >= 0 && n <= 255);
+    const luma = tokens ? 0.299 * parts[0] + 0.587 * parts[1] + 0.114 * parts[2] : 255;
+    return {
+      tokens, dark: tokens && luma < 128,
+      darkClass: Boolean(document.body && document.body.classList.contains("dark")),
+      media: Boolean(darkStyle && darkStyle.matches),
+    };
+  }
+
+  // Once the chat list is up (the link screen's look is fixed), after things settle, and only
+  // when something changed.
+  function reportLook() {
+    if (lookTimer) clearTimeout(lookTimer);
+    lookTimer = setTimeout(() => {
+      lookTimer = 0;
+      if (!lastReady) return;
+      const now = look();
+      const signature = JSON.stringify(now);
+      if (signature === lastLook) return;
+      lastLook = signature;
+      post({ type: "look", ...now });
+    }, LOOK_SETTLE_MS);
+  }
+
+  function watchLook() {
+    if (darkStyle && darkStyle.addEventListener) darkStyle.addEventListener("change", reportLook);
+    new MutationObserver(reportLook).observe(document.body, { attributes: true, attributeFilter: ["class"] });
+  }
+
   window.__natter = {
-    clickNotification, openChat, openLink, attach, receive, discard, setClass, activeChat, scan, audio, startCall,
+    clickNotification, openChat, openLink, attach, pick, receive, discard, setClass, activeChat, scan, audio, startCall,
+    canary,
   };
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", watch, { once: true });

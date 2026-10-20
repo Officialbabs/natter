@@ -1,5 +1,5 @@
-"""Natter's place on the system: its own systemd scope, memory it gives back, the sandbox,
-the Background portal, and the GStreamer codecs WhatsApp's media needs.
+"""Natter's place on the system: its own systemd scope and the memory limits on it, memory it
+gives back, the sandbox, the Background portal, and the GStreamer codecs WhatsApp's media needs.
 
 Desktops start each app in a transient unit named after it (GNOME: app-gnome-<app id>-<pid>.scope,
 Ada: app-ada-…, KDE: app-<app id>@<random>.service, Flatpak: app-flatpak-<app id>-<pid>.scope),
@@ -11,18 +11,23 @@ with its WebKit processes counted as that app's.
 from __future__ import annotations
 
 import errno
+import json
 import os
 import re
+import shutil
+import subprocess
 import threading
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Callable, Optional
 
 from gi.repository import Gio, GLib
 
 from . import APP_ID, NAME
 from .distro import GST_PYTHON, MEDIA, install_hint
+from .memguard import mem_total, scope_limits
 
 SYSTEMD = "org.freedesktop.systemd1"
 PORTAL = "org.freedesktop.portal.Desktop"
@@ -46,6 +51,88 @@ def confined_snap(snap: Optional[str]) -> bool:
         return False
     confinement = re.search(r"^confinement:[ \t]*(\S*)", meta, re.M)
     return not (confinement and confinement[1].strip("'\"") == "classic")
+
+
+# ---- Real-time threads ---------------------------------------------------------------------
+
+# WebKit makes some of its threads real-time by asking RealtimeKit, on the system bus. First it
+# caps the process's real-time CPU time at RealtimeKit's limit, 200 ms, as RealtimeKit requires.
+# The kernel kills (SIGKILL) a process whose real-time thread runs that long without a pause.
+# WebKit's network process has one such thread, "Storage", which runs IndexedDB. Loading
+# WhatsApp's database it ran past 200 ms, and the network process died, often seconds after
+# Natter started. The page was left cut short, half loaded, or failing every load after.
+# Nothing in Natter needs the system bus, so Natter and the WebKit processes it starts don't see
+# it: WebKit can't ask, and its threads stay ordinary ones with no cap.
+SYSTEM_BUS = "DBUS_SYSTEM_BUS_ADDRESS"
+NO_SYSTEM_BUS = "unix:path=/dev/null/natter-has-no-system-bus"
+_system_bus_before: Optional[tuple[Optional[str]]] = None  # (the address it had,) once hidden
+
+
+def hide_system_bus(environ=None, sandboxed: Optional[bool] = None) -> bool:
+    """Hide the system bus from Natter and what it starts. Call it before anything connects to
+    the system bus (GLib keeps the connection it makes). Inside Flatpak or Snap, WebKit asks a
+    portal on the session bus instead, so nothing changes there. True when it hid it."""
+    global _system_bus_before
+    environ = os.environ if environ is None else environ
+    if (in_sandbox() if sandboxed is None else sandboxed) or environ.get(SYSTEM_BUS) == NO_SYSTEM_BUS:
+        return False
+    _system_bus_before = (environ.get(SYSTEM_BUS),)
+    environ[SYSTEM_BUS] = NO_SYSTEM_BUS
+    return True
+
+
+def give_system_bus(launcher) -> None:
+    """Give a program Natter starts (not a WebKit one) the system bus Natter hid from itself.
+    `launcher` is a Gio.SubprocessLauncher or a Gio.AppLaunchContext."""
+    if _system_bus_before is None:
+        return
+    address = _system_bus_before[0]
+    if address is None:
+        launcher.unsetenv(SYSTEM_BUS)
+    elif isinstance(launcher, Gio.SubprocessLauncher):
+        launcher.setenv(SYSTEM_BUS, address, True)
+    else:
+        launcher.setenv(SYSTEM_BUS, address)
+
+
+def open_uri(uri: str, window=None) -> None:
+    """Open `uri` (a link, or a file's file:// address) in the app the desktop has for it.
+
+    Outside Flatpak and Snap GTK starts that app itself, with Natter's environment, so a browser
+    it started would have no system bus (hide_system_bus). So Natter starts it, with the system
+    bus given back. Inside a sandbox GTK asks the OpenURI portal, and nothing was hidden."""
+    from gi.repository import Gdk, Gtk
+
+    if _system_bus_before is None:
+        Gtk.UriLauncher.new(uri).launch(window, None, None, None)
+        return
+    display = window.get_display() if window is not None else Gdk.Display.get_default()
+    context = display.get_app_launch_context()
+    give_system_bus(context)
+
+    def done(_source, result) -> None:
+        try:
+            Gio.AppInfo.launch_default_for_uri_finish(result)
+        except GLib.Error as error:
+            print(f"natter: couldn't open {urlparse(uri).scheme} address: {error.message}", flush=True)
+
+    Gio.AppInfo.launch_default_for_uri_async(uri, context, None, done)
+
+
+def network_processes(pid: Optional[int] = None, proc: Path = Path("/proc")) -> set[int]:
+    """The WebKit network processes Natter started: its children named WebKitNetworkProcess."""
+    pid = os.getpid() if pid is None else pid
+    try:
+        tasks = os.listdir(proc / str(pid) / "task")
+    except OSError:
+        return set()
+    found = set()
+    for task in tasks:
+        for child in _read(proc / str(pid) / "task" / task / "children").split():
+            # The name is cut to 15 characters: "WebKitNetworkPr".
+            if child.isdigit() and _read(proc / child / "comm").startswith("WebKitNetwork"):
+                found.add(int(child))
+    return found
 
 
 def _read(path) -> str:
@@ -119,12 +206,87 @@ def scope_name(pid: int) -> str:
     return f"app-{app_id}-{pid}.scope"
 
 
-def move_to_own_scope(timeout: float = 0.5) -> Optional[str]:
-    """Put Natter in a transient scope of its own, before it starts any WebKit process.
+# The kernel's backstop for a page that grows without end, reached only when Natter's guard
+# (memguard.py) couldn't act: past MemoryMax, with its swap capped by MemorySwapMax, the kernel
+# ends the biggest process in the unit, a page (the guard ranks pages first, oom_score_adj).
+# What follows is the unit's OOMPolicy: "continue" leaves Natter running to start a fresh page;
+# systemd's default, "stop", stops all of Natter. No MemoryHigh: it never kills, and on 20 Oct
+# 2026 it held a runaway page at 6 GB while pushing gigabytes of it into swap, and stalled
+# Natter's window with it. memguard.scope_limits sizes both from the computer's memory.
+_made_scope: Optional[str] = None  # the scope move_to_own_scope made
+_launcher_limits: Optional[tuple[Optional[int], Optional[int]]] = None  # (MemoryMax, MemorySwapMax) a launcher set
+_told_oom_policy = False
+
+
+def _cgroup_limit(cgroup: Path, name: str) -> Optional[int]:
+    """A cgroup's memory.max or memory.swap.max in bytes; None when there's none ("max")."""
+    value = _read(cgroup / name).strip()
+    return int(value) if value.isdigit() else None
+
+
+def _unit_property(bus: Gio.DBusConnection, unit: str, name: str) -> Optional[str]:
+    """A string property of a systemd unit (its scope or service interface), None on any trouble."""
+    interface = "org.freedesktop.systemd1." + ("Service" if unit.endswith(".service") else "Scope")
+    try:
+        path = bus.call_sync(SYSTEMD, "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "GetUnit",
+                             GLib.Variant("(s)", (unit,)), GLib.VariantType("(o)"),
+                             Gio.DBusCallFlags.NONE, 3000, None).unpack()[0]
+        value = bus.call_sync(SYSTEMD, path, "org.freedesktop.DBus.Properties", "Get",
+                              GLib.Variant("(ss)", (interface, name)), GLib.VariantType("(v)"),
+                              Gio.DBusCallFlags.NONE, 3000, None).unpack()[0]
+    except GLib.Error:
+        return None
+    return value if isinstance(value, str) else None
+
+
+def limit_own_scope(accounts: int = 1) -> bool:
+    """Set the backstop's MemoryMax and MemorySwapMax, for `accounts` pages, on the unit Natter
+    runs in: one a launcher made (Ada's does), or the one move_to_own_scope made. Call it again
+    whenever an account is added or removed. True when they were set.
+
+    A launcher's own lower limits stay. Its OOMPolicy can't be changed after the unit starts
+    (systemd refuses it), so if it's "stop" that is logged, once: there the kernel's backstop
+    stops all of Natter, and only the guard ends a runaway page alone."""
+    global _launcher_limits, _told_oom_policy
+    cgroup = own_cgroup()
+    if in_sandbox() or not in_own_scope(cgroup):
+        return False
+    memory_max, swap_max = scope_limits(mem_total(), accounts)
+    launcher = cgroup.name != _made_scope
+    if launcher:
+        if _launcher_limits is None:  # read before Natter set anything of its own
+            _launcher_limits = (_cgroup_limit(cgroup, "memory.max"), _cgroup_limit(cgroup, "memory.swap.max"))
+        memory_max = min(memory_max, _launcher_limits[0] or memory_max)
+        swap_max = min(swap_max, swap_max if _launcher_limits[1] is None else _launcher_limits[1])
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        bus.call_sync(SYSTEMD, "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
+                      "SetUnitProperties",
+                      GLib.Variant("(sba(sv))", (cgroup.name, True, [("MemoryMax", GLib.Variant("t", memory_max)),
+                                                                     ("MemorySwapMax", GLib.Variant("t", swap_max))])),
+                      None, Gio.DBusCallFlags.NONE, 3000, None)
+    except GLib.Error as error:
+        print(f"natter: memory: couldn't limit {cgroup.name}: {error.message}", flush=True)
+        return False
+    if launcher and not _told_oom_policy:
+        _told_oom_policy = True
+        policy = _unit_property(bus, cgroup.name, "OOMPolicy")
+        if policy != "continue":
+            print(f"natter: memory: past {memory_max >> 20} MB, the kernel ends a page and systemd stops all of "
+                  f"{NAME} ({cgroup.name} has OOMPolicy={policy or 'unknown'}, which only its launcher can "
+                  "change); the guard ends a runaway page alone, before that", flush=True)
+    return True
+
+
+def move_to_own_scope(timeout: float = 0.5, accounts: int = 1) -> Optional[str]:
+    """Put Natter in a transient scope of its own, before it starts any WebKit process, with the
+    backstop's limits for `accounts` pages (limit_own_scope changes them later) and
+    OOMPolicy=continue, which can only be set now.
 
     Returns the scope's name, or None when Natter already has one, runs in a sandbox (whose
     launcher made the scope), or there's no systemd user manager to ask.
     """
+    global _made_scope
     if in_sandbox() or in_own_scope():
         return None
     try:
@@ -135,20 +297,31 @@ def move_to_own_scope(timeout: float = 0.5) -> Optional[str]:
         return None
     pid = os.getpid()
     name = scope_name(pid)
+    memory_max, swap_max = scope_limits(mem_total(), accounts)
+    properties = [
+        ("PIDs", GLib.Variant("au", [pid])),
+        ("Description", GLib.Variant("s", NAME)),
+        ("Slice", GLib.Variant("s", "app.slice")),
+        ("CollectMode", GLib.Variant("s", "inactive-or-failed")),
+        ("MemoryMax", GLib.Variant("t", memory_max)),
+        ("MemorySwapMax", GLib.Variant("t", swap_max)),
+        # The kernel ending a page past MemoryMax leaves Natter running: it starts a fresh page.
+        ("OOMPolicy", GLib.Variant("s", "continue")),
+    ]
     try:
-        properties = [
-            ("PIDs", GLib.Variant("au", [pid])),
-            ("Description", GLib.Variant("s", NAME)),
-            ("Slice", GLib.Variant("s", "app.slice")),
-            ("CollectMode", GLib.Variant("s", "inactive-or-failed")),
-        ]
-        bus.call_sync(SYSTEMD, "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
-                      "StartTransientUnit",
-                      GLib.Variant("(ssa(sv)a(sa(sv)))", (name, "fail", properties, [])),
-                      GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, 3000, None)
+        try:
+            _start_unit(bus, name, properties)
+        except GLib.Error as error:
+            if "OOMPolicy" not in error.message:
+                raise
+            # A systemd that can't set OOMPolicy on a scope refuses the whole unit: the rest still helps.
+            print(f"natter: memory: systemd won't set OOMPolicy on {name} ({error.message}); past its "
+                  f"limit, it stops all of {NAME}", flush=True)
+            _start_unit(bus, name, [prop for prop in properties if prop[0] != "OOMPolicy"])
     except GLib.Error as error:
         print(f"natter: couldn't get a scope of its own: {error.message}")
         return None
+    _made_scope = name
     # systemd moves the process once the job runs; wait so WebKit's processes follow it.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -156,6 +329,13 @@ def move_to_own_scope(timeout: float = 0.5) -> Optional[str]:
             return name
         time.sleep(0.02)
     return name
+
+
+def _start_unit(bus: Gio.DBusConnection, name: str, properties: list) -> None:
+    bus.call_sync(SYSTEMD, "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
+                  "StartTransientUnit",
+                  GLib.Variant("(ssa(sv)a(sa(sv)))", (name, "fail", properties, [])),
+                  GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, 3000, None)
 
 
 # ---- Memory ---------------------------------------------------------------------------------
@@ -180,18 +360,91 @@ def can_reclaim(cgroup: Optional[Path], swaps: str, zswap: str) -> bool:
     return _read(cgroup / "memory.swap.max").strip() != "0" and cheap_swap(swaps, zswap)
 
 
+def footprint(cgroup: Optional[Path] = None) -> int:
+    """Bytes Natter's unit really holds: its private memory (anon) plus what's been swapped
+    out, not the file cache the kernel can drop whenever it likes. 0 when it can't be read."""
+    cgroup = cgroup or own_cgroup()
+    if cgroup is None:
+        return 0
+    anon = 0
+    for line in _read(cgroup / "memory.stat").splitlines():
+        if line.startswith("anon "):
+            anon = int(line.split()[1])
+            break
+    try:
+        swapped = int(_read(cgroup / "memory.swap.current") or 0)
+    except ValueError:
+        swapped = 0
+    return anon + swapped
+
+
+def memory_tight(meminfo: Optional[str] = None) -> bool:
+    """Whether the whole computer is short of memory: under a tenth of it available, and swap
+    (if any) all but full. Ada's lifecycled asks apps to close then; Natter, hidden, has no
+    window to close, so it answers by giving back what it can (a fresh page)."""
+    values = {}
+    for line in (meminfo if meminfo is not None else _read("/proc/meminfo")).splitlines():
+        name, _, rest = line.partition(":")
+        if rest.split():
+            values[name] = int(rest.split()[0])
+    total, available = values.get("MemTotal", 0), values.get("MemAvailable", 0)
+    swap, swap_free = values.get("SwapTotal", 0), values.get("SwapFree", 0)
+    if not total:
+        return False
+    return available < total / 10 and (swap == 0 or swap_free < swap * 0.15)
+
+
+# Swap is for what's cold and will be wanted again. WhatsApp's leaked heap never is: parked in
+# swap it stays there, and one day it filled the computer's 15 GB (Ada's hibernation room
+# included) until Ada said memory was full. Past either of these, Natter stops moving memory to
+# swap, and a hidden Natter takes a fresh page instead, the one thing that empties it (app.py).
+SWAP_BUDGET_MB = 1024  # of Natter's own memory in swap
+SWAP_SHARE = 0.6  # of the computer's swap in use
+
+
+def own_swap(cgroup: Optional[Path] = None) -> int:
+    """Bytes of Natter's unit in swap (0 when it can't be read)."""
+    cgroup = cgroup or own_cgroup()
+    try:
+        return int(_read(cgroup / "memory.swap.current") or 0) if cgroup else 0
+    except ValueError:
+        return 0
+
+
+def swap_share(meminfo: Optional[str] = None) -> float:
+    """How much of the computer's swap is in use, from 0 to 1 (0 with no swap)."""
+    values = {}
+    for line in (meminfo if meminfo is not None else _read("/proc/meminfo")).splitlines():
+        name, _, rest = line.partition(":")
+        if name in ("SwapTotal", "SwapFree") and rest.split():
+            values[name] = int(rest.split()[0])
+    total = values.get("SwapTotal", 0)
+    return (total - values.get("SwapFree", total)) / total if total else 0.0
+
+
+def swap_full(cgroup: Optional[Path] = None, meminfo: Optional[str] = None) -> bool:
+    """Whether swap has taken all it should: Natter's share past its budget, or the computer's
+    swap past SWAP_SHARE in use."""
+    return own_swap(cgroup) > SWAP_BUDGET_MB * 1024 * 1024 or swap_share(meminfo) > SWAP_SHARE
+
+
 class Reclaimer:
     """Gives Natter's cold memory back while its window is hidden, the way Ada does for paused
     apps, except Natter keeps running so messages and notifications still arrive.
 
     Pages WhatsApp hasn't touched in a while go to (compressed) swap in small steps; anything
-    it needs again comes straight back. It stops at `floor` MB, or when the kernel can't find
-    more to take.
+    it needs again comes straight back. It stops at `floor` MB, when swap has taken all it
+    should (swap_full), or when the kernel can't find more to take.
     """
 
     STEP = "64M"
+    # Down to 300 MB (WhatsApp's own heap, swapped out), coming back to the window stuttered
+    # while it was pulled back in: typing, scrolling, until it all was. Kept above what
+    # WhatsApp works with, and file cache and anon taken alike, only what's really cold goes.
+    FLOOR_MB = 800
+    SWAPPINESS = 100
 
-    def __init__(self, floor_mb: int = 300, on_done: Optional[Callable[[int, int], None]] = None) -> None:
+    def __init__(self, floor_mb: int = FLOOR_MB, on_done: Optional[Callable[[int, int], None]] = None) -> None:
         self.cgroup: Optional[Path] = None  # the unit the current run gives memory back from
         self.floor = floor_mb * 1024 * 1024
         self.on_done = on_done
@@ -233,7 +486,7 @@ class Reclaimer:
         """Ask the kernel for one step. False when it has nothing more to give."""
         fd = os.open(self.cgroup / "memory.reclaim", os.O_WRONLY)
         try:
-            for command in (f"{self.STEP} swappiness=200", self.STEP):
+            for command in (f"{self.STEP} swappiness={self.SWAPPINESS}", self.STEP):
                 try:
                     os.write(fd, command.encode())
                     return True
@@ -247,7 +500,7 @@ class Reclaimer:
 
     def _run(self) -> None:
         before = self.usage()
-        while not self._stop.is_set() and self.usage() > self.floor:
+        while not self._stop.is_set() and self.usage() > self.floor and not swap_full(self.cgroup):
             try:
                 if not self._step():
                     break
@@ -311,6 +564,132 @@ class CallSound:
         if self._pipeline is not None:
             self._pipeline.set_state(self._null)
             self._pipeline = None
+
+
+class AudioFollower:
+    """Keeps the page's sound on the computer's current output.
+
+    WebKit's sound streams can be tied to the device that was the default when they opened, and
+    WhatsApp keeps its audio context open for good: Bluetooth headphones connected later got
+    nothing, voice notes and calls stayed on the laptop's speaker. When the default changes (or
+    a stream opens), Natter tells PipeWire its page's streams follow the default (target.object
+    -1). Not a move to a device: WirePlumber would remember that for every WebKit app's sound.
+    Through pactl and pw-metadata; where they're missing, nothing changes.
+    """
+
+    def __init__(self, app_name: str = NAME, app_id: str = APP_ID,
+                 on_change: Optional[Callable[[], None]] = None) -> None:
+        self.app_name, self.app_id = app_name, app_id
+        self.on_change = on_change  # the devices or the defaults changed (main loop)
+        self.pactl = shutil.which("pactl")
+        self.metadata = shutil.which("pw-metadata")
+        self._process: Optional[Gio.Subprocess] = None
+        self._pending = 0
+        self._restarts = 0
+        self._busy = threading.Lock()
+        self._change_pending = 0
+
+    def start(self) -> bool:
+        if not self.pactl or not self.metadata or self._process is not None:
+            return False
+        try:
+            launcher = Gio.SubprocessLauncher.new(Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
+            self._process = launcher.spawnv([self.pactl, "subscribe"])
+        except GLib.Error:
+            return False
+        self._read(Gio.DataInputStream.new(self._process.get_stdout_pipe()))
+        self._schedule()
+        return True
+
+    def stop(self) -> None:
+        if self._process is not None:
+            self._process.force_exit()
+            self._process = None
+        if self._pending:
+            GLib.source_remove(self._pending)
+            self._pending = 0
+
+    def _read(self, stream: Gio.DataInputStream) -> None:
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._line)
+
+    def _line(self, stream: Gio.DataInputStream, result: Gio.AsyncResult) -> None:
+        try:
+            line, _length = stream.read_line_finish_utf8(result)
+        except GLib.Error:
+            line = None
+        if line is None:  # pactl ended (PipeWire restarted, say): again, a few times
+            self._process = None
+            if self._restarts < 5:
+                self._restarts += 1
+                GLib.timeout_add_seconds(5, lambda: self.start() and False)
+            return
+        # The default device changed ("on server"), a stream opened, or a device came or went.
+        if "on server" in line or "'new' on sink-input" in line:
+            self._schedule()
+        if self.on_change and ("on server" in line or " on sink #" in line or " on source #" in line) \
+                and ("'new'" in line or "'remove'" in line or "on server" in line):
+            self._changed()
+        self._read(stream)
+
+    def _changed(self) -> None:
+        if not self._change_pending:
+            def fire() -> bool:
+                self._change_pending = 0
+                self.on_change()
+                return GLib.SOURCE_REMOVE
+            self._change_pending = GLib.timeout_add(500, fire)
+
+    def _schedule(self) -> None:
+        if not self._pending:
+            self._pending = GLib.timeout_add(300, self._follow)
+
+    def _follow(self) -> bool:
+        self._pending = 0
+        threading.Thread(target=self.follow, name="natter-audio", daemon=True).start()
+        return GLib.SOURCE_REMOVE
+
+    def _pactl(self, *args: str) -> str:
+        try:
+            return subprocess.run([self.pactl, *args], capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    def follow(self) -> int:
+        """Move the page's streams that aren't on the default output there. Returns how many."""
+        if not self._busy.acquire(blocking=False):
+            return 0
+        try:
+            default = self._pactl("get-default-sink").strip()
+            sinks = json.loads(self._pactl("-f", "json", "list", "sinks", "short") or "[]")
+            streams = json.loads(self._pactl("-f", "json", "list", "sink-inputs") or "[]")
+            target = next((sink["index"] for sink in sinks if sink.get("name") == default), None)
+            if target is None:
+                return 0
+            moved = 0
+            for stream in page_streams(streams, self.app_name, self.app_id):
+                node = (stream.get("properties") or {}).get("object.id")
+                if stream.get("sink") != target and node:
+                    subprocess.run([self.metadata, "--", str(node), "target.object", "-1"],
+                                   capture_output=True, timeout=5)
+                    moved += 1
+            return moved
+        except (ValueError, TypeError, KeyError):
+            return 0
+        finally:
+            self._busy.release()
+
+
+def page_streams(streams: list, app_name: str = NAME, app_id: str = APP_ID) -> list:
+    """Natter's page's sound streams among `pactl -f json list sink-inputs`: WebKit's sandboxed
+    web process, carrying Natter's app id (or name). Natter's own silent call stream runs in
+    python3, not here."""
+    found = []
+    for stream in streams:
+        props = stream.get("properties") or {}
+        if props.get("application.process.binary") == "WebKitWebProcess" and (
+                props.get("pipewire.access.portal.app_id") == app_id or props.get("application.name") == app_name):
+            found.append(stream)
+    return found
 
 
 def has_background_portal(bus: Gio.DBusConnection) -> bool:

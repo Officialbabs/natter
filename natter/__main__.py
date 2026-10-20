@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import sys
 
-from . import APP_ID, DEFAULT_APP_ID
+from . import APP_ID, DEFAULT_APP_ID, NAME
 
 # The oldest versions Natter runs with. Ubuntu 24.04, Debian 13 and Fedora 40 have them.
 FLOORS = {"PyGObject": (3, 42), "GTK": (4, 14), "libadwaita": (1, 5), "WebKitGTK": (2, 42)}
@@ -26,7 +26,7 @@ def dotted(version) -> str:
 
 def too_old(found: dict[str, tuple[int, ...]]) -> list[str]:
     """Which of `found` (name → version) are older than Natter needs, in words."""
-    return [f"{name} is {dotted(version)}; Natter needs {dotted(FLOORS[name])} or newer"
+    return [f"{name} is {dotted(version)}; {NAME} needs {dotted(FLOORS[name])} or newer"
             for name, version in found.items() if tuple(version[:len(FLOORS[name])]) < FLOORS[name]]
 
 
@@ -58,9 +58,9 @@ def explain(trouble: list[str]) -> None:
     from .distro import DESKTOP, image_based, install_hint, os_release
 
     release = os_release()
-    lines = ["Natter can't start:"] + [f"  - {line}" for line in trouble]
+    lines = [f"{NAME} can't start:"] + [f"  - {line}" for line in trouble]
     hint = install_hint(DESKTOP, release)
-    flatpak = f"the Natter Flatpak ({DEFAULT_APP_ID})"
+    flatpak = f"the {NAME} Flatpak ({DEFAULT_APP_ID})"
     if image_based(release):
         lines.append(f"This system installs apps as Flatpaks: install {flatpak}, which brings everything it needs.")
         if hint:
@@ -93,6 +93,9 @@ def main() -> int:
         pass
     if check():
         return 1
+    from .system import hide_system_bus
+
+    hide_system_bus()  # before anything connects to it: WebKit's real-time threads (system.py)
     from gi.repository import Gio
 
     asking = any(arg in ("-h", "--help", "-v", "--version") or arg.startswith("--help-") for arg in sys.argv[1:])
@@ -100,7 +103,7 @@ def main() -> int:
         try:
             Gio.bus_get_sync(Gio.BusType.SESSION)
         except GLib.Error as error:
-            print(f"Natter can't start: there's no D-Bus session bus ({error.message}).\n"
+            print(f"{NAME} can't start: there's no D-Bus session bus ({error.message}).\n"
                   "It runs inside a desktop session, which is where notifications, the tray and links reach it.",
                   file=sys.stderr)
             return 1

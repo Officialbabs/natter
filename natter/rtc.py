@@ -16,6 +16,7 @@ import base64
 import ctypes
 import hashlib
 import itertools
+import json
 import re
 import secrets
 import ssl
@@ -30,7 +31,8 @@ try:
     gi.require_version("Gst", "1.0")
     gi.require_version("GstSdp", "1.0")
     gi.require_version("GstWebRTC", "1.0")
-    from gi.repository import GLib, Gst, GstSdp, GstWebRTC
+    gi.require_version("JavaScriptCore", "6.0")
+    from gi.repository import GLib, Gst, GstSdp, GstWebRTC, JavaScriptCore
 except (ImportError, ValueError):
     Gst = None
 
@@ -44,7 +46,7 @@ ICE_FROM_CONNECTION = {"connecting": "checking", "connected": "connected", "disc
                        "failed": "failed", "closed": "closed"}
 SDP_TYPES = {"offer": 1, "pranswer": 2, "answer": 3, "rollback": 4}
 MAX_MESSAGE = 262144  # what the page is told when the far side doesn't say (RFC 8841's default is 64 KB)
-FLUSH_MS = 2  # how long events wait to go to the page together
+FLUSH_MS = 2  # batches go to the page at most this often (the first after a pause, at once)
 # WhatsApp's own checks open these channels for a moment: they aren't calls.
 NOT_CALLS = ("sctp-prewarm", "__transfer_probe__")
 DEBUG = bool(GLib.getenv("NATTER_DEBUG")) if Gst is not None else False
@@ -275,7 +277,7 @@ class Channel:
     def _on_data(self, _channel, data) -> None:
         self.received += 1
         payload = data.get_data() if data is not None else b""
-        self._emit("message", data=base64.b64encode(payload or b"").decode())
+        self.host.emit({"ch": self.key, "type": "message", "bytes": payload or b""})
 
     def init(self) -> dict:
         get = self.channel.get_property
@@ -552,6 +554,139 @@ def _error(answer, fallback: str) -> dict:
     return {"error": {"name": "OperationError", "message": message}}
 
 
+# ---- The page's video codecs ---------------------------------------------------------------------
+# rtc.js keeps counts of what each VideoDecoder and VideoEncoder in the page does, and of the
+# workers it starts: codec names, sizes and numbers, never content. They go to the log, so a
+# runaway (a video decoded whole with its frames kept, as once held 12 GB) shows what did it.
+
+LOG_EVERY = 1.0  # seconds between two lines for the same codec, at least
+_CODEC_NAME = re.compile(r"[A-Za-z0-9.]{1,40}")
+_ERROR_NAME = re.compile(r"[A-Za-z]{1,40}")
+_FIELDS = {"dec": {"op", "kind", "id", "codec", "desc", "lat", "rewrite", "w", "h", "out", "open", "held", "queue",
+                   "drops", "err"},
+           "enc": {"op", "kind", "id", "codec", "mode", "w", "h", "out", "queue", "drops", "err"},
+           "page": {"op", "kind", "workers", "annexb"}}
+
+
+def webcodecs_line(message: dict) -> Optional[tuple[str, str]]:
+    """(which codec, its log line) for one of rtc.js's counts messages, or None for anything else.
+
+    Only the fields rtc.js sends, each as it sends it: a message with another field, a long or
+    odd string, or a value of the wrong kind is dropped whole.
+    """
+    if not isinstance(message, dict) or message.get("op") != "webcodecs":
+        return None
+    kind = message.get("kind")
+    if not isinstance(kind, str) or kind not in _FIELDS or not set(message) <= _FIELDS[kind]:
+        return None
+
+    def count(key: str, limit: int = 10 ** 9) -> Optional[int]:
+        value = message.get(key, 0)
+        return value if type(value) is int and 0 <= value <= limit else None
+
+    def yes(key: str, words=("no", "yes")) -> Optional[str]:
+        value = message.get(key, False)
+        return words[value] if type(value) is bool else None
+
+    if kind == "page":
+        workers, annexb = count("workers"), count("annexb")
+        if workers is None or annexb is None:
+            return None
+        return "page", f"workers={workers} annexb-without-latency={annexb}"
+
+    codec, error = message.get("codec", ""), message.get("err", "")
+    if not isinstance(codec, str) or (codec and not _CODEC_NAME.fullmatch(codec)):
+        return None
+    if not isinstance(error, str) or (error and not _ERROR_NAME.fullmatch(error)):
+        return None
+    numbers = {key: count(key) for key in ("out", "open", "held", "queue", "drops")}
+    ident, width, height = count("id"), count("w", 65535), count("h", 65535)
+    if None in numbers.values() or not ident or width is None or height is None:
+        return None
+    parts = [f"{kind}#{ident}", codec or "?"]
+    if kind == "dec":
+        flags = (yes("desc"), yes("lat"), yes("rewrite", ("off", "on")))
+        if None in flags:
+            return None
+        parts += [f"desc={flags[0]}", f"lat={flags[1]}", f"rewrite={flags[2]}"]
+    else:
+        mode = message.get("mode", "")
+        if mode not in ("", "quality", "realtime"):
+            return None
+        parts.append(f"mode={mode or '?'}")
+    parts.append(f"{width}x{height}" if width and height else "size=?")
+    keys = ("out", "open", "held", "queue", "drops") if kind == "dec" else ("out", "queue", "drops")
+    parts += [f"{key}={numbers[key]}" for key in keys]
+    if error:
+        parts.append(f"err={error}")
+    return f"{kind}#{ident}", " ".join(parts)
+
+
+class CodecLog:
+    """rtc.js's codec counts as log lines, one a second at most for each codec (and the page's).
+
+    rtc.js sends them no more often than that; a line that comes sooner waits for its second,
+    and only the latest one waiting is kept.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic,
+                 later: Optional[Callable[[int, Callable[[], bool]], int]] = None,
+                 write: Optional[Callable[[str], None]] = None) -> None:
+        self._clock = clock
+        self._later = later or GLib.timeout_add
+        self._write = write or (lambda line: print(line, flush=True))
+        self._logged: dict[str, float] = {}  # codec -> when its last line went out
+        self._waiting: dict[str, str] = {}
+        self._timer = 0
+
+    def take(self, message: dict) -> None:
+        found = webcodecs_line(message)
+        if found is None:
+            return
+        key, line = found
+        if key not in self._waiting and self._due(key, self._clock()):
+            self._log(key, line)
+            return
+        self._waiting[key] = line
+        if not self._timer:
+            self._timer = self._later(int(LOG_EVERY * 1000), self._catch_up)
+
+    def _due(self, key: str, now: float) -> bool:
+        return key not in self._logged or now - self._logged[key] >= LOG_EVERY
+
+    def _log(self, key: str, line: str) -> None:
+        now = self._clock()
+        self._logged[key] = now
+        self._write(f"natter: webcodecs: {line}")
+        if len(self._logged) > 256:  # codecs long gone
+            for old in [k for k, at in self._logged.items() if now - at > 60]:
+                del self._logged[old]
+
+    def _catch_up(self) -> bool:
+        self._timer = 0
+        for key, line in list(self._waiting.items()):
+            if self._due(key, self._clock()):
+                del self._waiting[key]
+                self._log(key, line)
+        if self._waiting:
+            self._timer = self._later(int(LOG_EVERY * 1000), self._catch_up)
+        return False  # GLib.SOURCE_REMOVE
+
+
+def pack(events: list) -> str:
+    """A batch for the page: [base64 of all its packets' bytes, items], an item being
+    [channel, length] for a packet or the event itself."""
+    chunks, items = [], []
+    for event in events:
+        payload = event.get("bytes")
+        if payload is None:
+            items.append(event)
+        else:
+            chunks.append(payload)
+            items.append([event["ch"], len(payload)])
+    return json.dumps([base64.b64encode(b"".join(chunks)).decode() if chunks else "", items], separators=(",", ":"))
+
+
 def _stat(structure) -> dict:
     stat = {}
     for index in range(structure.n_fields()):
@@ -571,13 +706,12 @@ def _stat(structure) -> dict:
 class Host:
     """The page's peer connections and data channels.
 
-    `deliver(events)` hands a batch of events to the page, on the main loop, in order.
+    The page keeps a "pull" waiting (`pull`), answered with the next batch of events, in order.
     """
 
-    def __init__(self, deliver: Callable[[list], None], on_call: Optional[Callable[[bool], None]] = None) -> None:
+    def __init__(self, on_call: Optional[Callable[[bool], None]] = None) -> None:
         if not Gst.is_initialized():
             Gst.init(None)
-        self._deliver = deliver
         self._on_call = on_call  # on_call(True) when a call's channel opens, on_call(False) when the last closes
         self._calling: set[int] = set()
         self._connections: dict[int, Connection] = {}
@@ -588,6 +722,9 @@ class Host:
         self._lock = threading.Lock()
         self._outbox: list[dict] = []
         self._flush = 0
+        self._waiting = None  # (reply, JS context) of the page's waiting pull
+        self._sent_at = 0.0
+        self._codec_log = CodecLog()
 
     # ---- To the page ----
 
@@ -595,14 +732,36 @@ class Host:
         """Queue an event for the page (from any thread)."""
         with self._lock:
             self._outbox.append(event)
-            if not self._flush:
-                self._flush = GLib.timeout_add(FLUSH_MS, self._send)
+            self._schedule()
+
+    def pull(self, reply, context) -> None:
+        """The page waits for its next batch (main loop): `reply` is answered once there is one."""
+        if self._waiting is not None:
+            self._answer("")
+        with self._lock:
+            self._waiting = (reply, context)
+            if self._outbox:
+                self._schedule()
+
+    def _schedule(self) -> None:
+        """Send what's queued FLUSH_MS after the last batch, or now if that was longer ago (under the lock)."""
+        if self._flush or self._waiting is None:
+            return
+        wait = FLUSH_MS - (time.monotonic() - self._sent_at) * 1000
+        self._flush = GLib.timeout_add(max(0, int(wait + 0.999)), self._send)
+
+    def _answer(self, text: str) -> None:
+        reply, context = self._waiting
+        self._waiting = None
+        reply.return_value(JavaScriptCore.Value.new_string(context, text))
 
     def _send(self) -> bool:
         with self._lock:
-            events, self._outbox, self._flush = self._outbox, [], 0
-        if events:
-            self._deliver(events)
+            self._flush = 0
+            if self._waiting is None or not self._outbox:
+                return GLib.SOURCE_REMOVE
+            events, self._outbox, self._sent_at = self._outbox, [], time.monotonic()
+        self._answer(pack(events))
         return GLib.SOURCE_REMOVE
 
     @property
@@ -639,6 +798,12 @@ class Host:
     def post(self, message: dict) -> None:
         """Something the page did that needs no answer."""
         op = message.get("op")
+        if op == "sends":
+            self._sends(message)
+            return
+        if op == "webcodecs":
+            self._codec_log.take(message)
+            return
         if op != "send":
             _log(f"{op} pc{message.get('pc')}" + (f" ch{message.get('ch')} {message.get('label')!r}" if op == "channel" else "")
                  + (f" ({len((message.get('config') or {}).get('certificates') or [])} certificate(s),"
@@ -679,6 +844,22 @@ class Host:
                 connection._emit("negotiation-needed")
         elif op == "close":
             self._close(message.get("pc"))
+
+    def _sends(self, message: dict) -> None:
+        """Packets the page sent in one go: one base64 text, cut up by [channel, length, ...]."""
+        try:
+            data = base64.b64decode(message.get("data") or "")
+        except ValueError:
+            return
+        cuts, offset = message.get("cuts") or [], 0
+        for i in range(0, len(cuts) - 1, 2):
+            key, size = cuts[i], cuts[i + 1]
+            if not isinstance(size, int) or size < 0:
+                return
+            channel = self._channels.get(key)
+            if channel:
+                channel.send(data=data[offset:offset + size])
+            offset += size
 
     def call(self, message: dict, reply: Callable[[dict], None]) -> None:
         """Something the page asked that has an answer; `reply` is called once, on the main loop."""
@@ -754,6 +935,8 @@ class Host:
         for key in list(self._connections):
             self._close(key)
         self._certificates.clear()
+        if self._waiting is not None:
+            self._answer("")
         with self._lock:
             self._outbox.clear()
             if self._flush:

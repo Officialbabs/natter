@@ -57,6 +57,33 @@ def chat_link(uri: str) -> Optional[str]:
     return WHATSAPP_URL + "send?" + urlencode(params)
 
 
+# Group invites and channels: WhatsApp Web opens them when such a link is clicked in its page
+# (Natter's bridge clicks one), not at any address of its own.
+CODE = r"[A-Za-z0-9._-]{1,128}"
+
+
+def page_link(uri: str) -> Optional[str]:
+    """The link WhatsApp Web opens itself, for a group invite or a channel: chat.whatsapp.com/…
+    (also …/invite/…), whatsapp://chat?code=…, whatsapp.com/channel/…, whatsapp://channel/…"""
+    text = (uri or "").strip()
+    parsed = urlparse(text)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme in ("http", "https") and host == "chat.whatsapp.com":
+        match = re.fullmatch(rf"/(?:invite/)?({CODE})/?", parsed.path)
+        return f"https://chat.whatsapp.com/{match[1]}" if match else None
+    if parsed.scheme in ("http", "https") and host in ("whatsapp.com", "www.whatsapp.com"):
+        match = re.fullmatch(rf"/channel/({CODE})/?", parsed.path)
+        return f"https://whatsapp.com/channel/{match[1]}" if match else None
+    if parsed.scheme == "whatsapp":
+        if parsed.netloc == "chat":
+            code = dict(parse_qsl(parsed.query)).get("code", "")
+            return f"https://chat.whatsapp.com/{code}" if re.fullmatch(CODE, code) else None
+        if parsed.netloc == "channel":
+            match = re.fullmatch(rf"/({CODE})/?", parsed.path)
+            return f"https://whatsapp.com/channel/{match[1]}" if match else None
+    return None
+
+
 def short_link(uri: str) -> Optional[str]:
     """The wa.me form of a WhatsApp chat link, the way links to chats appear in messages."""
     target = chat_link(uri)

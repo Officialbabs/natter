@@ -1,7 +1,7 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=Natter
+Name=Natter Den
 GenericName=WhatsApp Client
 Comment=WhatsApp that feels like part of your desktop
 Exec=@EXEC@ %U

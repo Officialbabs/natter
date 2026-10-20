@@ -12,6 +12,13 @@ PNG = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n" + bytes(3
 
 
 class MessageTest(unittest.TestCase):
+    def test_canary(self):
+        message = parse_message({"type": "canary", "found": ["pane", "row"], "missing": ["search"], "token": "x"})
+        self.assertEqual(message, {"type": "canary", "found": ["pane", "row"], "missing": ["search"]})
+        self.assertIsNone(parse_message({"type": "canary", "found": "pane", "missing": []}))
+        self.assertIsNone(parse_message({"type": "canary", "found": [], "missing": [7]}))
+        self.assertIsNone(parse_message({"type": "canary", "found": [], "missing": ["x" * 25]}))
+
     def test_notification(self):
         message = parse_message({"type": "notify", "id": 7, "title": "Mum\x00\x1b", "body": "Line 1\nLine 2\x07",
                                  "tag": "mum@c.us", "icon": PNG, "token": "ignored here"})
@@ -82,6 +89,34 @@ class MessageTest(unittest.TestCase):
         self.assertEqual(clean_icon(PNG), PNG)
 
 
+class LookMessageTest(unittest.TestCase):
+    """The bridge's read-only report of how WhatsApp looks (reportLook), for the theme."""
+
+    SENT = {"type": "look", "tokens": True, "dark": False, "darkClass": False, "media": True}
+    TAKEN = {"type": "look", "tokens": True, "dark": False, "dark_class": False, "media": True}
+
+    def test_accepted(self):
+        self.assertEqual(parse_message(self.SENT), self.TAKEN)
+        # The token is checked before this; anything else the page adds is dropped.
+        self.assertEqual(parse_message(dict(self.SENT, token="t", theme="dark", extra=[1])), self.TAKEN)
+        for tokens, dark, dark_class, media in ((False, False, False, False), (True, True, True, True)):
+            message = {"type": "look", "tokens": tokens, "dark": dark, "darkClass": dark_class, "media": media}
+            self.assertEqual(parse_message(message), {"type": "look", "tokens": tokens, "dark": dark,
+                                                      "dark_class": dark_class, "media": media})
+
+    def test_wrong_shapes_are_dropped(self):
+        for change in ({"tokens": 1}, {"dark": "false"}, {"darkClass": None}, {"media": [True]}, {"dark": 0},
+                       {"tokens": {"x": 1}}):
+            self.assertIsNone(parse_message(dict(self.SENT, **change)), change)
+        for missing in ("tokens", "dark", "darkClass", "media"):
+            message = dict(self.SENT)
+            del message[missing]
+            self.assertIsNone(parse_message(message), missing)
+        # Natter's own name for it isn't the bridge's.
+        self.assertIsNone(parse_message({"type": "look", "tokens": True, "dark": False, "dark_class": False,
+                                         "media": False}))
+
+
 class BridgeTest(unittest.TestCase):
     """The bridge agrees with Natter on what they share."""
 
@@ -91,6 +126,36 @@ class BridgeTest(unittest.TestCase):
         for first, last in re.findall(r"\\u([0-9A-F]{4})(?:-\\u([0-9A-F]{4}))?", marks):
             found.update(map(chr, range(int(first, 16), int(last or first, 16) + 1)))
         self.assertEqual(found, INVISIBLE)
+
+    def test_never_reaches_into_whatsapps_storage_or_code(self):
+        # The theme's ban-safety rules: nothing in WhatsApp's storage (where its own theme and
+        # synced settings live) and nothing from its bundles.
+        for banned in ("localStorage", "sessionStorage", "indexedDB", "IndexedDB", "webpackChunk", "require(",
+                       "system-theme-mode", "__reactFiber", "__reactProps"):
+            self.assertNotIn(banned, BRIDGE)
+
+    def test_no_style_elements(self):
+        # The theme reaches the page only as WebKit's user style sheet (account.py apply_theme).
+        for banned in ('createElement("style")', "createElement('style')", 'createElement("link")',
+                       "createElement('link')", 'createElement("script")', "createElement('script')", "insertRule",
+                       "adoptedStyleSheets", "CSSStyleSheet", "<style", "<link"):
+            self.assertNotIn(banned, BRIDGE)
+
+    def test_the_look_report_only_reads(self):
+        start = BRIDGE.index("// ---- How WhatsApp looks")
+        section = BRIDGE[start:BRIDGE.index("window.__natter = {", start)]
+        for writes in ("setAttribute", "removeAttribute", "classList.add", "classList.remove", "classList.toggle",
+                       ".style", "setProperty", "dispatchEvent", "innerHTML", "textContent", "createElement",
+                       "appendChild", "click(", "focus(", "Event(", "fetch(", "__natter"):
+            self.assertNotIn(writes, section)
+        self.assertEqual(re.findall(r"post\(\{ type: \"(\w+)\"", section), ["look"])
+        self.assertIn("addEventListener(\"change\", reportLook)", section)  # the style changing
+        self.assertIn('attributeFilter: ["class"]', section)  # WhatsApp's dark class
+
+    def test_the_look_report_waits_for_the_chat_list(self):
+        self.assertIn("if (ready) reportLook();", BRIDGE)
+        self.assertIn("if (!lastReady) return;", BRIDGE)
+        self.assertRegex(BRIDGE, r"LOOK_SETTLE_MS = 2000;")
 
     def test_notification_ids_fit(self):
         # Each page load starts at a random id up to 2**n, then counts up.

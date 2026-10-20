@@ -14,6 +14,7 @@ from typing import Optional
 from gi.repository import Gio, GLib, GObject
 
 from . import APP_ID
+from .system import give_system_bus
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 CONNECT_TRIES = 75  # every 200 ms: 15 s for Qt WebEngine to start
@@ -37,10 +38,14 @@ class CallWindow(GObject.Object):
         "call-failed": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
     }
 
-    def __init__(self, data: Path, debug: bool = False) -> None:
+    def __init__(self, data: Path, debug: bool = False, microphone: bool = True, camera: bool = True) -> None:
         super().__init__()
         self.data = data
         self.debug = debug
+        # What WhatsApp there may use (the app's switches, and the desktop's answer about the
+        # camera): told at start, and again whenever it changes (set_media).
+        self.microphone = microphone
+        self.camera = camera
         self.socket_path = Path(GLib.get_user_runtime_dir()) / f"natter-calls-{APP_ID}.sock"
         self.process: Optional[Gio.Subprocess] = None
         self.connection: Optional[Gio.SocketConnection] = None
@@ -63,10 +68,12 @@ class CallWindow(GObject.Object):
         if self.process is not None:
             return
         argv = [sys.executable, "-m", "natter.callwindow", "--socket", str(self.socket_path),
-                "--data", str(self.data), "--app-id", APP_ID] + (["--debug"] if self.debug else [])
+                "--data", str(self.data), "--app-id", APP_ID] + (["--debug"] if self.debug else []) + \
+            (["--no-microphone"] if not self.microphone else []) + (["--no-camera"] if not self.camera else [])
         launcher = Gio.SubprocessLauncher.new(Gio.SubprocessFlags.NONE)
         path = os.environ.get("PYTHONPATH")
         launcher.setenv("PYTHONPATH", str(PACKAGE_ROOT) + (os.pathsep + path if path else ""), True)
+        give_system_bus(launcher)  # Natter hides it from itself and WebKit, not from this window
         try:
             self.process = launcher.spawnv(argv)
         except GLib.Error as error:
@@ -201,3 +208,15 @@ class CallWindow(GObject.Object):
 
     def show(self) -> None:
         self.send({"cmd": "show"})
+
+    def set_media(self, microphone: bool, camera: bool) -> None:
+        """What WhatsApp in the call window may use now. A window that isn't running gets it
+        when it starts; one starting up, once it's listening."""
+        if (microphone, camera) == (self.microphone, self.camera):
+            return
+        self.microphone, self.camera = microphone, camera
+        message = {"cmd": "media", "microphone": microphone, "camera": camera}
+        if self.connection is not None:
+            self._send_now(message)
+        elif self.process is not None:
+            self.queue = [queued for queued in self.queue if queued.get("cmd") != "media"] + [message]

@@ -4,19 +4,19 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
 
-  <name>Natter</name>
+  <name>Natter Den</name>
   <summary>Unofficial WhatsApp client that fits your desktop</summary>
   <developer id="io.github.officialbabs">
-    <name>Natter contributors</name>
+    <name>Natter Den contributors</name>
   </developer>
 
   <description>
     <p>
-      Natter shows WhatsApp Web in a native GTK and libadwaita window and connects it to the
+      Natter Den shows WhatsApp Web in a native GTK and libadwaita window and connects it to the
       rest of your desktop: notifications, the tray, the dock and the keyboard.
     </p>
     <p>
-      Natter is unofficial. It isn’t made by, endorsed by or affiliated with WhatsApp or Meta.
+      Natter Den is unofficial. It isn’t made by, endorsed by or affiliated with WhatsApp or Meta.
       It runs the real WhatsApp Web, the same way your browser would, and you link it to your
       phone the same way.
     </p>
@@ -25,14 +25,15 @@
       <li>Quiet hours, and an unread count in the tray and on the dock icon</li>
       <li>Ctrl+K jumps to any chat by name, or messages a phone number you haven’t saved</li>
       <li>Paste or drop pictures and files into a chat, or send them from the file manager</li>
-      <li>wa.me and whatsapp:// links open in Natter</li>
+      <li>wa.me and whatsapp:// links open in Natter Den</li>
       <li>A privacy blur that hides names, pictures and messages until you point at them</li>
       <li>Several accounts, each with its own session</li>
       <li>Keeps running in the background, and gives memory back while its window is closed</li>
     </ul>
     <p>
-      Voice and video calls open in your web browser: they need WebRTC, which the WebKit that
-      Natter is built on doesn’t offer.
+      Calls happen in Natter Den, with WhatsApp’s own call buttons in the chat, when GStreamer’s
+      WebRTC plugins are installed. Without them, calls open in your web browser. Voice calls
+      work, and video calls are still being finished.
     </p>
   </description>
 
@@ -68,8 +69,8 @@
   </supports>
 
   <branding>
-    <color type="primary" scheme_preference="light">#8ff0a4</color>
-    <color type="primary" scheme_preference="dark">#26a269</color>
+    <color type="primary" scheme_preference="light">#ffbe6f</color>
+    <color type="primary" scheme_preference="dark">#c64600</color>
   </branding>
 
   <content_rating type="oars-1.1">

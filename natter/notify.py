@@ -24,13 +24,14 @@ gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("Soup", "3.0")
 from gi.repository import GdkPixbuf, Gio, GLib, Soup
 
-from . import APP_ID, NAME
+from . import APP_ID, DEFAULT_APP_ID, NAME
 from .launcher import INVISIBLE
 
 # The app icon as a file path: the spec allows one, and it works where icon names in
-# ~/.local/share/icons aren't looked up (Ada's shell).
-_SVG = Path(__file__).resolve().parent.parent / "data" / "icons" / "hicolor" / "scalable" / "apps" / f"{APP_ID}.svg"
-APP_ICON = str(_SVG) if _SVG.is_file() else APP_ID
+# ~/.local/share/icons aren't looked up (Ada's shell). It's named by the default id, as in
+# app.py: a separate instance (NATTER_APP_ID) has no icon of its own.
+_SVG = Path(__file__).resolve().parent.parent / "data" / "icons" / "hicolor" / "scalable" / "apps" / f"{DEFAULT_APP_ID}.svg"
+APP_ICON = str(_SVG) if _SVG.is_file() else DEFAULT_APP_ID
 
 try:
     from .system import in_sandbox
@@ -148,17 +149,16 @@ def circle(pixbuf: GdkPixbuf.Pixbuf, size: int = AVATAR) -> GdkPixbuf.Pixbuf:
 
 
 def image_data(pixbuf: GdkPixbuf.Pixbuf) -> GLib.Variant:
-    return GLib.Variant(
-        "(iiibiiay)",
-        (
-            pixbuf.get_width(),
-            pixbuf.get_height(),
-            pixbuf.get_rowstride(),
-            pixbuf.get_has_alpha(),
-            pixbuf.get_bits_per_sample(),
-            pixbuf.get_n_channels(),
-            pixbuf.get_pixels(),
-        ),
+    """The image-data hint. Its pixels go in as one block: made from Python bytes, PyGObject built
+    them a byte at a time, 130-560 ms per notification on Natter's main thread."""
+    return GLib.Variant.new_tuple(
+        GLib.Variant("i", pixbuf.get_width()),
+        GLib.Variant("i", pixbuf.get_height()),
+        GLib.Variant("i", pixbuf.get_rowstride()),
+        GLib.Variant("b", pixbuf.get_has_alpha()),
+        GLib.Variant("i", pixbuf.get_bits_per_sample()),
+        GLib.Variant("i", pixbuf.get_n_channels()),
+        GLib.Variant.new_from_bytes(GLib.VariantType("ay"), pixbuf.read_pixel_bytes(), True),
     )
 
 
@@ -262,10 +262,13 @@ class Notifier:
              chat: str, icon: str) -> None:
         """WhatsApp asked for a notification. `chat` identifies the conversation (its tag or title)."""
         key = (account_id, chat or title)
-        if not self.settings["notifications"] or self.settings.in_quiet_hours():
+        if not self.settings["notifications"] or self.settings.notifications_paused():
             return
-        if self.muted.get(key, 0) > time.time():
+        now = time.time()
+        if self.muted.get(key, 0) > now:
             return
+        if len(self.muted) > 32:  # mutes that ran out go
+            self.muted = {k: until for k, until in self.muted.items() if until > now}
         shown = self.shown.get(key)
         if shown:
             shown.count += 1
@@ -275,9 +278,15 @@ class Notifier:
             shown = self.shown[key] = Shown(account_id, key[1], title, page_id, body, icon, account_name)
         self._deliver(shown)
 
+    def conceal(self) -> None:
+        """Show the notifications already up again, now hiding who wrote and what (Natter locked)."""
+        for shown in list(self.shown.values()):
+            if not shown.closed:
+                self._deliver(shown)
+
     def _reveal(self) -> tuple[bool, bool]:
         """Whether notifications may show who it's from, and the message."""
-        blurred = self.settings["privacy_blur"]
+        blurred = self.settings["privacy_blur"] or getattr(self.app, "locked", False)
         return self.settings["notify_sender"] and not blurred, self.settings["notify_preview"] and not blurred
 
     def _deliver(self, shown: Shown) -> None:
@@ -317,7 +326,8 @@ class Notifier:
         }
         if picture is not None:
             hints["image-data"] = image_data(picture)
-        actions = ["default", "Open", "mute", "Mute for an hour"] if capabilities and "actions" in capabilities else []
+        actions = (["default", "Open", "mute", "Mute Chat for 1 Hour"] if capabilities and "actions" in capabilities
+                   else [])
         params = GLib.Variant("(susssasa{sv}i)", (NAME, shown.server_id, APP_ICON, summary, text, actions, hints, -1))
         self.bus.call(BUS, PATH, BUS, "Notify", params, GLib.VariantType("(u)"),
                       Gio.DBusCallFlags.NONE, 5000, None, self._sent, shown)
@@ -338,7 +348,7 @@ class Notifier:
         notification.set_default_action_and_target(
             "app.notification-open", GLib.Variant("(sssi)", (shown.account, shown.chat, title, shown.page_id)))
         notification.add_button_with_target(
-            "Mute for an hour", "app.notification-mute", GLib.Variant("(ss)", (shown.account, shown.chat)))
+            "Mute Chat for 1 Hour", "app.notification-mute", GLib.Variant("(ss)", (shown.account, shown.chat)))
         self.app.send_notification(shown.gid, notification)
         shown.posted = True
 

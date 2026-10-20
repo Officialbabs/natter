@@ -98,6 +98,15 @@ DEFAULTS: dict[str, Any] = {
     "quiet_hours": False,
     "quiet_start": "22:00",
     "quiet_end": "07:00",
+    "dnd_until": 0,  # do not disturb: 0 = off, -1 = until turned off, else a Unix time
+    "lock_hash": "",  # the app lock's passcode, hashed (lock.py); "" = no lock
+    "lock_on_start": True,
+    "lock_on_hide": False,
+    "lock_idle_minutes": 0,  # 0 = never
+    "locked": False,  # internal: locked when Natter last ran (so quitting doesn't unlock it)
+    "lock_failures": 0,  # internal: wrong passcodes in a row (lock.Attempts)
+    "lock_wait_until": 0,  # internal: no passcode is checked before this (Unix time)
+    "lock_lockouts": 0,  # internal: how many waits so far (they grow)
     "privacy_blur": False,
     "blur_when_away": False,
     "dock_recent_chats": True,
@@ -110,7 +119,18 @@ DEFAULTS: dict[str, Any] = {
     "height": 780,
     "maximized": False,
     "appearance": "system",  # "system", "light" or "dark"
+    # A themes.py id: "den", "custom", "plain" or one of WhatsApp's ("wa-pink"). Read through
+    # themes.chosen(): an older theme ("lagoon") counts as the WhatsApp theme nearest to it, and
+    # anything else, hand-edited or missing (an upgrade), as the default, Den.
+    "theme": "den",
+    # Custom's colour, "#rrggbb". Read through themes.custom_colour(): anything else counts as
+    # Den's orange.
+    "theme_custom": "#ff7800",
     "hardware_acceleration": True,
+    # What WhatsApp may use, in every account (media.py): the desktop's camera permission is
+    # one for the whole app, so these are too.
+    "microphone": True,
+    "camera": True,
     "calls_ring": True,  # keep the linked call window running, so calls ring
     "calls_linked": False,  # internal: the call window has been linked once
     "sw_cleared": False,  # whether WhatsApp's old service-worker data has been cleared, once
@@ -155,6 +175,10 @@ class Settings:
         """Call `listener(key, value)` after every change."""
         self._listeners.append(listener)
 
+    def disconnect(self, listener) -> None:
+        if listener in self._listeners:
+            self._listeners.remove(listener)
+
     def save(self) -> None:
         write_private(self.path, json.dumps(self.values, indent=2, sort_keys=True))
 
@@ -166,6 +190,16 @@ class Settings:
         if not self["quiet_hours"]:
             return False
         return quiet_at(self["quiet_start"], self["quiet_end"], (now or datetime.now()).time())
+
+    def do_not_disturb(self, now: Optional[float] = None) -> bool:
+        """Whether notifications are paused from the tray (for a while, or until turned off)."""
+        until = self["dnd_until"]
+        if not isinstance(until, (int, float)) or until == 0:
+            return False
+        return until < 0 or until > (time.time() if now is None else now)
+
+    def notifications_paused(self) -> bool:
+        return self.do_not_disturb() or self.in_quiet_hours()
 
 
 def parse_clock(text: str) -> Optional[clock]:

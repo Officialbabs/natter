@@ -1,11 +1,12 @@
 #!/usr/bin/python3
-"""Natter and ZapZap side by side: the memory and CPU of every process each app runs.
+"""Natter Den, ZapZap and Whatsie side by side: the memory and CPU of every process each app runs.
 
-Each app is found by its systemd scopes (ZapZap's Flatpak runs its web engine in extra
-scopes, which count too). Memory is PSS from /proc/<pid>/smaps_rollup plus what is swapped
-out; CPU is user and system time over the measuring window.
+Each app is found by its systemd scopes: ZapZap's Flatpak runs its web engine in extra
+scopes, which count too, and Whatsie runs as a Snap or a Flatpak. Memory is PSS from
+/proc/<pid>/smaps_rollup plus what is swapped out; CPU is user and system time over the
+measuring window.
 
-  python3 tools/compare-memory.py              30 s, Natter and ZapZap
+  python3 tools/compare-memory.py              30 s, every app that's running
   python3 tools/compare-memory.py --seconds 60
 """
 
@@ -18,14 +19,15 @@ import time
 
 SLICE = f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice"
 APPS = {
-    "ZapZap": "app-flatpak-com.rtosta.zapzap-*.scope",
-    "Natter": "app-*io.github.Officialbabs.Natter-*.scope",
+    "ZapZap": ["app-flatpak-com.rtosta.zapzap-*.scope"],
+    "Whatsie": ["snap.whatsie.*.scope", "app-flatpak-com.ktechpit.whatsie-*.scope"],
+    "Natter Den": ["app-*io.github.Officialbabs.Natter-*.scope"],
 }
 HZ = os.sysconf("SC_CLK_TCK")
 
 
-def scopes(pattern: str) -> list[str]:
-    return [d for d in glob.glob(f"{SLICE}/{pattern}") if read(f"{d}/cgroup.procs").split()]
+def scopes(patterns: list[str]) -> list[str]:
+    return [d for pattern in patterns for d in glob.glob(f"{SLICE}/{pattern}") if read(f"{d}/cgroup.procs").split()]
 
 
 def read(path: str) -> str:
@@ -64,7 +66,7 @@ def main() -> None:
     parser.add_argument("--seconds", type=int, default=30, help="how long to measure CPU over")
     seconds = parser.parse_args().seconds
 
-    found = {app: scopes(pattern) for app, pattern in APPS.items()}
+    found = {app: scopes(patterns) for app, patterns in APPS.items()}
     before = {app: {p: cpu_ticks(p) for p in pids(dirs)} for app, dirs in found.items()}
     time.sleep(seconds)
     for app, dirs in found.items():

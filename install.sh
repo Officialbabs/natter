@@ -6,6 +6,7 @@
 set -e
 APP_ID=io.github.Officialbabs.Natter
 OLD_APP_ID=io.natter.Natter  # Natter's id before the rename: an install of it is moved over
+APP_NAME="Natter Den"  # the name people see, as NAME in natter/__init__.py
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -14,6 +15,7 @@ LAUNCHER="$BIN/natter"
 APPS="$DATA/applications"
 ENTRY="$APPS/$APP_ID.desktop"
 ICONS="$DATA/icons/hicolor/scalable/apps"
+SYMBOLIC="$DATA/icons/hicolor/symbolic/apps"
 SEARCH="$DATA/gnome-shell/search-providers"
 SERVICES="$DATA/dbus-1/services"
 AUTOSTART="$CONFIG/autostart"
@@ -40,6 +42,7 @@ py_quote() { printf '"%s"' "$(printf '%s\n' "$1" | sed -e 's/[\\"]/\\&/g')"; }
 # Everything an install under the id $1 puts in place, but the autostart entry.
 remove_installed() {
     rm -f "$APPS/$1.desktop" "$ICONS/$1.svg" "$ICONS/$1-unread.svg" \
+          "$SYMBOLIC/$1-symbolic.svg" "$SYMBOLIC/$1-unread-symbolic.svg" \
           "$SEARCH/$1.search-provider.ini" "$SERVICES/$1.service"
 }
 
@@ -81,7 +84,8 @@ done
 if [ -z "$FORCE" ]; then
     for id in "$OLD_APP_ID" "$APP_ID"; do
         if running "$id"; then
-            echo "Natter ($id) is running. Quit it first (Quit in its tray menu, or Ctrl+Q in its window),"
+            if [ "$id" = "$OLD_APP_ID" ]; then what="The old Natter"; else what="$APP_NAME"; fi
+            echo "$what ($id) is running. Quit it first (Quit in its tray menu, or Ctrl+Q in its window),"
             echo "then run this again. To go ahead while it runs: $0${*:+ $*} --force"
             exit 1
         fi
@@ -93,7 +97,7 @@ if [ -n "$UNINSTALL" ]; then
     remove_installed "$APP_ID"
     remove_installed "$OLD_APP_ID"
     refresh_caches
-    echo "Natter removed. Your WhatsApp sessions and settings are still in $DATA/natter and $CONFIG/natter"
+    echo "$APP_NAME removed. Your WhatsApp sessions and settings are still in $DATA/natter and $CONFIG/natter"
     echo "(and a cache in ${XDG_CACHE_HOME:-$HOME/.cache}/natter); delete those folders too to sign out everywhere."
     exit 0
 fi
@@ -111,7 +115,7 @@ done
 if [ -z "$PYTHON" ]; then
     first="$(command -v python3 || true)"
     if [ -z "$first" ]; then
-        echo "Natter needs Python 3 with PyGObject, GTK 4, libadwaita and WebKitGTK 6.0."
+        echo "$APP_NAME needs Python 3 with PyGObject, GTK 4, libadwaita and WebKitGTK 6.0."
     else
         "$first" -c "$CHECK" "$HERE" || true  # says what's missing, and how to install it here
     fi
@@ -141,8 +145,11 @@ esac
 
 echo "==> Installing the menu entry, icons and desktop search"
 EXEC="$(exec_quote "$LAUNCHER")"
-mkdir -p "$APPS" "$ICONS" "$SEARCH" "$SERVICES"
+mkdir -p "$APPS" "$ICONS" "$SYMBOLIC" "$SEARCH" "$SERVICES"
 cp "$HERE/data/icons/hicolor/scalable/apps/$APP_ID.svg" "$HERE/data/icons/hicolor/scalable/apps/$APP_ID-unread.svg" "$ICONS/"
+# The tray icon in the panel's own colour, for panels other than Ada's (tray.py).
+cp "$HERE/data/icons/hicolor/symbolic/apps/$APP_ID-symbolic.svg" \
+   "$HERE/data/icons/hicolor/symbolic/apps/$APP_ID-unread-symbolic.svg" "$SYMBOLIC/"
 # The icon by its full path: Ada's shell (Qt) doesn't find icons by name in ~/.local/share/icons,
 # which has no index.theme.
 sed -e "s|@EXEC@|$(sed_escape "$EXEC")|" -e "s|^Icon=.*|Icon=$(sed_escape "$ICONS/$APP_ID.svg")|" \
@@ -163,7 +170,7 @@ refresh_caches
 # Ada's background allow list names apps by id: an entry for the old one no longer counts.
 LIFECYCLE="$CONFIG/os-ai/lifecycle.ini"
 if [ -f "$LIFECYCLE" ] && grep -qF "$OLD_APP_ID" "$LIFECYCLE"; then
-    echo "Note: $LIFECYCLE names $OLD_APP_ID. Replace it with $APP_ID there, so Ada lets Natter run in the background."
+    echo "Note: $LIFECYCLE names $OLD_APP_ID. Replace it with $APP_ID there, so Ada lets $APP_NAME run in the background."
 fi
 
 # whatsapp:// links: take them only if no other app had them (ZapZap, say) or the old Natter
@@ -174,7 +181,7 @@ if command -v xdg-mime >/dev/null; then
             xdg-mime default "$APP_ID.desktop" x-scheme-handler/whatsapp ;;
         *)
             xdg-mime default "$handler" x-scheme-handler/whatsapp
-            echo "whatsapp:// links still open in $handler. To open them in Natter instead:"
+            echo "whatsapp:// links still open in $handler. To open them in $APP_NAME instead:"
             echo "  xdg-mime default $APP_ID.desktop x-scheme-handler/whatsapp" ;;
     esac
 fi
@@ -203,4 +210,4 @@ if running "$OLD_APP_ID"; then
     echo "before opening the new one: both would use the same WhatsApp session."
 fi
 
-echo "Done. Open Natter from your apps, or run 'natter'."
+echo "Done. Open $APP_NAME from your apps, or run 'natter'."

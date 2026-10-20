@@ -8,6 +8,7 @@ per line:
 
   Natter → window   {"cmd": "call", "chat": NAME, "video": BOOL} | {"cmd": "answer"} |
                     {"cmd": "decline"} | {"cmd": "show"} | {"cmd": "hide"} | {"cmd": "quit"} |
+                    {"cmd": "media", "microphone": BOOL, "camera": BOOL} |
                     {"cmd": "eval", "js": BODY} (only with --debug)
   window → Natter   {"event": "state", "value": "loading" | "needs-link" | "ready"} |
                     {"event": "incoming", "name": NAME, "video": BOOL} | {"event": "incoming-ended"} |
@@ -15,6 +16,7 @@ per line:
                     {"event": "eval", "result": ...}
 
 Run by Natter as: python3 -m natter.callwindow --socket PATH --data DIR --app-id ID
+                  [--no-microphone] [--no-camera]
 """
 
 from __future__ import annotations
@@ -32,11 +34,13 @@ from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineS
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow, QVBoxLayout, QWidget
 
+from . import NAME
+
 WHATSAPP = "https://web.whatsapp.com/"
 PREFIX = "__natter_calls__"
 SCRIPT = (Path(__file__).resolve().parent / "calls.js").read_text()
-LINK_TEXT = ("<b>Link Natter's call window.</b> On your phone, open WhatsApp → Settings → Linked devices → "
-             "Link a device, and scan this code. It's linked once, as its own device; Natter keeps it "
+LINK_TEXT = ("<b>Link the call window.</b> On your phone, open WhatsApp → Settings → Linked devices → "
+             "Link a device, and scan this code. It's linked once, as its own device, and stays "
              "hidden except while you're in a call.")
 
 
@@ -44,9 +48,24 @@ def whatsapp(url: QUrl) -> bool:
     return url.scheme() == "https" and url.host() == "web.whatsapp.com"
 
 
+# Qt's permissions (QWebEnginePermission.PermissionType and the older QWebEnginePage.Feature
+# have the same names) that use the microphone and the camera, and which of them each needs.
+MEDIA = {"MediaAudioCapture": ("microphone",), "MediaVideoCapture": ("camera",),
+         "MediaAudioVideoCapture": ("microphone", "camera")}
+
+
+def allowed(kind: str, microphone: bool, camera: bool) -> bool:
+    """Whether WhatsApp gets a permission (by its Qt name): the microphone and the camera as
+    Natter's switches say (and the desktop's answer for the camera: Chromium opens it itself,
+    never asking), a request for both only when both may be used. The rest as before: the
+    screen in a call, notifications."""
+    switches = {"microphone": microphone, "camera": camera}
+    return all(switches[device] for device in MEDIA.get(kind, ()))
+
+
 class Page(QWebEnginePage):
-    """WhatsApp only: other sites open in the browser; calls get the microphone, camera and
-    screen without asking, as in Natter's main window."""
+    """WhatsApp only: other sites open in the browser; calls get the screen without asking, and
+    the microphone and camera as Natter's switches say (allowed)."""
 
     def __init__(self, profile: QWebEngineProfile, window: "CallWindow") -> None:
         super().__init__(profile, window)
@@ -59,13 +78,14 @@ class Page(QWebEnginePage):
             self.desktopMediaRequested.connect(self._desktop_media)
 
     def _permission(self, permission) -> None:
-        if whatsapp(permission.origin()):
+        if whatsapp(permission.origin()) and self.window.allows(permission.permissionType().name):
             permission.grant()
         else:
             permission.deny()
 
     def _feature(self, url: QUrl, feature) -> None:
-        policy = (QWebEnginePage.PermissionPolicy.PermissionGrantedByUser if whatsapp(url)
+        policy = (QWebEnginePage.PermissionPolicy.PermissionGrantedByUser
+                  if whatsapp(url) and self.window.allows(feature.name)
                   else QWebEnginePage.PermissionPolicy.PermissionDeniedByUser)
         self.setFeaturePermission(url, feature, policy)
 
@@ -106,7 +126,7 @@ class Popup(QMainWindow):
 
     def __init__(self, profile: QWebEngineProfile, owner: "CallWindow") -> None:
         super().__init__()
-        self.setWindowTitle("WhatsApp call — Natter")
+        self.setWindowTitle(f"WhatsApp Call — {NAME}")
         self.view = QWebEngineView(self)
         self.view.setPage(Page(profile, owner))
         self.setCentralWidget(self.view)
@@ -117,17 +137,19 @@ class Popup(QMainWindow):
 
 
 class CallWindow(QMainWindow):
-    def __init__(self, socket_path: str, data: Path, app_id: str, debug: bool) -> None:
+    def __init__(self, socket_path: str, data: Path, app_id: str, debug: bool,
+                 microphone: bool = True, camera: bool = True) -> None:
         super().__init__()
         self.data = data
         self.debug = debug
+        self.microphone, self.camera = microphone, camera
         self.clients: list[QLocalSocket] = []
         self.popups: list[Popup] = []
         self.state = "loading"
         self.ringing = False
         self.in_call = False
         self.quitting = False
-        self.setWindowTitle("Calls — Natter")
+        self.setWindowTitle(f"Calls — {NAME}")
         self.setWindowIcon(QIcon.fromTheme(app_id))
         self.resize(900, 680)
 
@@ -147,6 +169,7 @@ class CallWindow(QMainWindow):
         script.setRunsOnSubFrames(False)
         profile.scripts().insert(script)
         self.profile = profile
+        self._forget_grants()
 
         self.view = QWebEngineView(self)
         self.view.setPage(Page(profile, self))
@@ -225,11 +248,33 @@ class CallWindow(QMainWindow):
         elif cmd == "hide":
             if not (self.in_call or self.ringing or self.state == "needs-link"):
                 self.hide()
+        elif cmd == "media":
+            self.microphone, self.camera = bool(message.get("microphone")), bool(message.get("camera"))
+            self._forget_grants()
         elif cmd == "quit":
             self.quitting = True
             QApplication.quit()
         elif cmd == "eval" and self.debug:
             self._js(str(message.get("js", "")), lambda result: self._send({"event": "eval", "result": result}))
+
+    def allows(self, kind: str) -> bool:
+        return allowed(kind, self.microphone, self.camera)
+
+    def _forget_grants(self) -> None:
+        """Qt 6.8 and later keep what was granted in the profile, and don't ask again: forget
+        what was granted to WhatsApp for a device that's now off, so its next request is asked
+        (and refused) here. Only the profile's own answers for WhatsApp; nothing of the page's."""
+        query = getattr(self.profile, "queryPermission", None)
+        if query is None:
+            return  # before Qt 6.8 there's no reading or forgetting them
+        from PyQt6.QtWebEngineCore import QWebEnginePermission
+
+        for kind in MEDIA:
+            if self.allows(kind):
+                continue
+            permission = query(QUrl(WHATSAPP), getattr(QWebEnginePermission.PermissionType, kind))
+            if permission.isValid() and permission.state() == QWebEnginePermission.State.Granted:
+                permission.reset()
 
     def _js(self, body: str, then=None) -> None:
         # runJavaScript has no await: run an async function and come back through the console.
@@ -318,11 +363,13 @@ class CallWindow(QMainWindow):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Natter's call window")
+    parser = argparse.ArgumentParser(description=f"{NAME}'s call window")
     parser.add_argument("--socket", required=True)
     parser.add_argument("--data", required=True)
     parser.add_argument("--app-id", default="io.github.Officialbabs.Natter")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--no-microphone", action="store_true", help="WhatsApp can't use the microphone")
+    parser.add_argument("--no-camera", action="store_true", help="WhatsApp can't use the camera")
     args = parser.parse_args()
     data = Path(args.data)
     data.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -332,10 +379,11 @@ def main() -> int:
         os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (flags + " --enable-features=WebRTCPipeWireCapturer").strip()
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication([sys.argv[0]])
-    app.setApplicationName("Natter")
+    app.setApplicationName(NAME)
     app.setDesktopFileName(args.app_id)  # the window belongs to Natter on the dock
     app.setQuitOnLastWindowClosed(False)
-    window = CallWindow(args.socket, data, args.app_id, args.debug)
+    window = CallWindow(args.socket, data, args.app_id, args.debug,
+                        microphone=not args.no_microphone, camera=not args.no_camera)
     window.hide()
     return app.exec()
 
