@@ -11,9 +11,14 @@
 // Packets sent in one task go up together, as one message.
 // Down from Natter: the page keeps a "pull" call waiting on the answering handler, and Natter
 // answers it with the next batch of events, in order (see deliverBatch).
+//
+// Natter adds this file to every page, also where calls open in a window of their own: the
+// ceilings on the page's video codecs (see "Video codecs") are for every page. The WebRTC
+// stand-in, and what goes with it (the call's sound, the camera), only where Natter does the
+// calls' networking (both handlers there) and WebKit has no RTCPeerConnection of its own.
 (() => {
   "use strict";
-  if (window.__natterRtc || typeof window.RTCPeerConnection === "function") return;
+  if (window.__natterRtc) return;
 
   // The handlers and token are taken now, before WhatsApp's scripts run (see bridge.js).
   const TOKEN = "__NATTER_TOKEN__";
@@ -22,9 +27,9 @@
   const handlers = window.webkit && window.webkit.messageHandlers;
   const postHandler = handlers && handlers.natterRtc;
   const callHandler = handlers && handlers.natterRtcCall;
-  if (!postHandler || !callHandler) return;
-  const post = postHandler.postMessage.bind(postHandler);
-  const ask = callHandler.postMessage.bind(callHandler);
+  const calls = Boolean(postHandler && callHandler) && typeof window.RTCPeerConnection !== "function";
+  const post = postHandler ? postHandler.postMessage.bind(postHandler) : () => {};  // the codecs' counts go nowhere
+  const ask = callHandler ? callHandler.postMessage.bind(callHandler) : () => Promise.reject(new Error("No calls here"));
   const send = (message) => { flushPackets(); post({ ...message, token: TOKEN }); };  // after the packets before it
   const call = async (message) => {
     const reply = await ask({ ...message, token: TOKEN });
@@ -539,7 +544,7 @@
   // With it, the call's worklet goes straight to the context's destination, which plays. Sound
   // goes to the system's current output either way, so choosing a device is only remembered.
   const Context = window.AudioContext;
-  if (Context && typeof Context.prototype.setSinkId !== "function") {
+  if (calls && Context && typeof Context.prototype.setSinkId !== "function") {
     const sinks = new WeakMap();
     Object.defineProperty(Context.prototype, "sinkId", {
       configurable: true, enumerable: true,
@@ -569,9 +574,11 @@
   // WebKit bounds neither the frames a decoder hands out nor the frames waiting in an encoder,
   // each 1.5 MB at 1366x766: a video attached to a chat was once decoded whole, faster than real
   // time, with its frames kept, until the page held 12 GB. So every decoder and encoder in the
-  // page also has a ceiling, far above what a call uses:
-  // - a decoder whose frames the page holds HELD_FRAMES of takes no more chunks until some are let
-  //   go (they wait, counted in decodeQueueSize), and fails if that takes HELD_MS outside a call;
+  // page's own thread also has a ceiling, far above what a call uses:
+  // - a decoder whose frames the page holds HELD_FRAMES of, or any decoder while the page holds
+  //   PAGE_FRAMES from all of them together (one decoder after another, each kept under its own),
+  //   takes no more chunks until some are let go (they wait, counted in decodeQueueSize), and
+  //   fails if nothing moves for HELD_MS outside a call;
   // - an encoder with ENCODE_QUEUE frames waiting drops frames in a call (never a key frame) and
   //   fails outside one;
   // - a rewritten decoder fed faster than real time outside a call is being fed a file, and fails.
@@ -579,6 +586,7 @@
   // decoder and encoder does goes up to Natter as counts, no content, at most once a second each,
   // for the log; so does how many workers the page starts, since none of this reaches into one.
   const HELD_FRAMES = 64;  // a call's decoder has 1-3 out at once
+  const PAGE_FRAMES = 2 * HELD_FRAMES;  // a group call's decoders, 1-3 each
   const HELD_MS = 10000;
   const ENCODE_QUEUE = 32;  // a call's encoder has 0-2 waiting
   const AHEAD_US = 1.5e6;
@@ -633,6 +641,8 @@
   const codecs = new WeakMap();
   const made = { dec: 0, enc: 0 };
   const page = { kind: "page", workers: 0, annexb: 0, dirty: false, sentAt: -Infinity, every: REPORT_MS };
+  let pageOpen = 0;  // decoded frames the page holds, from every decoder
+  const waiting = new Set();  // decoders with chunks held back
 
   function track(kind, base) {
     return {
@@ -666,7 +676,9 @@
 
   // Only these fields, which rtc.py checks again: codec names, sizes and counts.
   function countsOf(rec) {
-    if (rec.kind === "page") return { op: "webcodecs", kind: "page", workers: rec.workers, annexb: rec.annexb };
+    if (rec.kind === "page") {
+      return { op: "webcodecs", kind: "page", workers: rec.workers, annexb: rec.annexb, open: pageOpen };
+    }
     const message = { op: "webcodecs", kind: rec.kind, id: rec.id, codec: rec.codec, w: rec.w, h: rec.h,
                       out: rec.out, queue: queueOf(rec), drops: rec.drops };
     if (rec.kind === "dec") Object.assign(message, { desc: rec.desc, lat: rec.lat, rewrite: rec.rewrite, open: rec.open,
@@ -709,6 +721,7 @@
     }
     rec.heldChunks = 0;
     rec.heldSince = 0;
+    waiting.delete(rec);
     if (rec.timer) clearTimeout(rec.timer);
     rec.timer = 0;
   }
@@ -730,7 +743,11 @@
     rec.onError = pageError;
     return {
       output(...values) {
-        onOutput(values[0]);
+        try {
+          onOutput(values[0]);
+        } catch (_) {
+          // Counting never keeps a frame from the page.
+        }
         return pageOutput(...values);
       },
       error(failure) {
@@ -759,7 +776,8 @@
 
   // ---- Decoded frames the page holds ------------------------------------------------------------
   // Each with its decoder's counts, until close() or until it's collected unclosed. A copy
-  // (clone) holds the same picture, so it counts as one more until it's let go too.
+  // (clone), or a frame made from one (new VideoFrame(frame), to give it another timestamp),
+  // holds the same picture in WebKit, so it counts as one more until it's let go too.
 
   const holders = new WeakMap();
   const collected = typeof FinalizationRegistry === "function" ? new FinalizationRegistry((rec) => letGo(rec)) : null;
@@ -768,14 +786,19 @@
     if (!frame || typeof frame !== "object" || holders.has(frame)) return;
     holders.set(frame, rec);
     rec.open++;
+    pageOpen++;
     if (collected) collected.register(frame, rec, frame);
   }
 
   function letGo(rec) {
-    rec.open = Math.max(0, rec.open - 1);
+    if (rec.open > 0) {
+      rec.open--;
+      pageOpen--;
+    }
     rec.releasedAt = performance.now();
     if (rec.held.length) drain(rec);
     else changed(rec);
+    for (const other of [...waiting]) if (other !== rec) drain(other);  // room on the page for them too
   }
 
   const Frame = window.VideoFrame;
@@ -801,6 +824,20 @@
     };
     for (const name of ["close", "clone"])
       Object.defineProperty(Frame.prototype, name, { value: native(methods[name]), writable: true, enumerable: true, configurable: true });
+    // The constructor is wrapped, not subclassed: frames WebKit makes itself still pass
+    // `instanceof VideoFrame`, and VideoFrame is the browser's own in every other way.
+    const Made = new Proxy(Frame, {
+      construct(target, args, newTarget) {
+        const frame = Reflect.construct(target, args, newTarget === Made ? target : newTarget);
+        const rec = args[0] && typeof args[0] === "object" ? holders.get(args[0]) : undefined;
+        if (rec) hold(frame, rec);
+        return frame;
+      },
+    });
+    native(Made, "VideoFrame");
+    Object.defineProperty(Frame.prototype, "constructor", { value: Made, writable: true, enumerable: false,
+                                                            configurable: true });
+    Object.defineProperty(window, "VideoFrame", { value: Made, writable: true, configurable: true, enumerable: false });
   }
 
   // ---- Decoders ---------------------------------------------------------------------------------
@@ -815,7 +852,10 @@
     return Math.max(rec.sent.length, Reflect.get(decoderBase, "decodeQueueSize", rec.target));
   }
 
-  const full = (rec) => rec.open + inFlight(rec) >= HELD_FRAMES;
+  const full = (rec) => {
+    const coming = inFlight(rec);
+    return rec.open + coming >= HELD_FRAMES || pageOpen + coming >= PAGE_FRAMES;
+  };
 
   // Outside a call, whether a rewritten decoder's chunks run ahead of the clock: a file is fed
   // as fast as it decodes, a call as it comes (and the startup test is one frame).
@@ -890,6 +930,10 @@
     rec.heldChunks++;
     if (!rec.heldSince) rec.heldSince = performance.now();
     if (!rec.timer) rec.timer = setTimeout(() => waited(rec), 1000);
+    if (!waiting.has(rec)) {
+      waiting.add(rec);
+      if (pageOpen + inFlight(rec) >= PAGE_FRAMES) changed(page, true);  // the page's ceiling, not the decoder's
+    }
     changed(rec, true);
   }
 
@@ -901,13 +945,17 @@
         continue;
       }
       rec.heldChunks--;
+      rec.heldSince = performance.now();  // it moves: what's left waits from now
       try {
         feed(rec, item.chunk);
       } catch (_) {
         rec.drops++;  // WebKit refused it after all, too late to tell the page
       }
     }
-    if (!rec.held.length) rec.heldSince = 0;
+    if (!rec.held.length) {
+      rec.heldSince = 0;
+      waiting.delete(rec);
+    }
     changed(rec);
   }
 
@@ -1106,7 +1154,7 @@
   // shared for a while, every camera request asks for the same mode, and a camera that's already
   // on is handed out again rather than opened twice.
   const devices = navigator.mediaDevices;
-  if (devices && typeof devices.getUserMedia === "function" && typeof devices.enumerateDevices === "function") {
+  if (calls && devices && typeof devices.getUserMedia === "function" && typeof devices.enumerateDevices === "function") {
     const enumerate = devices.enumerateDevices.bind(devices);
     const open = devices.getUserMedia.bind(devices);
     const LIST_MS = 30000;
@@ -1222,6 +1270,7 @@
     };
   }
 
+  if (!calls) return;
   const classes = { RTCPeerConnection, RTCDataChannel, RTCSessionDescription, RTCIceCandidate, RTCCertificate };
   for (const [name, value] of Object.entries(classes)) install(name, value);
 

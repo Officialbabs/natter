@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 
 from natter import memguard
-from natter.memguard import CALL_GRACE, CALL_ROOM, GiB, KILL_MEMORY, MiB
+from natter.memguard import CALL_GRACE, CALL_MARGIN, CALL_ROOM, NATTER_ROOM, RUNAWAY_RATE, GiB, KILL_MEMORY, MiB
 
 UI = 1000
 TICKS = os.sysconf("SC_CLK_TCK")
@@ -101,10 +101,32 @@ class LimitsTest(unittest.TestCase):
         self.assertEqual(memguard.scope_limits(16 * GiB, 0), memguard.scope_limits(16 * GiB, 1))
 
     def test_the_guard_comes_first(self):
-        # Even in a call, a page at the guard's limit fits under the unit's, with Natter beside it.
-        for total in (4 * GiB, 8 * GiB, 16 * GiB, 64 * GiB):
+        # Even in a call, the most the guard lets a page hold fits under the unit's limit, swap and
+        # all, with Natter beside it: there the kernel would end it, and under a launcher's unit
+        # (OOMPolicy=stop) all of Natter.
+        for total in (4 * GiB, int(7.6 * GiB), 8 * GiB, int(14.8 * GiB), 16 * GiB, 64 * GiB, 0):
             memory_max, swap_max = memguard.scope_limits(total, 1)
-            self.assertLess(memguard.page_limit(total) + CALL_ROOM, memory_max + swap_max)
+            guard = memguard.MemoryGuard(memguard.page_limit(total), ceiling=memguard.page_ceiling(total),
+                                         idle_add=lambda *a: None)
+            for in_call in (False, True):
+                soft, hard = guard.limits(in_call)
+                self.assertLessEqual(soft, hard, (total, in_call))
+                self.assertLessEqual(hard + CALL_MARGIN, memory_max + swap_max - NATTER_ROOM, (total, in_call))
+
+    def test_the_ceiling_only_binds_on_small_computers(self):
+        for total in (int(7.6 * GiB), 8 * GiB, int(14.8 * GiB), 16 * GiB, 64 * GiB):
+            limit = memguard.page_limit(total)
+            self.assertGreater(memguard.page_ceiling(total), limit + CALL_ROOM + CALL_MARGIN, total)
+        self.assertEqual(memguard.page_ceiling(4 * GiB), int(4 * GiB * 0.6) + int(1.5 * GiB) - GiB)
+        guard = memguard.MemoryGuard(2 * GiB, ceiling=memguard.page_ceiling(4 * GiB), idle_add=lambda *a: None)
+        self.assertEqual(guard.limits(False), (2 * GiB, memguard.page_ceiling(4 * GiB)))
+        self.assertEqual(guard.limits(True), (memguard.page_ceiling(4 * GiB),) * 2)
+
+    def test_limits(self):
+        guard = memguard.MemoryGuard(3 * GiB, idle_add=lambda *a: None)
+        self.assertEqual(guard.limits(False), (3 * GiB, 3 * GiB + CALL_ROOM))
+        self.assertEqual(guard.limits(True), (3 * GiB + CALL_ROOM, 3 * GiB + CALL_ROOM + CALL_MARGIN))
+        self.assertLess(RUNAWAY_RATE, 130 * MiB)  # the slowest runaway seen grew 130-160 MB/s
 
     def test_mem_total(self):
         self.assertEqual(memguard.mem_total("MemTotal:       15551240 kB\nMemFree: 1 kB\n"), 15551240 * 1024)
@@ -161,32 +183,58 @@ class GuardTest(GuardBase):
     def test_past_the_limit_in_swap_the_page_ends(self):
         # WebKit's own limit counts resident memory only: this page would pass it unseen.
         self.guard.check(now=0)
+        self.proc.set(3002, anon_mb=1500, swap_mb=1000)
+        self.assertEqual(self.guard.check(now=2), [])
         self.proc.set(3002, anon_mb=1500, swap_mb=1800)
-        self.assertEqual(self.guard.check(now=2), [3002])
+        self.assertEqual(self.guard.check(now=4), [3002])  # past the limit, growing at both looks
         self.assertEqual(self.killed, [3002])
         self.assertEqual(self.reported, [(3002, 3300 * MiB)])
-        self.assertIn("page 3002 held 3300 MB, past its limit of 3072 MB, growing 1050 MB/s; ended it",
+        self.assertIn("page 3002 held 3300 MB, past its limit of 3072 MB, growing 400 MB/s; ended it",
                       self.out.getvalue())
         self.assertFalse(self.guard.recent_kill(4002, now=5))
         self.assertTrue(self.guard.recent_kill(3002, now=5))
         self.assertFalse(self.guard.recent_kill(3002, now=6))  # claimed once: one view per page
 
+    def test_past_the_limit_holding_still_the_page_stays(self):
+        # What a call left behind, or slow creep: left for the fresh page (app.py), not ended in
+        # front of whoever is using the window.
+        for now, size in enumerate((3300, 3300, 3350, 3350, 3400, 4500)):
+            self.proc.set(3002, anon_mb=size)
+            self.guard.check(now=now * 2)
+        self.assertEqual(self.killed, [])
+
+    def test_past_the_limit_growing_like_a_runaway_ends(self):
+        for now, size in enumerate((2800, 3000, 3200)):  # 100 MB/s, past the limit at the third look
+            self.proc.set(3002, anon_mb=size)
+            self.guard.check(now=now * 2)
+        self.assertEqual(self.killed, [3002])
+
+    def test_slower_than_a_runaway_is_ended_past_the_room(self):
+        for now, size in enumerate((4000, 4100, 4200, 4300, 4400, 4500, 4600)):  # 50 MB/s
+            self.proc.set(3002, anon_mb=size)
+            self.guard.check(now=now * 2)
+        self.assertEqual(self.killed, [])
+        self.proc.set(3002, anon_mb=4700)
+        self.guard.check(now=14)
+        self.assertEqual(self.killed, [3002])
+        self.assertIn("held 4700 MB, past its limit of 4608 MB, growing 50 MB/s; ended it", self.out.getvalue())
+
     def test_the_kill_is_noted_before_the_signal(self):
         # WebKit may report the crash before the guard's thread runs on: recent_kill knows already.
         claimed = []
         guard = self.make(killer=lambda pid: claimed.append(guard.recent_kill(pid)) or True)
-        self.proc.set(3002, anon_mb=3500)
+        self.proc.set(3002, anon_mb=5000)
         guard.check(now=time.monotonic())
         self.assertEqual(claimed, [True])
 
     def test_recent_kill_of_any_page(self):
-        self.proc.set(3002, anon_mb=3500)
+        self.proc.set(3002, anon_mb=5000)
         self.guard.check(now=0)
         self.assertTrue(self.guard.recent_kill(now=10))
         self.assertFalse(self.guard.recent_kill(now=11))
 
     def test_an_old_kill_is_not_claimed(self):
-        self.proc.set(3002, anon_mb=3500)
+        self.proc.set(3002, anon_mb=5000)
         self.guard.check(now=0)
         self.assertFalse(self.guard.recent_kill(3002, now=KILL_MEMORY + 1))
 
@@ -198,40 +246,84 @@ class GuardTest(GuardBase):
         self.assertEqual(self.killed, [])
 
     def test_in_a_call_past_the_raised_limit_slow_growth_stays(self):
-        # A long call's engine keeps growing, slowly: never ended for that.
+        # A long call's engine keeps growing, slowly: not ended for that until the call's margin.
         self.call = True
-        for now, size in enumerate((4700, 4800, 4900, 5000)):  # 50 MB/s
+        for now, size in enumerate((4700, 4800, 4900, 5000, 5100)):  # 50 MB/s
             self.proc.set(3002, anon_mb=size)
             self.guard.check(now=now * 2)
         self.assertEqual(self.killed, [])
+        self.proc.set(3002, anon_mb=5200)  # past the call's margin: the unit's backstop isn't far now
+        self.guard.check(now=10)
+        self.assertEqual(self.killed, [3002])
+        self.assertIn("past its limit of 5120 MB in a call, growing 50 MB/s; ended it", self.out.getvalue())
 
     def test_in_a_call_a_runaway_past_the_raised_limit_ends(self):
         self.call = True
-        self.proc.set(3002, anon_mb=4700)
+        self.proc.set(3002, anon_mb=4650)
         self.guard.check(now=0)
-        self.proc.set(3002, anon_mb=5200)
+        self.proc.set(3002, anon_mb=4800)
         self.guard.check(now=2)
         self.assertEqual(self.killed, [])  # one fast look isn't two
-        self.proc.set(3002, anon_mb=5700)
+        self.proc.set(3002, anon_mb=4950)
         self.guard.check(now=4)
         self.assertEqual(self.killed, [3002])
-        self.assertIn("past its limit of 4608 MB in a call, growing 250 MB/s; ended it", self.out.getvalue())
+        self.assertIn("past its limit of 4608 MB in a call, growing 75 MB/s; ended it", self.out.getvalue())
+
+    def test_in_a_call_the_runaway_of_20_october_is_ended(self):
+        # 130-160 MB/s, in a call in any account: ended within two looks of passing the call's room.
+        self.call = True
+        sizes = list(range(2600, 6000, 300))  # 150 MB/s
+        for now, size in enumerate(sizes):
+            self.proc.set(3002, anon_mb=size)
+            self.guard.check(now=now * 2)
+            if self.killed:
+                break
+        self.assertEqual(self.killed, [3002])
+        self.assertLessEqual(size, 3072 + 1536 + 2 * 300)
 
     def test_the_call_room_lasts_a_while_after_the_call(self):
         self.call = True
         self.guard.check(now=0)
         self.call = False
-        self.proc.set(3002, anon_mb=3500)
+        self.proc.set(3002, anon_mb=4700)  # in the call's room, holding still
         self.guard.check(now=CALL_GRACE - 1)
         self.assertEqual(self.killed, [])
         self.guard.check(now=CALL_GRACE + 1)
+        self.assertEqual(self.killed, [3002])
+
+    def test_after_the_call_a_runaway_is_ended_at_once(self):
+        # Not a minute later: the grace keeps only the call's room.
+        self.call = True
+        self.guard.check(now=0)
+        self.call = False
+        for now, size in enumerate((4400, 4700, 5000)):  # 150 MB/s
+            self.proc.set(3002, anon_mb=size)
+            self.guard.check(now=10 + now * 2)
+        self.assertEqual(self.killed, [3002])
+
+    def test_after_a_long_call_on_an_8_gb_computer_the_page_stays(self):
+        # 7.6 GiB to the kernel: a limit of 2.5 GiB, and an idle page of 1.3 GB that a long call
+        # left 1.4 GB more. It holds still once the call is over, window shown: no reload.
+        total = int(7.6 * GiB)
+        guard = self.make(ceiling=memguard.page_ceiling(total))
+        guard.limit = memguard.page_limit(total)
+        self.call = True
+        self.proc.set(3002, anon_mb=2700)
+        guard.check(now=0)
+        self.call = False
+        for now in range(2, int(CALL_GRACE) + 600, 2):
+            guard.check(now=now)
+        self.assertEqual(self.killed, [])
+        for now, size in ((1000, 2900), (1002, 3100), (1004, 3300)):  # then grows like a runaway: ended
+            self.proc.set(3002, anon_mb=size)
+            guard.check(now=now)
         self.assertEqual(self.killed, [3002])
 
     def test_a_calling_check_that_fails_keeps_what_was_known(self):
         self.call = True
         self.guard.check(now=0)
         self.guard.calling = lambda: 1 / 0
-        self.proc.set(3002, anon_mb=3500)
+        self.proc.set(3002, anon_mb=4700)
         self.guard.check(now=2)
         self.assertEqual(self.killed, [])
 
@@ -239,7 +331,7 @@ class GuardTest(GuardBase):
         self.guard.check(now=0)
         (self.proc.root / "3002" / "status").unlink()  # gone between the list and the look
         self.assertEqual(self.guard.check(now=2), [])
-        self.proc.add(3002, "WebKitWebProces", [], 3500, parent=3001)
+        self.proc.add(3002, "WebKitWebProces", [], 5000, parent=3001)
         guard = self.make(killer=lambda pid: False)  # gone between the look and the kill
         self.assertEqual(guard.check(now=4), [])
         self.assertEqual(self.reported, [])
@@ -254,7 +346,7 @@ class GuardTest(GuardBase):
 
     def test_a_page_is_ended_once(self):
         # SIGKILL sent, a page holding gigabytes takes a while to go: not ended (or claimed) twice.
-        self.proc.set(3002, anon_mb=3500)
+        self.proc.set(3002, anon_mb=5000)
         self.guard.check(now=0)
         self.guard.check(now=2)
         self.assertEqual(self.killed, [3002])
@@ -361,8 +453,8 @@ class ThreadTest(unittest.TestCase):
             proc.page(3000, 3001, 3002, anon_mb=1200)
             proc.children([3000])
             killed, queued = [], []
-            guard = memguard.MemoryGuard(GiB, lambda pid, size: None, poll=0.02, proc=proc.root, pid=UI,
-                                         flatpak=False, killer=lambda pid: killed.append(pid) or True,
+            guard = memguard.MemoryGuard(GiB // 2, lambda pid, size: None, poll=0.02, ceiling=GiB, proc=proc.root,
+                                         pid=UI, flatpak=False, killer=lambda pid: killed.append(pid) or True,
                                          idle_add=lambda fn, *args: queued.append(args))
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 guard.start()

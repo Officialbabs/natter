@@ -14,7 +14,7 @@ from unittest import mock
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import GLib, Gtk
+from gi.repository import GLib
 
 from natter import APP_ID, NAME, media, palette, prefs, window
 from natter.palette import Palette, device_command
@@ -415,7 +415,8 @@ class AskAgainTest(Privacy):
 
     def test_the_dialog(self):
         _host, alert = self.ask("cancel")
-        self.assertEqual(alert.props, {"heading": "Ask Again for the Camera?", "body": "Your desktop will ask you now."})
+        self.assertEqual(alert.props, {"heading": "Ask Again for the Camera?",
+                                       "body": "Your desktop will ask you now."})
         self.assertEqual(alert.responses(), [("cancel", "_Cancel"), ("ask", "_Ask Again")])
         self.assertEqual(alert.called("set_response_appearance"), [("ask", "Adw.ResponseAppearance.SUGGESTED")])
         self.assertEqual(alert.called("set_close_response"), [("cancel",)])
@@ -705,10 +706,20 @@ class ToastWordsTest(unittest.TestCase):
         self.assertEqual((button, action), ("Details", "app.preferences-page"))
         self.assertTrue(target.equal(GLib.Variant("s", "privacy")))
 
+    def test_waiting(self):
+        # Refused before the desktop's answer could be read: Privacy says it's waiting for it.
+        title, button, action, target = refused_toast("camera", "waiting")
+        self.assertEqual(title, "Waiting for your desktop's privacy settings")
+        self.assertEqual((button, action), ("Details", "app.preferences-page"))
+        self.assertTrue(target.equal(GLib.Variant("s", "privacy")))
+        self.assertEqual(refused_toast("camera", "waiting", "Work")[0],
+                         "Waiting for your desktop's privacy settings (Work)")
+
     def test_names_the_account(self):
-        self.assertEqual(refused_toast("camera", "off", "Work")[0], f"Work: the camera is off in {NAME}")
+        # In brackets, as app.py names them in its own toasts about the microphone and camera.
+        self.assertEqual(refused_toast("camera", "off", "Work")[0], f"The camera is off in {NAME} (Work)")
         self.assertEqual(refused_toast("camera", "desktop", "R&D")[0],
-                         f"R&D: your desktop blocks the camera for {NAME}")
+                         f"Your desktop blocks the camera for {NAME} (R&D)")
 
     def test_privacy_is_a_page(self):
         from natter.app import PREFERENCES_PAGES
@@ -769,7 +780,12 @@ class RefusedToastTest(unittest.TestCase):
         self.assertEqual(fake.toasts[0][0][0], f"The camera is off in {NAME}")
         fake = self.window(accounts=2)
         self.refuse(fake, 1.0, account=fake.app.accounts[1])
-        self.assertEqual(fake.toasts[0][0][0], f"A1: the camera is off in {NAME}")
+        self.assertEqual(fake.toasts[0][0][0], f"The camera is off in {NAME} (A1)")
+
+    def test_waiting_is_said(self):
+        fake = self.window()
+        self.refuse(fake, 1.0, reason="waiting")
+        self.assertEqual(fake.toasts[0][0][0], "Waiting for your desktop's privacy settings")
 
     def test_nothing_unknown(self):
         fake = self.window()

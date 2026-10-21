@@ -56,6 +56,18 @@ It only does that where swap is cheap (zram, or zswap enabled), and Ada's launch
 (`app-ada-io.github.Officialbabs.Natter-<pid>.scope`) counts as its own, so it doesn't make
 another.
 
+Two things for lifecycled, from a WhatsApp page that grew to 12 GB (20 October 2026):
+
+- **Measure an app by what it holds: anon plus swap** (`memory.stat`'s `anon` and
+  `memory.swap.current`), not `memory.current`. That read 6.2 GB while the page held 12.3 GB,
+  the rest of it in swap, so lifecycled closed other apps instead of the one that was growing.
+- **Make launcher scopes with `OOMPolicy=continue`.** systemd's default, `stop`, stops the whole
+  app when the kernel ends one of its processes at the unit's `MemoryMax`; with `continue` only
+  that process goes, and Natter Den starts a fresh page in its place. It can only be set when
+  the scope is made, so Natter Den sets it on scopes it makes itself, sets `MemoryMax` and
+  `MemorySwapMax` on Ada's, and says in its log when Ada's is `stop`. Its own guard
+  (`natter/memguard.py`) ends a runaway page well before either.
+
 ## Light, Dark and Dune
 
 Ada's Settings → Appearance picks the apps' style (Light, Dark or Dune) and stores it in

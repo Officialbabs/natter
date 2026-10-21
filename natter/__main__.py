@@ -91,6 +91,12 @@ def main() -> int:
         GLib.set_prgname(APP_ID)
     except ImportError:
         pass
+    from .gstfix import apply as fix_camera
+
+    # Before anything starts GStreamer, in Natter or WebKit: it reads these settings once.
+    # The camera's first-frame freeze with GStreamer 1.28 and newer (gstfix.py; on by default
+    # only where system.py keeps its settings from the programs Natter opens).
+    fix_camera()
     if check():
         return 1
     from .system import hide_system_bus

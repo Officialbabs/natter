@@ -296,6 +296,7 @@ class WordingTest(unittest.TestCase):
         self.assertEqual(label.props["label"], f"flatpak run {APP_ID} --background")  # no word joiners in it
         self.assertTrue(label.props["selectable"])
         self.assertEqual(label.props["wrap_mode"], "word")  # never inside the app id
+        self.assertEqual(label.called("set_focusable"), [(False,)])  # not opened with it all selected
 
 
 class AboutTest(unittest.TestCase):

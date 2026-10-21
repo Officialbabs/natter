@@ -52,9 +52,10 @@ class Entry:
 
 
 class Palette(Adw.Dialog):
-    def __init__(self, app, files: Optional[list[Path]] = None, query: str = "") -> None:
+    def __init__(self, app, files: Optional[list[Path]] = None, query: str = "", how: str = "") -> None:
         self.app = app
         self.files = files or []
+        self.how = how  # how the files came (dropped, pasted, shared): for the log (Account.attach)
         super().__init__(title="Send To" if self.files else "Go to Chat", content_width=460, content_height=540)
 
         self.entry = Gtk.SearchEntry(hexpand=True,
@@ -112,7 +113,7 @@ class Palette(Adw.Dialog):
         if digits and app.window.account:
             account = app.window.account
             found.append(Entry(f"Message +{digits}", "Opens a chat without saving the number",
-                               lambda: app.message_number(account, digits, self.files), avatar=False,
+                               lambda: app.message_number(account, digits, self.files, self.how), avatar=False,
                                icon="chat-message-new-symbolic"))
 
         chats: list[tuple[Chat, object]] = []
@@ -122,7 +123,7 @@ class Palette(Adw.Dialog):
         for chat in rank(query, [c for c, _ in chats])[:LIMIT]:
             account = by_chat[id(chat)]
             found.append(Entry(chat.name, account.name if several else "",
-                               lambda a=account, n=chat.name: app.go_to(a, n, self.files)))
+                               lambda a=account, n=chat.name: app.go_to(a, n, self.files, self.how)))
 
         if not self.files and query.strip():
             commands = [

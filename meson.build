@@ -21,8 +21,33 @@ pkgdatadir = datadir / meson.project_name()
 
 install_subdir('natter',
   install_dir: pkgdatadir,
-  exclude_directories: ['__pycache__'],
+  exclude_directories: ['__pycache__', 'camfix'],  # camfix: C source, built below
 )
+
+# The camera fix (natter/camfix/nattercamfix.c, used by natter/gstfix.py): a GStreamer tracer that
+# stops WebKit's camera freezing on its first frame with GStreamer 1.28 and newer. Optional: built
+# when there's a C compiler and GStreamer's development files; Natter runs without it. gstfix.py
+# finds it through the camfix-dir file installed next to it.
+camfix_dir = prefix / get_option('libdir') / meson.project_name() / 'gstreamer-1.0'
+gstreamer = dependency('', required: false)
+if add_languages('c', required: false, native: false)
+  gstreamer = dependency('gstreamer-1.0', required: false)
+endif
+if gstreamer.found()
+  shared_module('nattercamfix', 'natter' / 'camfix' / 'nattercamfix.c',
+    dependencies: gstreamer,
+    c_args: ['-DNATTER_VERSION="' + meson.project_version() + '"'],
+    install: true,
+    install_dir: camfix_dir,
+  )
+  configure_file(
+    input: 'natter' / 'camfix' / 'camfix-dir.in',
+    output: 'camfix-dir',
+    configuration: {'DIR': camfix_dir},
+    install: true,
+    install_dir: pkgdatadir / 'natter',
+  )
+endif
 
 # The launcher: the Python that has PyGObject on its first line, the package's folder in NATTER_DIR.
 configure_file(

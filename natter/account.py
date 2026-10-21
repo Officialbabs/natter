@@ -57,6 +57,10 @@ GRANT_REUSE = 10 * 60
 BACKOFF = (1, 5, 30, 120)
 STEADY = 10 * 60
 LOOP_CRASHES, LOOP_SECONDS = 3, 120
+# A page ended for its memory gets a fresh one after a second, outside that count. Ended again
+# within this long, it's the same again (a video still being added), so it stays down until
+# Try Again.
+MEMORY_AGAIN = 10 * 60
 
 # What the page may tell Natter: anything longer is cut, anything of the wrong kind is dropped.
 NAME_LIMIT = 200  # a chat's name, a notification's title
@@ -226,6 +230,23 @@ def reload_delay(crashes: list[float]) -> Optional[int]:
     return BACKOFF[min(streak, len(BACKOFF)) - 1]
 
 
+def attach_line(paths: list[Path], how: str = "") -> str:
+    """The log line for files handed to WhatsApp (Account.attach): how many, how big, their
+    types and how they came, never their names. What WhatsApp does with a file goes by its type
+    and size: a video is decoded in the page, and one took the page to 12 GB (20 Oct 2026)."""
+    size, types = 0, []
+    for path in paths:
+        try:
+            size += Path(path).stat().st_size
+        except OSError:
+            pass
+        kind = Gio.content_type_get_mime_type(Gio.content_type_guess(str(path), None)[0]) or "application/octet-stream"
+        if kind not in types:
+            types.append(kind)
+    count = f"{len(paths)} file{'' if len(paths) == 1 else 's'}"
+    return f"natter: attach: {count}, {size / 2 ** 20:.1f} MB, {', '.join(types)}, via {how or 'unknown'}"
+
+
 def file_name(suggested: str) -> str:
     """A name to save a download under: no folders, control or invisible characters, not hidden, never empty."""
     name = re.sub(r"^[.\s]+", "", clean(Path(suggested or "").name, 1024) or "")
@@ -268,6 +289,8 @@ class Account(GObject.Object):
         # WhatsApp asked for the microphone or camera (kind) and Natter said no: "off" for its
         # own switch, "desktop" for the desktop's answer about the camera (media.refusal).
         "media-refused": (GObject.SignalFlags.RUN_FIRST, None, (str, str)),
+        # The page was ended for the memory it held (_on_memory_ended): reloaded, or stopped (True).
+        "memory-ended": (GObject.SignalFlags.RUN_FIRST, None, (bool,)),
     }
 
     def __init__(self, app, info: dict, url: Optional[str] = None) -> None:
@@ -281,6 +304,7 @@ class Account(GObject.Object):
         self.needs_link = False  # WhatsApp shows its link screen (QR code)
         self.reloading = False  # WhatsApp loads again (Reload, a fresh page, after a crash) until it's back
         self.crashing = False  # crashed again and again: not reloading until reload()
+        self.memory_stopped = False  # crashing, because it was ended for its memory twice (_on_memory_ended)
         self.removed = False
         self.failed: Optional[str] = None
         self.dev_url = url
@@ -290,6 +314,7 @@ class Account(GObject.Object):
         self._fallback: dict[int, WebKit.Notification] = {}
         self._handlers: list[tuple[GObject.Object, int]] = []
         self._crashes: list[float] = []
+        self._memory_ends: list[float] = []  # time.monotonic() of each page ended for its memory
         # WhatsApp's calls in the page: data channels done by GStreamer (rtc.py), when it's here.
         self.rtc: Optional[rtc.Host] = None
         self._picked: Optional[list[str]] = None  # files waiting for WebKit to ask for them (attach)
@@ -320,7 +345,11 @@ class Account(GObject.Object):
         self.refused_since_load = dict.fromkeys(MEDIA_KINDS, False)
         # The backstop (_on_capture_state) may end each kind's capture once, until it reads none.
         self._backstop = dict.fromkeys(MEDIA_KINDS, True)
-        self._lose_media_after_call = False  # app._on_anchor_gone, during a call
+        # Kinds switched off during a call whose grant WebKit may still reuse: the page loads
+        # afresh once the call is over (stop_media, _on_page_call).
+        self._fresh_after_call: set[str] = set()
+        # WhatsApp's camera requests waiting on Natter's own question to the desktop (_on_media_request).
+        self._held_media: list = []
 
         data, cache = DATA / "accounts" / self.id / "web", CACHE / "accounts" / self.id
         data.mkdir(parents=True, exist_ok=True)
@@ -343,13 +372,17 @@ class Account(GObject.Object):
         self.apply_theme()
         content.register_script_message_handler("natter", None)
         self._connect(content, "script-message-received::natter", self._on_message)
+        # rtc.js in every page: the ceilings on the page's video codecs, and their counts for the
+        # log, are for every page. Its WebRTC stand-in only with calls in the page, which give it
+        # the answering handler too.
+        content.add_script(WebKit.UserScript.new(RTC.replace("__NATTER_TOKEN__", self._token),
+                                                 WebKit.UserContentInjectedFrames.TOP_FRAME,
+                                                 WebKit.UserScriptInjectionTime.START, allow, None))
+        content.register_script_message_handler("natterRtc", None)
+        self._connect(content, "script-message-received::natterRtc", self._on_rtc_message)
+        self._codec_log = None if app.calls_in_page else rtc.CodecLog(later=GLib.timeout_add)
         if app.calls_in_page:
             self.rtc = rtc.Host(self._on_page_call)
-            content.add_script(WebKit.UserScript.new(RTC.replace("__NATTER_TOKEN__", self._token),
-                                                     WebKit.UserContentInjectedFrames.TOP_FRAME,
-                                                     WebKit.UserScriptInjectionTime.START, allow, None))
-            content.register_script_message_handler("natterRtc", None)
-            self._connect(content, "script-message-received::natterRtc", self._on_rtc_message)
             content.register_script_message_handler_with_reply("natterRtcCall", None)
             self._connect(content, "script-message-with-reply-received::natterRtcCall", self._on_rtc_call)
 
@@ -590,9 +623,10 @@ class Account(GObject.Object):
             GLib.source_remove(self._link_timer)
             self._link_timer = 0
 
-    def attach(self, paths: list[Path], done: Optional[Callable[[bool], None]] = None) -> None:
+    def attach(self, paths: list[Path], done: Optional[Callable[[bool], None]] = None, how: str = "") -> None:
         """Put files in the open chat, which brings up WhatsApp's preview with a caption box (or
-        adds them to the preview when it's already open).
+        adds them to the preview when it's already open). `how` they came is for the log
+        (attach_line): "drop", "paste", "share" (the dock icon, `natter FILE…`) or "debug".
 
         The bridge clicks a file input of its own and WebKit asks which files (_on_file_chooser):
         WhatsApp then gets them straight from disk, whatever their size, with nothing copied
@@ -602,6 +636,7 @@ class Account(GObject.Object):
         if not paths:
             finish(False)
             return
+        print(attach_line(paths, how), flush=True)
         self._picked = [str(Path(p).resolve()) for p in paths]  # plain paths: a file:// URI gives empty files
 
         def picked(result) -> None:
@@ -711,8 +746,9 @@ class Account(GObject.Object):
     def fresh_page(self) -> None:
         """WhatsApp again in a new web process. After a call, WhatsApp keeps its call engine
         loaded: twenty threads and memory that WebKit can't give back (it only grows), well over
-        a gigabyte. Only a new process lets it go. The chat that was open opens again."""
-        if self.removed or self.calling:
+        a gigabyte. Only a new process lets it go. The chat that was open opens again. A page
+        that stopped (crashing) stays stopped until Try Again."""
+        if self.removed or self.calling or self.crashing:
             return
         self.fresh_at = time.monotonic()
         self._reopen_after_load()
@@ -730,8 +766,9 @@ class Account(GObject.Object):
     def reload(self) -> None:
         """Load WhatsApp again, also after a crash loop."""
         self.failed = None
-        self.crashing = False
+        self.crashing = self.memory_stopped = False
         self._crashes.clear()
+        self._memory_ends.clear()
         self._load(self.home)
         self.emit("state-changed")
 
@@ -740,11 +777,13 @@ class Account(GObject.Object):
             GLib.source_remove(self._reload_timer)
             self._reload_timer = 0
         self._end_link()
-        # A load Natter starts ends what WebKit reuses without asking (stop_media), and what it
-        # remembers refusing.
+        # A load Natter starts ends what WebKit reuses without asking (stop_media), what it
+        # remembers refusing, and the requests the old page made.
         self._allowed_at = dict.fromkeys(MEDIA_KINDS)
         self._ended_at = dict.fromkeys(MEDIA_KINDS)
         self.refused_since_load = dict.fromkeys(MEDIA_KINDS, False)
+        self._fresh_after_call = set()
+        self._held_media = []
         self.ready = False
         self.look = self.look_dark = None  # the new page says again how it looks
         self._set_reloading(uri == self.home)  # not for a link opened in the page
@@ -788,7 +827,7 @@ class Account(GObject.Object):
     # ---- WebRTC for calls (rtc.js, rtc.py) ---------------------------------------------------
 
     def _rtc_message(self, value) -> Optional[dict]:
-        if self.rtc is None or not self._trusted():
+        if not self._trusted():
             return None
         try:
             raw = json.loads(value.to_json(0) or "null")
@@ -800,11 +839,15 @@ class Account(GObject.Object):
 
     def _on_rtc_message(self, _content, value) -> None:
         message = self._rtc_message(value)
-        if message is not None:
+        if message is None:
+            return
+        if self.rtc is not None:
             self.rtc.post(message)
+        elif message.get("op") == "webcodecs" and self._codec_log is not None:  # all rtc.js sends without calls
+            self._codec_log.take(message)
 
     def _on_rtc_call(self, _content, value, reply) -> bool:
-        message = self._rtc_message(value)
+        message = self._rtc_message(value) if self.rtc is not None else None
         if message is None:
             reply.return_error_message("Not available")
             return True
@@ -828,9 +871,11 @@ class Account(GObject.Object):
         throttling = ("HiddenPageDOMTimerThrottling",)
         _features(self.view.get_settings(), off=throttling if active else (), on=() if active else throttling)
         self.emit("in-call", active)
-        if not active and self._lose_media_after_call:
-            self._lose_media_after_call = False
-            self.reload()  # what lose_media held back for the call
+        if not active and self._fresh_after_call:
+            # A device switched off during the call: WebKit would still hand it out without asking.
+            kinds, self._fresh_after_call = self._fresh_after_call, set()
+            if any(self._media_blocked(kind) for kind in kinds):
+                self.fresh_page()
 
     def _on_message(self, _content, value) -> None:
         if not self._trusted():
@@ -967,17 +1012,47 @@ class Account(GObject.Object):
         """WhatsApp asks for the microphone, the camera, or both (screen sharing is neither, and
         these switches leave it alone). Natter's switches decide, and for the camera natively the
         desktop's answer too (media.refusals). What's refused is said (media-refused) and noted,
-        for media_allowed_again; what's allowed is noted for stop_media."""
+        for media_allowed_again; what's allowed is noted for stop_media.
+
+        With nothing stored for the camera, the desktop asks when WebKit lists devices through
+        its portal; but where WebKit can find the camera without it (app.camera_fallback), a
+        listing that missed the portal never asked. So such a request waits while Natter asks
+        the desktop itself (app.ask_camera), and only a yes lets it through."""
         audio = WebKit.user_media_permission_is_for_audio_device(request)
         video = WebKit.user_media_permission_is_for_video_device(request)
+        gate = self.app.camera_gate()
+        if video and gate == "ask" and self.app.camera_fallback and not self._media_refusals(gate, audio, video):
+            self._held_media.append(request)
+            self.app.ask_camera(lambda answer: self._asked_desktop(request, audio, video, answer))
+            return
+        self._answer_media(request, gate, audio, video)
+
+    def _asked_desktop(self, request, audio: bool, video: bool, answer: Optional[str]) -> None:
+        """The desktop answered Natter's question for a request that waited on it: a yes lets it
+        through, unless something else refuses it by now; anything else refuses its camera."""
+        if self.removed or request not in self._held_media:
+            return  # the page has loaded again since, or gone: WebKit has let go of the request
+        self._held_media.remove(request)
+        gate = self.app.camera_gate()
+        if answer != "yes":
+            gate = "no"
+        elif gate == "ask":
+            gate = "yes"  # the store says so too, a moment later
+        self._answer_media(request, gate, audio, video)
+
+    def _media_refusals(self, gate: Optional[str], audio: bool, video: bool) -> list[tuple[str, str]]:
         settings = self.app.settings
-        refused = refusals(bool(settings["microphone"]), bool(settings["camera"]), self.app.camera_gate(),
-                           audio, video)
+        return refusals(bool(settings["microphone"]), bool(settings["camera"]), gate, audio, video)
+
+    def _answer_media(self, request, gate: Optional[str], audio: bool, video: bool) -> None:
+        refused = self._media_refusals(gate, audio, video)
         if refused:
             request.deny()
             for kind, reason in refused:
                 self.refused_since_load[kind] = True
                 self.emit("media-refused", kind, reason)
+            if ("camera", "waiting") in refused:
+                self.app.desktop_media.refresh()  # read the store now, not at its next try
             return
         now = time.monotonic()
         for kind, asked in (("microphone", audio), ("camera", video)):
@@ -987,13 +1062,15 @@ class Account(GObject.Object):
 
     def _on_permission_query(self, _view, query) -> bool:
         """navigator.permissions.query(): what Natter would answer (see _on_permission), so the
-        page lists devices by name and doesn't ask first. A device switched off reads "denied",
-        as a site blocked in a browser does, and the page sees one nameless device of that kind.
-        That only changes what the page sees: refusing is _on_permission's job."""
+        page lists devices by name and doesn't ask first. A device switched off, or a camera the
+        desktop keeps from Natter, reads "denied", as a site blocked in a browser does, and the
+        page sees one nameless device of that kind: not the camera's name and id, which WebKit
+        lists even where the portal refused it (udev). That only changes what the page sees:
+        refusing is _on_permission's job."""
         name = query.get_name()
         if name not in ("microphone", "camera", "notifications") or not self._trusted():
             return False
-        if name in MEDIA_KINDS and not self.app.settings[name]:
+        if name in MEDIA_KINDS and self._media_blocked(name):
             query.finish(WebKit.PermissionState.DENIED)
         else:
             query.finish(WebKit.PermissionState.GRANTED)
@@ -1022,27 +1099,43 @@ class Account(GObject.Object):
         While it captures, ending the capture ends the page's tracks of that kind, lets the
         device go, and makes WebKit forget what it allowed (both kinds: the other's next request
         is asked again). Once it reads none, that does nothing, yet WebKit would still hand the
-        device out again without asking, for up to GRANT_REUSE after the capture ended, or until
-        a page loads if none was made: only a load Natter starts ends that, so allowed since then,
-        and not in a call, the page loads afresh (back on the chat that was open). In a call,
-        the backstop sees to anything reused (_on_capture_state)."""
+        device out again without asking (_grant_lives). Only a load Natter starts ends that, so
+        allowed since then, the page loads afresh (back on the chat that was open): now, or in a
+        call once the call is over (_on_page_call). Meanwhile the backstop sees to anything
+        reused (_on_capture_state)."""
         if self.removed:
             return False
         if self._capture_state(kind) != WebKit.MediaCaptureState.NONE:  # active or muted
             self._end_capture(kind)
             return True
-        ended = self._ended_at[kind]
-        if self._allowed_at[kind] is not None and not self.calling and (
-                ended is None or time.monotonic() - ended < GRANT_REUSE):
-            self.fresh_page()
+        if self._grant_lives(kind):
+            if self.calling:
+                self._fresh_after_call.add(kind)
+            else:
+                self.fresh_page()
         return False
+
+    def _grant_lives(self, kind: str) -> bool:
+        """Whether WebKit may still hand out what Natter allowed of `kind` without asking. It
+        forgets every grant GRANT_REUSE after the page last stopped capturing anything (its timer
+        starts once neither kind captures), so not while either does, and never a grant no
+        capture has ended since."""
+        allowed = self._allowed_at[kind]
+        if allowed is None:
+            return False
+        if any(self._capture_state(other) != WebKit.MediaCaptureState.NONE for other in MEDIA_KINDS):
+            return True
+        ended = max((at for at in self._ended_at.values() if at is not None), default=None)
+        return ended is None or ended < allowed or time.monotonic() - ended < GRANT_REUSE
 
     def media_allowed_again(self, kind: str) -> None:
         """The microphone or camera (`kind`) may be used again. A request that follows a click
         (WhatsApp's call and camera buttons) reaches Natter at once. One that doesn't (a preview
         that starts by itself) WebKit keeps refusing while it remembers Natter's no, until the
-        page loads again: so if Natter refused it since, and nobody's in a call, it reloads."""
-        if self.refused_since_load[kind] and not self.calling and not self.removed and not self._media_blocked(kind):
+        page loads again: so if Natter refused it since, and nobody's in a call, it reloads (not
+        a page that stopped: that waits for Try Again)."""
+        if (self.refused_since_load[kind] and not self.calling and not self.removed and not self.crashing
+                and not self._media_blocked(kind)):
             self.reload()
 
     def _on_capture_state(self, _view, pspec) -> None:
@@ -1057,13 +1150,12 @@ class Account(GObject.Object):
             self._end_capture(kind)
 
     def lose_media(self) -> None:
-        """No microphone or camera for this page until Natter restarts (app._on_anchor_gone):
-        WebKit's media streams off, which takes a page loaded afresh. Not in a call: after it."""
+        """No microphone or camera for WhatsApp's pages from now until Natter restarts
+        (app._on_anchor_gone): WebKit's media streams off for every page loaded from here on.
+        The page that's up keeps them, call and all: the portal named its web process while the
+        anchor lived, and goes by that. A new web process (a fresh page, one after a crash) is
+        what it can't name any more, and that page has no device listing to hang on."""
         self.view.get_settings().set_enable_media_stream(False)
-        if self.calling:
-            self._lose_media_after_call = True
-        elif not self.removed:
-            self.reload()
 
     def devices_changed(self) -> None:
         """A microphone or speaker came or went, or the default changed: WhatsApp looks again
@@ -1187,17 +1279,12 @@ class Account(GObject.Object):
         if reason == WebKit.WebProcessTerminationReason.TERMINATED_BY_API or self.removed:
             return
         if reason == WebKit.WebProcessTerminationReason.EXCEEDED_MEMORY_LIMIT:
-            # Not a crash: WebKit ended the page at Natter's kill threshold (app.py MEMORY_KILL),
-            # usually for what a call left behind. A fresh page at once, kept out of the
-            # crash-loop count, back on the chat that was open.
-            print(f"natter: {self.name}'s page passed its memory limit; a fresh page", flush=True)
-            self.fresh_at = time.monotonic()
-            self._reopen_after_load()
-            if self._reload_timer:
-                GLib.source_remove(self._reload_timer)
-            self._reload_timer = GLib.timeout_add_seconds(1, self._reload_after_crash)
-            self.reloading = True
-            self.emit("state-changed")
+            self._on_memory_ended("WebKit")
+            return
+        # Natter's guard, and the kernel at the unit's limit, end a page with SIGKILL: to WebKit, a crash.
+        by = self.app.ended_for_memory() if reason == WebKit.WebProcessTerminationReason.CRASHED else None
+        if by:
+            self._on_memory_ended(by)
             return
         self._crashes = self._crashes[-(LOOP_CRASHES + len(BACKOFF)):] + [time.monotonic()]
         delay = reload_delay(self._crashes)
@@ -1219,6 +1306,33 @@ class Account(GObject.Object):
         self._reload_timer = 0
         self._load(self.home)
         return GLib.SOURCE_REMOVE
+
+    def _on_memory_ended(self, by: str) -> None:
+        """The page was ended for the memory it held, `by` WebKit at Natter's kill threshold
+        (app.py MEMORY_KILL), usually for what a call left behind, or by Natter's guard or the
+        kernel (memguard.py) for a page growing without end: a video's decoded frames took one to
+        12 GB on 20 Oct 2026. Not a crash: a fresh page after a second, kept out of the
+        crash-loop count, back on the chat that was open. Ended again within MEMORY_AGAIN, it
+        would only do the same again, so it stays down until Try Again (memory_stopped)."""
+        now = time.monotonic()
+        self._memory_ends = [at for at in self._memory_ends if now - at < MEMORY_AGAIN] + [now]
+        if self._reload_timer:
+            GLib.source_remove(self._reload_timer)
+            self._reload_timer = 0
+        if len(self._memory_ends) > 1:
+            print(f"natter: {self.name}'s page was ended for its memory ({by}), again within "
+                  f"{MEMORY_AGAIN // 60} minutes; not reloading", flush=True)
+            self.crashing = self.memory_stopped = True
+            self.reloading = False
+            self._drop_pending()
+        else:
+            print(f"natter: {self.name}'s page was ended for its memory ({by}); a fresh page", flush=True)
+            self.fresh_at = now
+            self._reopen_after_load()
+            self._reload_timer = GLib.timeout_add_seconds(1, self._reload_after_crash)
+            self.reloading = True
+        self.emit("state-changed")
+        self.emit("memory-ended", self.memory_stopped)
 
     def network_lost(self) -> None:
         """WebKit's network process died (app.py), and this page's database, websocket and loads

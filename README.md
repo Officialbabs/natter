@@ -34,6 +34,7 @@ runs the real WhatsApp Web and nothing else, the same way your browser would.
 | **Themes** | In Preferences → Appearance: Den (the default, in the icon's orange); WhatsApp's own 22 chat themes, with WhatsApp's names and colours in the order its picker has them (WhatsApp green, Pearl indigo, Tyrian purple, Sunset orange, Merino teal, Royal blue, Dark cerulean, Charcoal green, Persian plum, Dune mono, Default blue, Default mono, Sky blue, Brown, Cream, Emerald, Lemon, Lime, Pink, Red, Sunrise orange, Warm yellow); Custom, a theme in any colour you pick, made the way WhatsApp makes its own; or Plain for WhatsApp's and your system's own colours. Each recolours the accent, links, read ticks, sent bubbles and chat background on WhatsApp's page and the accent in Natter Den's window, in light and dark, and switches live. Light, Dark or Follow System passes through to WhatsApp; on Ada, Follow System follows Ada's own Light, Dark or Dune. Themes only redefine WhatsApp's colour names in a local style sheet: nothing is loaded, clicked or stored in WhatsApp ([how](#themes)). |
 | **Privacy blur** | Ctrl+Shift+B blurs names, pictures and messages until you point at them. It can also blur everything while Natter Den is in the background. |
 | **App lock** | A passcode keeps WhatsApp out of sight: when Natter Den starts, when its window closes, or after being idle; Ctrl+L locks it now. While it's locked, notifications don't say who wrote or what, and recent chats leave the dock and search. |
+| **Microphone and camera** | Switches in Preferences → Privacy, the main menu and Ctrl+K turn them off for WhatsApp, the way a browser blocks a site; turned off during a call, that device stops at once. If your desktop has blocked the camera, Natter Den says so and can have your desktop ask again (in the Flatpak, it shows where to allow it). |
 | **Multiple accounts** | Each with its own session. Ctrl+1, Ctrl+2… switch between them. |
 | **Stays out of the way** | Closing the window keeps Natter Den in the tray. It can start hidden at login. The tray menu keeps to the essentials: show or hide, privacy blur, pause notifications, lock and quit. |
 | **Lighter** | A third to nearly half less memory than ZapZap and Whatsie with the same account ([measured](#natter-den-and-zapzap-side-by-side)). |
@@ -48,6 +49,16 @@ gives the page those data channels, done by GStreamer, so calls run in the same 
 as everything else, with no second browser behind it. That needs GStreamer's WebRTC plugins
 (see [Install](#from-a-checkout)); without them, calls open in your browser. Calls are new:
 voice calls work, and video calls are still being finished.
+
+The camera is found even when the desktop is slow to answer. WebKitGTK 2.52 asks the desktop's
+camera portal for it and gives the portal 10 ms; on a busy computer the answer came late and
+WhatsApp said "Camera not found". Natter Den lets WebKit find the camera itself then, with udev's
+notes on each device (read-only in WebKit's sandbox), and as that way doesn't ask the desktop,
+Natter Den keeps the desktop's answer for the camera itself: its "no", its camera switch for all
+apps, and, with nothing stored yet, it has the desktop ask before WhatsApp gets the camera. (In
+the Flatpak it's the portal's answer, as before.) One known WebKit bug remains: with GStreamer
+1.28 or newer, the camera's picture can freeze on its first frame
+([WebKit bug 324582](https://bugs.webkit.org/show_bug.cgi?id=324582)). A fix is coming.
 
 ## On your desktop
 
@@ -359,8 +370,24 @@ Most of Natter Den's memory is WhatsApp's own page.
   open), not a trip to swap. A fresh page is also the one thing that empties swap. Natter Den
   checks the moment its window hides, and again whenever it runs after being paused, since
   desktops such as Ada may freeze a hidden app within seconds. WebKit itself ends a page past
-  2.5 times the limit (about 3.8 GB), and Natter Den starts a fresh one. The unit has a 6 GB
-  `MemoryHigh` as a last backstop. Each of these decisions is logged with the memory it saw.
+  2.5 times the limit (about 3.8 GB), and Natter Den starts a fresh one. Each of these decisions
+  is logged with the memory it saw.
+- **A guard for a page that grows without end**: WebKit's limit only counts what's resident, and
+  only looks when the page's own main thread lets it, so a page busy growing gets past it (on
+  20 October 2026 a video being attached took one to 12 GB). Natter Den looks at each page itself
+  every 2 s, from a thread of its own, with the window shown or hidden, swap included: a page
+  holding more than a quarter of the computer's memory (between 2.5 and 6 GB, never more than
+  half) and growing like a runaway (faster than 64 MB/s), or 1.5 GB more than that whatever it
+  does, is ended and reloaded, back on the chat that was open, with a toast if you're using the
+  window. (What a call leaves behind holds still, and waits for the fresh page.) Ended again
+  within ten minutes, it stays down until you press Try Again, and if you're not looking at the
+  window a notification says so. During a call, and for a minute after, the page may hold 1.5 GB
+  more before growth counts, and half a gigabyte more again whatever it does. The last backstop
+  is the kernel's: the unit Natter Den runs in has a `MemoryMax` (one page's limit, 1.5 GB for
+  each account and half a gigabyte for Natter Den, at most 60% of the computer's memory) and at
+  most 1.5 GB of swap. Where Natter Den makes the unit itself it's `OOMPolicy=continue`, so the
+  kernel ending a page there leaves Natter Den running. The log says what each page held, and
+  the files handed to WhatsApp by number, size and type, never by name.
 - **Closing when asked**: a desktop closing apps to make room (a close request to a hidden
   window, or SIGTERM) gets a real quit, not a trip to the tray.
 - **No spare processes**: process swapping and the back/forward cache are off (one site, no

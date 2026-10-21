@@ -8,7 +8,8 @@ The microphone has no desktop permission: WebKit records through PulseAudio, whi
 so its switch is NAME's say alone. The camera has one, kept by the camera portal; but natively
 WebKit can also find the camera without the portal (app.py lets it read udev's notes, for when
 the portal answers too late), and that way skips the desktop's answer. So NAME keeps the
-desktop's "no" itself (media_allowed), as the portal would have.
+desktop's answer itself (media_allowed), as the portal would have: its "no" and its lockdown,
+none while it can't be read, and with nothing stored, a question of NAME's own (ask_camera_again).
 """
 
 from __future__ import annotations
@@ -45,18 +46,28 @@ UNKNOWN = ("org.freedesktop.DBus.Error.UnknownMethod", "org.freedesktop.DBus.Err
            "org.freedesktop.DBus.Error.UnknownObject")
 # What the bus answers when there's nobody by that name to ask.
 NO_SERVICE = ("org.freedesktop.DBus.Error.ServiceUnknown", "org.freedesktop.DBus.Error.NameHasNoOwner")
+# Seconds before the store is read again after it couldn't be (the last again and again), while
+# its answer isn't known: till then WhatsApp has no camera, as a "no" may be stored.
+STORE_RETRY = (2, 5, 15, 30)
+# Seconds NAME waits for the desktop to answer a question of its own (a dialog nobody answers,
+# behind the window): then it takes it as no answer. A late answer still counts, from the store.
+ASK_LIMIT = 120
 
 
 # ---- What WhatsApp may use (pure) -----------------------------------------------------------
 
 def refusal(kind: str, on: bool, desktop: Optional[str]) -> Optional[str]:
     """Why WhatsApp can't have `kind` now: "off" when NAME's switch is off, "desktop" when the
-    desktop has said no to NAME's camera; None when it can. `desktop` is the answer NAME keeps
-    itself (App.camera_gate): None where the portal keeps it (Flatpak) or there's none."""
+    desktop has said no to NAME's camera (or has cameras off for every app), "waiting" while its
+    answer can't be read yet; None when it can. `desktop` is the answer NAME keeps itself
+    (App.camera_gate): None where the portal keeps it (Flatpak) or there's none, "ask" when
+    nothing is stored (WhatsApp's request then waits for NAME to ask, Account._on_media_request)."""
     if not on:
         return "off"
     if kind == "camera" and desktop == "no":
         return "desktop"
+    if kind == "camera" and desktop == "waiting":
+        return "waiting"
     return None
 
 
@@ -83,9 +94,10 @@ def device_subtitle(kind: str, on: bool, desktop: Optional[str], present: Option
                     sandboxed: bool, restart: bool = False) -> str:
     """The line under the microphone's or camera's switch: the switch is NAME's choice, the line
     what the desktop or the hardware makes of it. Off wins over everything else. `desktop` is
-    the desktop's answer for the camera ("yes", "no", "ask", or None when it can't be read: in
-    the Flatpak, until it's known); `present` None when it isn't known; `restart` when the camera
-    can't work again until NAME restarts (App._on_anchor_gone)."""
+    the desktop's answer for the camera ("yes", "no", "ask", "waiting" while it can't be read
+    natively, or None when it can't be read at all: in the Flatpak, until it's known); `present`
+    None when it isn't known; `restart` when the camera can't work again until NAME restarts
+    (App._on_anchor_gone)."""
     if not on:
         return "WhatsApp can't use it"
     if restart:
@@ -96,6 +108,8 @@ def device_subtitle(kind: str, on: bool, desktop: Optional[str], present: Option
         return "Your desktop has the camera turned off for all apps"
     if desktop == "no":
         return "Blocked by your desktop's privacy settings"
+    if desktop == "waiting":
+        return "Waiting for your desktop's privacy settings"
     if present is False:
         return "No camera found"
     if desktop == "ask" or (sandboxed and desktop != "yes"):
@@ -106,10 +120,15 @@ def device_subtitle(kind: str, on: bool, desktop: Optional[str], present: Option
 
 
 def stored_answer(permissions: dict, app_id: str = APP_ID) -> str:
-    """NAME's answer in the store's camera entry ({app id: [answer]}): "yes", "no", or "ask",
-    which is also what nothing stored means (the desktop asks then)."""
+    """NAME's answer in the store's camera entry ({app id: [answer]}): "yes", "no", or "ask" for
+    nothing stored (the desktop asks then, and stores what's answered). A stored "ask" is a no:
+    the desktop asks every time, but its portal hands the camera over only for "yes", so only
+    NAME's own way to it (udev) would ever open it, whatever was answered. Ask Again… puts a
+    real answer in its place."""
     found = permissions.get(app_id) or []
     answer = found[0] if found else ""
+    if answer == "ask":
+        return "no"
     return answer if answer in ANSWERS else "ask"
 
 
@@ -179,15 +198,20 @@ def camera_answer(bus: Optional[Gio.DBusConnection], sandboxed: Optional[bool] =
 
 class DesktopMedia:
     """What the desktop says about the camera, kept up to date: its stored answer for NAME
-    (natively; in the Flatpak only whether it's yes), whether there's a camera, and whether the
-    desktop has cameras off for every app (lockdown). `on_change()` runs on the main loop when
-    any of them changes. Only reads: it never writes the store, and never opens the camera."""
+    (natively; in the Flatpak only whether it's yes), whether that's known yet, whether there's
+    a camera, and whether the desktop has cameras off for every app (lockdown). `on_change()`
+    runs on the main loop when any of them changes. Only reads: it never writes the store, and
+    never opens the camera."""
 
     def __init__(self, on_change: Callable[[], None], bus: Optional[Gio.DBusConnection] = None,
                  sandboxed: Optional[bool] = None) -> None:
         self.on_change = on_change
         self.sandboxed = in_sandbox() if sandboxed is None else sandboxed
         self.answer: Optional[str] = None
+        # Natively, whether the store has answered: the answer, nothing stored, or no store at
+        # all. Until then a "no" may be stored. Retried (STORE_RETRY) until it answers.
+        self.known = False
+        self._retries, self._retry_timer = 0, 0
         self.lockdown = False
         self._portal_present: Optional[bool] = None
         self._lockdowns: dict[str, bool] = {}  # by backend: the portal uses one, which isn't said
@@ -201,6 +225,7 @@ class DesktopMedia:
                 bus = None
         self.bus = bus
         if bus is None:
+            self.known = True  # no session bus: no desktop permission to keep
             return
         if not self.sandboxed:
             self._subscribe(STORE, STORE, "Changed", STORE_PATH, TABLE, self._on_store_changed)
@@ -227,6 +252,9 @@ class DesktopMedia:
 
     def close(self) -> None:
         self._closed = True
+        if self._retry_timer:
+            GLib.source_remove(self._retry_timer)
+            self._retry_timer = 0
         if self.bus is not None:
             for subscription in self._subscriptions:
                 self.bus.signal_unsubscribe(subscription)
@@ -265,24 +293,46 @@ class DesktopMedia:
         if self.sandboxed:
             self._probe()
             return
+        self._look_up()
+        self._ask_backends()
+
+    def _look_up(self) -> None:
         self._call(STORE, STORE_PATH, STORE, "Lookup", GLib.Variant("(ss)", (TABLE, ENTRY)), "(a{sas}v)",
                    self._looked_up)
-        self._ask_backends()
 
     def _looked_up(self, value: Optional[GLib.Variant], error: Optional[GLib.Error]) -> None:
         if value is not None:
-            self._set(answer=stored_answer(value.unpack()[0]))
+            self._set(answer=stored_answer(value.unpack()[0]), known=True)
         elif error is not None and remote_error(error) == NOT_FOUND:
-            self._set(answer="ask")  # the desktop has never been asked
+            self._set(answer="ask", known=True)  # the desktop has never been asked
         elif error is not None and remote_error(error) in NO_SERVICE:
-            self._set(answer=None)  # no store at all: no desktop permission to keep
-        # Anything else (a store too busy to answer in time) keeps the answer known so far: a
-        # "no" mustn't lapse because the computer was slow.
+            self._set(answer=None, known=True)  # no store at all: no desktop permission to keep
+        elif not self.known:
+            # Not yet read (a store too busy to answer in time, or one that failed to start): a
+            # "no" may be stored, so the camera waits (App.camera_gate) and the store is asked again.
+            self._retry()
+        # Anything else keeps the answer known so far: a "no" mustn't lapse because the computer
+        # was slow.
+
+    def _retry(self) -> None:
+        if self._retry_timer or self._closed:
+            return
+        delay = STORE_RETRY[min(self._retries, len(STORE_RETRY) - 1)]
+        self._retries += 1
+        if self._retries <= len(STORE_RETRY):  # then the same again and again: said once
+            print(f"natter: the desktop's permission store didn't answer; asking again in {delay} s", flush=True)
+        self._retry_timer = GLib.timeout_add_seconds(delay, self._retried)
+
+    def _retried(self) -> bool:
+        self._retry_timer = 0
+        if not self.known and not self._closed:
+            self._look_up()
+        return False  # GLib.SOURCE_REMOVE
 
     def _on_store_changed(self, params: GLib.Variant) -> None:
         _table, entry, deleted, _data, permissions = params.unpack()
         if entry == ENTRY:
-            self._set(answer="ask" if deleted else stored_answer(permissions))
+            self._set(answer="ask" if deleted else stored_answer(permissions), known=True)
 
     def _ask_backends(self) -> None:
         self._call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ListNames", None, "(as)",
@@ -360,36 +410,56 @@ def private_bus() -> Optional[Gio.DBusConnection]:
 
 
 def ask_camera_again(bus: Gio.DBusConnection, done: Callable[[Optional[str]], None],
-                     sandboxed: Optional[bool] = None) -> None:
-    """Have the desktop ask whether NAME may use the camera, after the user said yes to that in
-    NAME (Preferences → Ask Again…). `done(answer)` runs once, on the main loop: "yes", "no", or
-    None when the desktop couldn't be asked.
+                     sandboxed: Optional[bool] = None, forget: bool = True,
+                     later: Optional[Callable[[int, Callable[[], bool]], int]] = None) -> None:
+    """Have the desktop ask whether NAME may use the camera: after the user said yes to that in
+    NAME (Preferences → Ask Again…), or, without `forget`, for WhatsApp's request when nothing
+    is stored and WebKit didn't ask (Account._on_media_request). `done(answer)` runs once, on the
+    main loop: "yes", "no", or None when the desktop couldn't be asked, or didn't answer within
+    ASK_LIMIT (`later` is GLib.timeout_add_seconds), or its portal stopped before it answered.
 
-    Natively a stored "no" is never asked again, so NAME first forgets its own answer, and only
-    its own (DeletePermission for APP_ID: never another app's row, and never Set or
-    SetPermission, as the desktop's own dialog makes the decision). Then NAME asks straight away
-    itself, rather than leaving it to WebKit: with nothing stored, WebKitGTK 2.52 sends a request
-    of its own at every device listing in WhatsApp's page, and its dialogs stack while the page
-    waits on them. The portal stores the answer under APP_ID, the id WebKit's sandboxes carry.
+    Natively a stored "no" is never asked again, so to ask again NAME first forgets its own
+    answer, and only its own (DeletePermission for APP_ID: never another app's row, and never Set
+    or SetPermission, as the desktop's own dialog makes the decision). Then NAME asks straight
+    away itself, rather than leaving it to WebKit: with nothing stored, WebKitGTK 2.52 sends a
+    request of its own at every device listing in WhatsApp's page, and its dialogs stack while
+    the page waits on them. The portal stores the answer under APP_ID, the id WebKit's
+    sandboxes carry.
 
     In the Flatpak the store can be neither read nor changed from inside: only AccessCamera,
     which asks when nothing is stored and otherwise answers at once.
 
     `bus` should be a private connection (private_bus): Register has to be its first call."""
     sandboxed = in_sandbox() if sandboxed is None else sandboxed
+    later = later or GLib.timeout_add_seconds
     token = "natter_" + uuid.uuid4().hex
     sender = (bus.get_unique_name() or ":").lstrip(":").replace(".", "_")
     expected = f"{PORTAL_PATH}/request/{sender}/{token}"
-    state = {"subscription": 0, "done": False}
+    state = {"subscription": 0, "owner": 0, "timer": 0, "done": False}
 
     def finish(answer: Optional[str]) -> None:
         if state["done"]:
             return
         state["done"] = True
-        if state["subscription"]:
-            bus.signal_unsubscribe(state["subscription"])
-            state["subscription"] = 0
+        for key in ("subscription", "owner"):
+            if state[key]:
+                bus.signal_unsubscribe(state[key])
+                state[key] = 0
+        if state["timer"]:
+            GLib.source_remove(state["timer"])
+            state["timer"] = 0
         done(answer)
+
+    def too_long() -> bool:
+        state["timer"] = 0
+        print(f"natter: the desktop didn't answer about the camera in {ASK_LIMIT} s", flush=True)
+        finish(None)
+        return False  # GLib.SOURCE_REMOVE
+
+    def owner_changed(params: GLib.Variant) -> None:
+        if not params.unpack()[2]:  # gone: a portal that starts again knows nothing of the question
+            print("natter: the camera portal stopped before it answered", flush=True)
+            finish(None)
 
     def listen(request: str) -> None:
         if state["subscription"]:
@@ -397,6 +467,12 @@ def ask_camera_again(bus: Gio.DBusConnection, done: Callable[[Optional[str]], No
         state["subscription"] = bus.signal_subscribe(
             PORTAL, REQUEST, "Response", request, None, Gio.DBusSignalFlags.NONE,
             lambda _bus, _sender, _path, _iface, _signal, params: finish("yes" if params.unpack()[0] == 0 else "no"))
+        if not state["owner"]:
+            state["owner"] = bus.signal_subscribe(
+                "org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged", "/org/freedesktop/DBus", PORTAL,
+                Gio.DBusSignalFlags.NONE, lambda _bus, _sender, _path, _iface, _signal, params: owner_changed(params))
+        if not state["timer"]:
+            state["timer"] = later(ASK_LIMIT, too_long)
 
     def access() -> None:
         def called(source, result) -> None:
@@ -415,7 +491,7 @@ def ask_camera_again(bus: Gio.DBusConnection, done: Callable[[Optional[str]], No
                  GLib.Variant("(a{sv})", ({"handle_token": GLib.Variant("s", token)},)), GLib.VariantType("(o)"),
                  Gio.DBusCallFlags.NONE, -1, None, called)
 
-    def forget() -> None:
+    def forget_answer() -> None:
         def forgotten(source, result) -> None:
             try:
                 source.call_finish(result)
@@ -441,7 +517,10 @@ def ask_camera_again(bus: Gio.DBusConnection, done: Callable[[Optional[str]], No
                       f"({error.message})", flush=True)
                 finish(None)
                 return
-        forget()
+        if forget:
+            forget_answer()
+        else:
+            access()
 
     if sandboxed:
         access()

@@ -47,7 +47,7 @@ def account_status(account) -> str:
     if account.needs_link:
         return "Needs linking"
     if account.crashing:
-        return "Keeps stopping"
+        return "Used too much memory" if account.memory_stopped else "Keeps stopping"
     if account.failed:
         return "Can't reach WhatsApp"
     return "Linked" if account.ready else "Loading…"

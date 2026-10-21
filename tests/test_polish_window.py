@@ -204,6 +204,20 @@ class PureHelpersTest(unittest.TestCase):
         self.assertEqual(window.tab_look(True, False, 0), ("dialog-warning-symbolic", 0))
         self.assertEqual(window.tab_look(True, False, 2), ("dialog-warning-symbolic", 0))
         self.assertEqual(window.tab_look(False, True, 3), ("view-refresh-symbolic", 3))  # as before
+        # Stopped (Try Again): a warning, and no count, as WhatsApp isn't there to keep it.
+        self.assertEqual(window.tab_look(False, False, 4, stopped=True), ("dialog-warning-symbolic", 0))
+
+    def test_a_stopped_account_wants_attention(self):
+        accounts = [SimpleNamespace(id="a", needs_link=False, reloading=False, unread=0, crashing=False),
+                    SimpleNamespace(id="b", needs_link=False, reloading=False, unread=3, crashing=True)]
+        pages = {account.id: Fake() for account in accounts}
+        fake = Fake(app=SimpleNamespace(accounts=accounts), pages=pages)
+        fake._show_subtitle = fake._show_reloading = lambda: None
+        Window.show_status(fake, 3)
+        self.assertEqual(pages["a"].called("set_needs_attention"), [(False,)])
+        self.assertEqual(pages["b"].called("set_needs_attention"), [(True,)])
+        self.assertEqual(pages["b"].called("set_icon_name"), [("dialog-warning-symbolic",)])
+        self.assertEqual(pages["b"].called("set_badge_number"), [(0,)])
 
     def test_switcher_places(self):
         self.assertEqual(window.switcher_places(1, False), (False, False))
@@ -330,11 +344,46 @@ class BannerTest(unittest.TestCase):
         self.assertEqual(fake.banner.called("set_button_label")[-1], ("",))
 
 
+class ToastTest(unittest.TestCase):
+    """Toasts go where they can be seen: over Preferences while it's open."""
+
+    def adw(self):
+        class Toast(Fake):
+            def __init__(self, **values):
+                super().__init__(**values)
+
+        class PreferencesDialog(Fake):
+            pass
+
+        return SimpleNamespace(Toast=Toast, PreferencesDialog=PreferencesDialog)
+
+    def test_over_preferences(self):
+        adw = self.adw()
+        dialog = adw.PreferencesDialog()
+        fake = Fake(toasts=Fake(), get_visible_dialog=lambda: dialog)
+        with mock.patch.object(window, "Adw", adw):
+            Window.toast(fake, "Microphone turned off. WhatsApp can't hear you")
+        self.assertEqual(len(dialog.called("add_toast")), 1)
+        self.assertEqual(dialog.called("add_toast")[0][0].title, "Microphone turned off. WhatsApp can't hear you")
+        self.assertEqual(fake.toasts.called("add_toast"), [])
+
+    def test_in_the_window_otherwise(self):
+        adw = self.adw()
+        for dialog in (None, Fake()):  # no dialog, or one with no toasts of its own (an alert)
+            fake = Fake(toasts=Fake(), get_visible_dialog=lambda dialog=dialog: dialog)
+            with mock.patch.object(window, "Adw", adw):
+                Window.toast(fake, "Saved", "Open", "app.open-file", GLib.Variant("s", "/x"))
+            toast = fake.toasts.called("add_toast")[0][0]
+            self.assertEqual(toast.called("set_button_label"), [("Open",)])
+            if dialog is not None:
+                self.assertEqual(dialog.called("add_toast"), [])
+
+
 class NoticeTest(unittest.TestCase):
     ERROR = "Error resolving “web.whatsapp.com”: Temporary failure in name resolution"
 
-    def page(self, failed=None, crashing=False):
-        account = Fake(failed=failed, crashing=crashing)
+    def page(self, failed=None, crashing=False, memory_stopped=False):
+        account = Fake(failed=failed, crashing=crashing, memory_stopped=memory_stopped)
         page = Fake(account=account, notice=Fake(), detail=Fake(), software=Fake(),
                     settings={"hardware_acceleration": True})
         AccountPage._show_state(page)
@@ -353,6 +402,13 @@ class NoticeTest(unittest.TestCase):
         page = self.page(crashing=True)
         self.assertEqual(page.detail.called("set_visible")[-1], (False,))
         self.assertEqual(page.software.called("set_visible")[-1], (True,))
+
+    def test_stopped_for_memory_says_so_without_the_graphics_way_out(self):
+        page = self.page(crashing=True, memory_stopped=True)
+        self.assertEqual(page.notice.called("set_title")[-1], ("WhatsApp Used Too Much Memory",))
+        self.assertIn("twice in ten minutes", page.notice.called("set_description")[-1][0])
+        self.assertEqual(page.software.called("set_visible")[-1], (False,))  # drivers don't make a page grow
+        self.assertEqual(page.notice.called("set_visible")[-1], (True,))
 
     def test_back_online(self):
         page = self.page()

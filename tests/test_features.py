@@ -1,6 +1,7 @@
 """The app lock, do not disturb, group invite and channel links, tray submenus, and the
 call pieces that don't need a running WhatsApp (rtc.py's description handling)."""
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -352,6 +353,7 @@ class ReviewFixesTest(unittest.TestCase):
 
         fake._network_processes, fake._network_looks, fake._quitting = {101}, 0, False
         fake._last_look = time.monotonic()
+        fake._note_oom_kills = lambda events, now: None
         fake.accounts = [type("Account", (), {"network_lost": lambda _a: lost.append(1)})()]
         with mock.patch("natter.app.network_processes", return_value={202}):
             Natter._check_network_process(fake)
@@ -532,6 +534,28 @@ class RealtimeThreadsTest(unittest.TestCase):
         launcher = self.Launcher()
         self.system.give_system_bus(launcher)
         self.assertEqual(launcher.env, {})
+
+    def test_camera_fix_taken_off_apps_natter_starts(self):
+        """gstfix.apply()'s GStreamer settings are for WebKit only: not a browser, a media player
+        or the call window."""
+        from unittest import mock
+
+        from natter import gstfix
+
+        with tempfile.TemporaryDirectory() as home:
+            plugins = Path(home, ".local", "lib", "natter", "gstreamer-1.0")
+            plugins.mkdir(parents=True)
+            (plugins / gstfix.PLUGIN).write_bytes(b"")
+            environ = {"HOME": home, "XDG_CACHE_HOME": str(Path(home, "cache")), "GST_TRACERS": "leaks",
+                       "NATTER_CAMFIX": "1"}
+            self.addCleanup(setattr, gstfix, "STATUS", gstfix.STATUS)
+            fix = gstfix.apply(environ, flatpak_info=str(Path(home, "none")), dirs=[plugins], version=(1, 28, 2))
+            self.assertTrue(fix.on, fix.reason)
+            with mock.patch.dict(os.environ, environ, clear=True):
+                launcher = self.Launcher()
+                self.system.give_system_bus(launcher)  # nothing hidden: still cleaned
+                self.assertEqual(launcher.env, {"GST_PLUGIN_PATH": None, "GST_TRACERS": "leaks", "GST_REGISTRY": None})
+                self.assertTrue(gstfix.cleaned())  # so open_uri() starts apps itself, cleaned
 
     def test_network_processes_are_children_by_name(self):
         with tempfile.TemporaryDirectory() as folder:

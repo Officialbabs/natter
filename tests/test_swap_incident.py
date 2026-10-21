@@ -219,9 +219,12 @@ class HideAndThawTest(unittest.TestCase):
         fake = type("App", (), {})()
         fake._network_processes, fake._network_looks, fake._quitting = set(), 0, False
         fake._last_look = time.monotonic() - THAW_GAP - 5
-        fake._thawed = lambda paused: thawed.append(paused)
+        fake._memory_events = {}
+        fake._note_oom_kills = lambda events, now: None
+        fake._thawed = lambda stalled, before, after: thawed.append(stalled)
         fake.accounts = []
-        with mock.patch("natter.app.network_processes", return_value=set()):
+        with mock.patch("natter.app.network_processes", return_value=set()), \
+                mock.patch("natter.app.memory_events", return_value={}):
             Natter._check_network_process(fake)
             Natter._check_network_process(fake)  # right after: no gap
         self.assertEqual(len(thawed), 1)

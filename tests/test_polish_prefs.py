@@ -30,8 +30,9 @@ def calls(name: str) -> list[ast.Call]:
 
 
 class Account:
-    def __init__(self, ready=False, needs_link=False, failed=None, crashing=False):
+    def __init__(self, ready=False, needs_link=False, failed=None, crashing=False, memory_stopped=False):
         self.ready, self.needs_link, self.failed, self.crashing = ready, needs_link, failed, crashing
+        self.memory_stopped = memory_stopped
 
 
 class FolderTest(unittest.TestCase):
@@ -56,6 +57,7 @@ class AccountStatusTest(unittest.TestCase):
         self.assertEqual(account_status(Account()), "Loading…")
         self.assertEqual(account_status(Account(failed="Error resolving the name")), "Can't reach WhatsApp")
         self.assertEqual(account_status(Account(crashing=True)), "Keeps stopping")
+        self.assertEqual(account_status(Account(crashing=True, memory_stopped=True)), "Used too much memory")
 
     def test_needing_a_link_comes_first(self):
         # A page that crashed on the link screen still needs the phone first.

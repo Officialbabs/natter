@@ -3,7 +3,9 @@ the desktop's answer and asking it again, WhatsApp's page following the switches
 the app's side (app.py), the call window (calls.py, callwindow.py), and udev in WebKit's sandbox."""
 
 import ast
+import contextlib
 import inspect
+import io
 import os
 import tempfile
 import textwrap
@@ -76,6 +78,12 @@ class AllowedTest(unittest.TestCase):
         self.assertEqual(refusals(False, False, "no", True, True), [("microphone", "off"), ("camera", "off")])
         self.assertEqual(refusals(True, True, None, True, True), [])
 
+    def test_while_the_desktops_answer_cant_be_read_the_camera_waits(self):
+        # A "no" may be stored: natively nothing else keeps it (udev, Chromium).
+        self.assertEqual(refusals(True, True, "waiting", True, True), [("camera", "waiting")])
+        self.assertTrue(media_allowed(True, True, "waiting", True, False))
+        self.assertEqual(refusals(True, False, "waiting", False, True), [("camera", "off")])  # off says more
+
 
 class SubtitleTest(unittest.TestCase):
     def line(self, kind, on=True, desktop="yes", present=True, lockdown=False, sandboxed=False, **more):
@@ -95,6 +103,7 @@ class SubtitleTest(unittest.TestCase):
         self.assertEqual(self.line("camera", lockdown=True), "Your desktop has the camera turned off for all apps")
         self.assertEqual(self.line("camera", present=False), "No camera found")
         self.assertEqual(self.line("camera", desktop=None, present=None), "WhatsApp can use it for video calls")
+        self.assertEqual(self.line("camera", desktop="waiting"), "Waiting for your desktop's privacy settings")
 
     def test_off_wins_over_every_desktop_state(self):
         for desktop in ("yes", "no", "ask", None):
@@ -123,7 +132,8 @@ class SubtitleTest(unittest.TestCase):
 
     def test_wording(self):
         lines = {self.line(kind, on, desktop, present, lockdown, sandboxed, restart=restart)
-                 for kind in ("microphone", "camera") for on in (True, False) for desktop in ("yes", "no", "ask", None)
+                 for kind in ("microphone", "camera") for on in (True, False)
+                 for desktop in ("yes", "no", "ask", "waiting", None)
                  for present in (True, False, None) for lockdown in (True, False) for sandboxed in (True, False)
                  for restart in (True, False)}
         for line in lines:
@@ -250,7 +260,8 @@ class AnswerTest(unittest.TestCase):
     def test_stored_answers(self):
         self.assertEqual(stored_answer({APP_ID: ["yes"]}), "yes")
         self.assertEqual(stored_answer({APP_ID: ["no"], "other.App": ["yes"]}), "no")
-        self.assertEqual(stored_answer({APP_ID: ["ask"]}), "ask")
+        # Asked every time, but the portal hands the camera over only for yes: to Natter a no.
+        self.assertEqual(stored_answer({APP_ID: ["ask"]}), "no")
         self.assertEqual(stored_answer({"other.App": ["no"]}), "ask")  # nothing for Natter: the desktop asks
         self.assertEqual(stored_answer({APP_ID: []}), "ask")
         self.assertEqual(stored_answer({APP_ID: ["maybe"]}), "ask")
@@ -300,13 +311,52 @@ class DesktopMediaTest(unittest.TestCase):
 
     def test_a_slow_store_keeps_a_no(self):
         bus, desktop, _changes = self.watch(Lookup=lookup({APP_ID: ["no"]}))
-        self.assertEqual(desktop.answer, "no")
+        self.assertEqual((desktop.answer, desktop.known), ("no", True))
         bus.replies["Lookup"] = dbus_error("org.freedesktop.DBus.Error.NoReply", "Timeout was reached")
         desktop.refresh()
-        self.assertEqual(desktop.answer, "no")
+        self.assertEqual((desktop.answer, desktop.known), ("no", True))
+        self.assertEqual(desktop._retry_timer, 0)  # known already: nothing to wait for
         bus.replies["Lookup"] = dbus_error("org.freedesktop.DBus.Error.ServiceUnknown")
         desktop.refresh()
         self.assertIsNone(desktop.answer)  # no store at all
+        self.assertTrue(desktop.known)
+
+    def test_a_store_that_doesnt_answer_at_first_is_asked_again(self):
+        # Started at login on a busy computer: the first Lookup times out. The answer isn't known
+        # (App.camera_gate: "waiting"), and the store is read again until it answers.
+        timers = []
+        timeout = GLib.Error.new_literal(Gio.io_error_quark(), "Timeout was reached", Gio.IOErrorEnum.TIMED_OUT)
+        with mock.patch.object(media.GLib, "timeout_add_seconds", lambda delay, run: timers.append((delay, run)) or 7), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            bus, desktop, changes = self.watch(Lookup=timeout)
+            self.assertEqual((desktop.answer, desktop.known), (None, False))
+            self.assertEqual([delay for delay, _run in timers], [2])
+            self.assertIn("didn't answer; asking again in 2 s", out.getvalue())
+            timers.pop()[1]()  # it fails again: a while longer
+            self.assertEqual([delay for delay, _run in timers], [5])
+            bus.replies["Lookup"] = lookup({APP_ID: ["no"]})
+            count = len(changes)
+            timers.pop()[1]()
+        self.assertEqual((desktop.answer, desktop.known), ("no", True))
+        self.assertGreater(len(changes), count)
+        self.assertEqual(timers, [])
+        self.assertEqual(bus.methods().count("Lookup"), 3)
+
+    def test_a_retry_goes_with_closing(self):
+        removed = []
+        timeout = dbus_error("org.freedesktop.DBus.Error.NoReply", "Timeout was reached")
+        with mock.patch.object(media.GLib, "timeout_add_seconds", lambda delay, run: 9), \
+                mock.patch.object(media.GLib, "source_remove", removed.append), \
+                contextlib.redirect_stdout(io.StringIO()):
+            _bus, desktop, _changes = self.watch(Lookup=timeout)
+            desktop.close()
+        self.assertEqual(removed, [9])
+
+    def test_nothing_stored_and_no_bus_are_known(self):
+        _bus, desktop, _changes = self.watch(Lookup=dbus_error(media.NOT_FOUND))
+        self.assertEqual((desktop.answer, desktop.known), ("ask", True))
+        with mock.patch.object(media.Gio, "bus_get_sync", side_effect=GLib.Error("no session bus")):
+            self.assertTrue(DesktopMedia(lambda: None, None, sandboxed=False).known)  # nothing to keep
 
     def test_camera_present(self):
         bus, desktop, _changes = self.watch(Get=GLib.Variant("(v)", (GLib.Variant("b", False),)))
@@ -370,14 +420,22 @@ class DesktopMediaTest(unittest.TestCase):
 
 
 class AskAgainTest(unittest.TestCase):
-    def ask(self, sandboxed=False, response=0, **replies):
+    def setUp(self):
+        self.timers, self.removed = [], []
+        patch = mock.patch.object(media.GLib, "source_remove", self.removed.append)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def ask(self, sandboxed=False, response=0, forget=True, **replies):
         defaults = {"Register": GLib.Variant("()", ()), "DeletePermission": GLib.Variant("()", ()),
                     "AccessCamera": lambda dest: GLib.Variant("(o)", (self.request(bus),))}
         bus = FakeBus({**defaults, **replies})
         answers = []
-        ask_camera_again(bus, answers.append, sandboxed=sandboxed)
-        if bus.subscriptions and response is not None:
-            bus.emit("Response", GLib.Variant("(ua{sv})", (response, {})))
+        later = lambda delay, run: self.timers.append((delay, run)) or len(self.timers)
+        with contextlib.redirect_stdout(io.StringIO()):
+            ask_camera_again(bus, answers.append, sandboxed=sandboxed, forget=forget, later=later)
+            if bus.subscriptions and response is not None:
+                bus.emit("Response", GLib.Variant("(ua{sv})", (response, {})))
         return bus, answers
 
     @staticmethod
@@ -432,6 +490,36 @@ class AskAgainTest(unittest.TestCase):
         bus, answers = self.ask()
         bus.emit("Response", GLib.Variant("(ua{sv})", (1, {})))
         self.assertEqual(answers, ["yes"])
+        self.assertEqual(self.removed, [1])  # its time limit went with the answer
+
+    def test_for_a_request_nothing_is_forgotten(self):
+        bus, answers = self.ask(forget=False)
+        self.assertEqual(bus.methods(), ["Register", "AccessCamera"])
+        self.assertEqual(answers, ["yes"])
+
+    def test_an_answer_that_never_comes(self):
+        # A dialog nobody answers (behind the window): Natter stops waiting, and asks again later.
+        bus, answers = self.ask(response=None)
+        self.assertEqual(answers, [])
+        (delay, run), = self.timers
+        self.assertEqual(delay, media.ASK_LIMIT)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(run())
+        self.assertEqual(answers, [None])
+        self.assertEqual(bus.subscriptions, {})
+        self.assertEqual(self.removed, [])  # it was the timer that ran
+
+    def test_a_portal_that_stops_before_it_answers(self):
+        # A portal that starts again knows nothing of the question: no Response would ever come.
+        bus, answers = self.ask(response=None)
+        owner = GLib.Variant("(sss)", (media.PORTAL, "", ":1.99"))
+        bus.emit("NameOwnerChanged", owner, arg0=media.PORTAL)  # started: nothing to do with it
+        self.assertEqual(answers, [])
+        with contextlib.redirect_stdout(io.StringIO()):
+            bus.emit("NameOwnerChanged", GLib.Variant("(sss)", (media.PORTAL, ":1.99", "")), arg0=media.PORTAL)
+        self.assertEqual(answers, [None])
+        self.assertEqual(bus.subscriptions, {})
+        self.assertEqual(self.removed, [1])
 
 
 def calls_in(tree) -> list[tuple[str, ast.Call]]:
@@ -482,9 +570,10 @@ class StoreWritesTest(unittest.TestCase):
     def test_nothing_new_touches_the_page(self):
         # Ban safety: the switches act as a browser would, never through WhatsApp's page.
         for function in (Account._on_permission, Account._on_media_request, Account._on_permission_query,
+                         Account._asked_desktop, Account._answer_media, Account._grant_lives,
                          Account.stop_media, Account.media_allowed_again, Account._on_capture_state,
                          Account.lose_media, Account._end_capture, Natter._apply_media, Natter._on_desktop_media,
-                         Natter.ask_camera_again, Natter._on_anchor_gone, Natter.media_state):
+                         Natter.ask_camera, Natter.ask_camera_again, Natter._on_anchor_gone, Natter.media_state):
             source = inspect.getsource(function)
             for banned in (".run(", "evaluate_javascript", "call_async_javascript_function", "dispatchEvent",
                            "devices_changed"):
@@ -557,9 +646,16 @@ class View:
 class Page:
     """An Account as the switches see it: Account's own code, on stand-in parts."""
 
-    def __init__(self, settings, gate=None, trusted=True, calling=False):
-        self.app = SimpleNamespace(settings=settings, camera_gate=lambda: gate)
+    def __init__(self, settings, gate=None, trusted=True, calling=False, fallback=False):
+        self.questions = []
+        self.app = SimpleNamespace(settings=settings, camera_gate=lambda: self.gate, camera_fallback=fallback,
+                                   ask_camera=self.questions.append,
+                                   desktop_media=SimpleNamespace(refreshed=0))
+        self.app.desktop_media.refresh = lambda: setattr(self.app.desktop_media, "refreshed",
+                                                         self.app.desktop_media.refreshed + 1)
+        self.gate = gate
         self.view, self.calling, self.removed, self.trusted = View(), calling, False, trusted
+        self.crashing = False
         self.emitted, self.fresh, self.reloads = [], 0, 0
         self.home, self._reload_timer, self.reloading = "https://web.whatsapp.com/", 0, False
         self.ready = self.needs_link = False
@@ -568,7 +664,7 @@ class Page:
         self._ended_at = dict.fromkeys(media.KINDS)
         self.refused_since_load = dict.fromkeys(media.KINDS, False)
         self._backstop = dict.fromkeys(media.KINDS, True)
-        self._lose_media_after_call = False
+        self._fresh_after_call, self._held_media = set(), []
 
     def __getattr__(self, name):
         return types.MethodType(getattr(Account, name), self)
@@ -610,8 +706,8 @@ class PageTest(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def page(self, gate=None, trusted=True, calling=False, **values):
-        return Page(settings(self, **values), gate, trusted, calling)
+    def page(self, gate=None, trusted=True, calling=False, fallback=False, **values):
+        return Page(settings(self, **values), gate, trusted, calling, fallback)
 
     def ask(self, page, request):
         self.assertTrue(page._on_permission(None, request))
@@ -671,6 +767,73 @@ class PermissionTest(PageTest):
         self.assertEqual(page.refused_since_load, {"microphone": False, "camera": False})
         self.assertEqual(page.view.loaded, [page.home])
 
+    def test_while_the_desktops_answer_cant_be_read(self):
+        page = self.page("waiting")
+        self.assertEqual(self.ask(page, MediaRequest(True, True)), "deny")
+        self.assertEqual(page.emitted, [("media-refused", "camera", "waiting")])
+        self.assertEqual(page.app.desktop_media.refreshed, 1)  # read now, not at its next try
+        self.assertEqual(self.ask(page, MediaRequest(True, False)), "allow")
+
+    def test_the_desktops_lockdown_and_a_stored_ask_refuse(self):
+        # App.camera_gate gives "no" for both: the portal would never hand the camera over.
+        self.assertEqual(self.ask(self.page("no"), MediaRequest(False, True)), "deny")
+
+    def test_nothing_stored_waits_for_natters_own_question(self):
+        # WebKit found the camera itself (udev): the desktop wasn't asked, so Natter asks.
+        page = self.page("ask", fallback=True)
+        request = MediaRequest(True, True)
+        self.assertTrue(page._on_permission(None, request))
+        self.assertIsNone(request.answer)
+        self.assertEqual(len(page.questions), 1)
+        page.gate = "yes"  # the store says so too
+        page.questions[0]("yes")
+        self.assertEqual(request.answer, "allow")
+        self.assertIsNotNone(page._allowed_at["camera"])
+        self.assertEqual(page._held_media, [])
+
+    def test_a_yes_before_the_store_says_so(self):
+        page = self.page("ask", fallback=True)
+        request = MediaRequest(False, True)
+        page._on_permission(None, request)
+        page.questions[0]("yes")  # the store's Changed still on its way
+        self.assertEqual(request.answer, "allow")
+
+    def test_anything_but_a_yes_refuses_the_camera(self):
+        for answer in ("no", None):
+            page = self.page("ask", fallback=True)
+            request = MediaRequest(True, True)
+            page._on_permission(None, request)
+            page.questions[0](answer)
+            self.assertEqual(request.answer, "deny", answer)
+            self.assertEqual(page.emitted, [("media-refused", "camera", "desktop")])
+
+    def test_switched_off_while_the_desktop_asked(self):
+        page = self.page("ask", fallback=True)
+        request = MediaRequest(False, True)
+        page._on_permission(None, request)
+        page.app.settings["camera"] = False
+        page.questions[0]("yes")
+        self.assertEqual(request.answer, "deny")
+        self.assertEqual(page.emitted, [("media-refused", "camera", "off")])
+
+    def test_a_page_loaded_since_drops_its_requests(self):
+        page = self.page("ask", fallback=True)
+        request = MediaRequest(False, True)
+        page._on_permission(None, request)
+        page._end_link = lambda: None
+        page._set_reloading = lambda reloading: None
+        page._load(page.home)
+        page.questions[0]("yes")
+        self.assertIsNone(request.answer)  # WebKit let go of it with the old page
+
+    def test_without_webkits_own_way_the_portal_asks(self):
+        # Only the portal hands WebKit a camera then, and asks when nothing's stored.
+        self.assertEqual(self.ask(self.page("ask"), MediaRequest(False, True)), "allow")
+        page = self.page("ask", fallback=True)
+        self.assertEqual(self.ask(page, MediaRequest(True, False)), "allow")  # the microphone: nobody to ask
+        self.assertEqual(page.questions, [])
+        self.assertEqual(self.ask(self.page("ask", fallback=True, camera=False), MediaRequest(False, True)), "deny")
+
     def test_device_names_while_either_is_on(self):
         self.assertEqual(self.ask(self.page(microphone=False), DeviceInfoRequest()), "allow")
         self.assertEqual(self.ask(self.page(camera=False), DeviceInfoRequest()), "allow")
@@ -696,6 +859,15 @@ class QueryTest(PageTest):
         page.app.settings["microphone"] = False
         self.assertEqual(self.query(page, "camera"), (True, ["granted"]))
         self.assertEqual(self.query(page, "microphone"), (True, ["denied"]))
+
+    def test_a_camera_the_desktop_keeps_from_natter(self):
+        # Listed even so (udev): "denied" hides its name and id, as for a switch turned off.
+        for gate in ("no", "waiting"):
+            page = self.page(gate)
+            self.assertEqual(self.query(page, "camera"), (True, ["denied"]), gate)
+            self.assertEqual(self.query(page, "microphone"), (True, ["granted"]), gate)
+        for gate in ("yes", "ask", None):
+            self.assertEqual(self.query(self.page(gate), "camera"), (True, ["granted"]), gate)
 
     def test_notifications_unchanged(self):
         page = self.page(microphone=False, camera=False)
@@ -738,11 +910,61 @@ class OffTest(PageTest):
         self.ask(page, MediaRequest(False, True))
         page.app.settings["camera"] = False
         page.stop_media("camera")
-        self.assertEqual(page.fresh, 0)  # the backstop sees to it instead
+        self.assertEqual(page.fresh, 0)  # the backstop sees to it meanwhile
+
+    def test_once_the_call_is_over(self):
+        # Off during a voice call, with a grant from a video call before it: WebKit would hand the
+        # camera out again without asking once the call is over, so the page loads afresh then.
+        page = self.page(calling=True)
+        self.ask(page, MediaRequest(False, True))
+        page.app.settings["camera"] = False
+        page.stop_media("camera")
+        page.calling = False
+        with mock.patch.object(natter_account, "_features", lambda *args, **kwargs: None):
+            page._on_page_call(False)
+        self.assertEqual(page.fresh, 1)
+        self.assertEqual(page.emitted[-1], ("in-call", False))
+        with mock.patch.object(natter_account, "_features", lambda *args, **kwargs: None):
+            page._on_page_call(False)
+        self.assertEqual(page.fresh, 1)  # once
+
+    def test_on_again_before_the_call_is_over(self):
+        page = self.page(calling=True)
+        self.ask(page, MediaRequest(False, True))
+        page.app.settings["camera"] = False
+        page.stop_media("camera")
+        page.app.settings["camera"] = True
+        page.calling = False
+        with mock.patch.object(natter_account, "_features", lambda *args, **kwargs: None):
+            page._on_page_call(False)
+        self.assertEqual(page.fresh, 0)
+
+    def test_webkits_timer_waits_for_both_kinds(self):
+        # The microphone captured long after the camera's capture ended: WebKit's timer started
+        # only then, so the camera's grant still lives.
+        page = self.page()
+        with mock.patch.object(natter_account.time, "monotonic", return_value=100.0):
+            self.ask(page, MediaRequest(True, True))
+            page._on_capture_state(None, SimpleNamespace(name="camera-capture-state"))  # camera ended at 100
+        page.view.state["microphone"] = State.ACTIVE
+        page.app.settings["camera"] = False
+        with mock.patch.object(natter_account.time, "monotonic", return_value=100.0 + 2 * GRANT_REUSE):
+            page.stop_media("camera")
+        self.assertEqual(page.fresh, 1)
+        page.view.state["microphone"] = State.NONE
+        with mock.patch.object(natter_account.time, "monotonic", return_value=100.0 + 2 * GRANT_REUSE):
+            page._on_capture_state(None, SimpleNamespace(name="microphone-capture-state"))
+        with mock.patch.object(natter_account.time, "monotonic", return_value=100.0 + 3 * GRANT_REUSE - 1):
+            page.stop_media("camera")
+        self.assertEqual(page.fresh, 2)
+        with mock.patch.object(natter_account.time, "monotonic", return_value=100.0 + 3 * GRANT_REUSE + 1):
+            page.stop_media("camera")
+        self.assertEqual(page.fresh, 2)
 
     def test_webkit_forgets_after_a_while(self):
         page = self.page()
-        self.ask(page, MediaRequest(False, True))
+        with mock.patch.object(natter_account.time, "monotonic", return_value=900.0):
+            self.ask(page, MediaRequest(False, True))  # allowed, then captured until 1000
         page.app.settings["camera"] = False
         with mock.patch.object(natter_account.time, "monotonic", return_value=1000.0):
             page._on_capture_state(None, SimpleNamespace(name="camera-capture-state"))  # ended at 1000
@@ -750,6 +972,17 @@ class OffTest(PageTest):
             page.stop_media("camera")
         self.assertEqual(page.fresh, 1)
         with mock.patch.object(natter_account.time, "monotonic", return_value=1000.0 + GRANT_REUSE + 1):
+            page.stop_media("camera")
+        self.assertEqual(page.fresh, 1)
+
+    def test_a_grant_no_capture_has_ended_since_never_lapses(self):
+        page = self.page()
+        with mock.patch.object(natter_account.time, "monotonic", return_value=10.0):
+            page._on_capture_state(None, SimpleNamespace(name="camera-capture-state"))  # an older capture's end
+        with mock.patch.object(natter_account.time, "monotonic", return_value=5000.0):
+            self.ask(page, MediaRequest(False, True))  # allowed, and nothing captured since
+        page.app.settings["camera"] = False
+        with mock.patch.object(natter_account.time, "monotonic", return_value=5000.0 + 2 * GRANT_REUSE):
             page.stop_media("camera")
         self.assertEqual(page.fresh, 1)
 
@@ -819,18 +1052,12 @@ class OnTest(PageTest):
 
 
 class LoseMediaTest(PageTest):
-    def test_off_and_a_new_page(self):
-        page = self.page()
-        page.lose_media()
-        self.assertFalse(page.view.media_stream)
-        self.assertEqual(page.reloads, 1)
-
-    def test_after_the_call(self):
-        page = self.page(calling=True)
-        page.lose_media()
-        self.assertFalse(page.view.media_stream)
-        self.assertEqual(page.reloads, 0)
-        self.assertTrue(page._lose_media_after_call)
+    def test_off_for_pages_to_come_and_the_one_up_left_alone(self):
+        for calling in (False, True):
+            page = self.page(calling=calling)
+            page.lose_media()
+            self.assertFalse(page.view.media_stream)
+            self.assertEqual((page.reloads, page.fresh, page.view.loaded, page.view.set_to), (0, 0, [], []))
 
 
 # ---- The app's side (app.py) ---------------------------------------------------------------------
@@ -878,10 +1105,11 @@ class App:
         self.accounts, self.window = list(accounts), Window() if window else None
         self.actions = {kind: Action() for kind in media.KINDS}
         self.calls = SimpleNamespace(media=[], set_media=lambda *values: self.calls.media.append(values))
-        self.desktop_media = SimpleNamespace(answer=gate, sandboxed=False, present=True, lockdown=False,
-                                             refreshed=0, refresh=lambda: None)
+        self.desktop_media = SimpleNamespace(answer=gate, known=True, sandboxed=False, present=True, lockdown=False,
+                                             refreshed=0, refresh=lambda: None, asked=lambda answer: None)
         self.media_lost, self.microphone_present, self.camera_fallback = False, None, False
         self._media_watchers, self._media_watch_next, self._asking_camera = {}, 0, False
+        self._camera_waiting, self._camera_gate_before = [], None
         self._camera_gate_was, self._quitting, self.told = None, False, []
         self.settings.connect(lambda key, value: Natter._on_setting(self, key, value))
 
@@ -944,25 +1172,100 @@ class AppTest(unittest.TestCase):
         app._on_desktop_media()  # nothing new
         self.assertEqual(len(accounts[0].done), 2)
 
+    def asking(self, app):
+        """Ask Again… with the desktop's dialog up: returns the function that answers it."""
+        out = []
+        bus = SimpleNamespace(close=lambda *args: None)
+        with mock.patch.object(media, "private_bus", return_value=bus), \
+                mock.patch.object(media, "ask_camera_again", lambda b, done, forget=True: out.append(done)):
+            app.ask_camera_again(lambda answer: None)
+        return out[0]
+
     def test_while_asking_again_the_answers_on_the_way_dont_count(self):
         accounts = [FakeAccount("Personal")]
         app = App(self, accounts)
         app.desktop_media.answer = "no"
         app._on_desktop_media()
-        app._asking_camera = True
+        answer = self.asking(app)
         app.desktop_media.answer = "ask"  # forgotten, the dialog still up
         app._on_desktop_media()
         self.assertEqual(accounts[0].done, [("off", "camera")])
-        app._asking_camera = False
+        app.desktop_media.answer = "yes"  # stored before the answer reached Natter
+        app._on_desktop_media()
+        self.assertEqual(accounts[0].done, [("off", "camera")])
+        answer("yes")
+        self.assertEqual(accounts[0].done, [("off", "camera"), ("on", "camera")])
+        app._on_desktop_media()
+        self.assertEqual(len(accounts[0].done), 2)  # once
+
+    def test_the_yes_counts_when_it_comes_before_the_store(self):
+        accounts = [FakeAccount("Personal")]
+        app = App(self, accounts)
+        app.desktop_media.answer = "no"
+        app._on_desktop_media()
+        answer = self.asking(app)
+        answer("yes")  # the store still says no
+        self.assertEqual(accounts[0].done, [("off", "camera")])
         app.desktop_media.answer = "yes"
         app._on_desktop_media()
         self.assertEqual(accounts[0].done, [("off", "camera"), ("on", "camera")])
+
+    def test_a_no_while_natter_asks_still_stops_the_camera(self):
+        # The question unanswered (a dialog behind the window): what was allowed meanwhile mustn't
+        # outlast a no from the desktop's settings.
+        accounts = [FakeAccount("Personal", ["camera"])]
+        app = App(self, accounts)
+        app.desktop_media.answer = "no"
+        app._on_desktop_media()
+        self.asking(app)
+        app.desktop_media.answer = "ask"
+        app._on_desktop_media()
+        app.desktop_media.answer = "yes"  # WebKit's own dialog, answered
+        app._on_desktop_media()
+        app.desktop_media.answer = "no"
+        app._on_desktop_media()
+        self.assertEqual(accounts[0].done, [("off", "camera"), ("off", "camera")])
+        self.assertEqual(app.window.toasts, ["Your desktop blocked the camera. WhatsApp's video has stopped"] * 2)
+
+    def test_lockdown_acts_like_a_no(self):
+        accounts = [FakeAccount("Personal", ["camera"])]
+        app = App(self, accounts, gate="yes")
+        app._on_desktop_media()
+        app.desktop_media.lockdown = True
+        self.assertEqual(app.camera_gate(), "no")
+        app._on_desktop_media()
+        self.assertEqual(accounts[0].done, [("off", "camera")])
+        self.assertEqual(app.calls.media[-1], (True, False))  # Chromium opens v4l2 itself
+        state = app.media_state("camera")
+        self.assertEqual((state["desktop"], state["lockdown"]), ("no", True))
+        self.assertEqual(device_subtitle("camera", **state), "Your desktop has the camera turned off for all apps")
+        app.desktop_media.lockdown = False
+        app._on_desktop_media()
+        self.assertEqual(accounts[0].done, [("off", "camera"), ("on", "camera")])
+
+    def test_waiting_for_the_store(self):
+        accounts = [FakeAccount("Personal")]
+        app = App(self, accounts, gate=None)
+        app.desktop_media.known = False
+        self.assertEqual(app.camera_gate(), "waiting")
+        app._camera_gate_was = app.camera_gate()  # as _start_window_services leaves it
+        self.assertEqual(app._call_window_media(), (True, False))
+        self.assertEqual(device_subtitle("camera", **app.media_state("camera")),
+                         "Waiting for your desktop's privacy settings")
+        app.desktop_media.known, app.desktop_media.answer = True, "yes"
+        app._on_desktop_media()
+        self.assertEqual(accounts[0].done, [("on", "camera")])  # what was refused meanwhile may ask again
+        self.assertEqual(app.calls.media[-1], (True, True))
+        app.desktop_media.answer = None  # no store at all: nothing to keep
+        self.assertIsNone(app.camera_gate())
 
     def test_the_gate_is_native_only(self):
         app = App(self, gate="no")
         self.assertEqual(app.camera_gate(), "no")
         app.desktop_media.sandboxed = True
         self.assertIsNone(app.camera_gate())  # the portal keeps it there
+        app.desktop_media.known, app.desktop_media.lockdown = False, True
+        self.assertIsNone(app.camera_gate())  # lockdown too
         app.desktop_media = None
         self.assertIsNone(app.camera_gate())
 
@@ -1010,23 +1313,39 @@ class AppTest(unittest.TestCase):
         self.assertFalse(app.media_lost)
         self.assertEqual(accounts[0].done, [])
 
-    def test_ask_again_one_at_a_time(self):
+    def test_one_question_at_a_time(self):
+        # A request's question and Ask Again… while one is out hear its answer: never two dialogs.
+        app = App(self)
+        questions, answers = [], []
+        bus = SimpleNamespace(close=lambda *args: None)
+        with mock.patch.object(media, "private_bus", return_value=bus), \
+                mock.patch.object(media, "ask_camera_again",
+                                  lambda b, done, forget=True: questions.append((done, forget))):
+            app.ask_camera(lambda answer: answers.append(("request", answer)))
+            app.ask_camera_again(lambda answer: answers.append(("again", answer)))
+        self.assertEqual([forget for _done, forget in questions], [False])  # a request forgets nothing
+        questions[0][0]("no")
+        self.assertEqual(answers, [("request", "no"), ("again", "no")])
+        self.assertFalse(app._asking_camera)
+
+    def test_no_bus_no_question(self):
         app = App(self)
         answers = []
-        app._asking_camera = True
-        with mock.patch.object(media, "private_bus", side_effect=AssertionError("asked twice")):
+        with mock.patch.object(media, "private_bus", return_value=None):
             app.ask_camera_again(answers.append)
-        self.assertEqual(answers, [None])
+        self.assertEqual((answers, app._asking_camera), ([None], False))
 
     def test_ask_again_reads_the_answer(self):
         app = App(self)
-        closed, answers, asked = [], [], []
+        closed, answers, asked, forgot = [], [], [], []
         bus = SimpleNamespace(close=lambda *args: closed.append(True))
         app.desktop_media.asked = asked.append
         with mock.patch.object(media, "private_bus", return_value=bus), \
-                mock.patch.object(media, "ask_camera_again", lambda b, done: done("yes")):
+                mock.patch.object(media, "ask_camera_again",
+                                  lambda b, done, forget=True: forgot.append(forget) or done("yes")):
             app.ask_camera_again(answers.append)
         self.assertEqual((answers, asked, closed, app._asking_camera), (["yes"], ["yes"], [True], False))
+        self.assertEqual(forgot, [True])
 
 
 class DebugInfoTest(unittest.TestCase):

@@ -9,10 +9,11 @@ pushed the page into swap and stalled Natter's window along with it.
 
 This guard looks from Natter's side, in a thread of its own, so a stalled main loop doesn't stall
 it: every GUARD_POLL seconds, each of Natter's WebKit web processes, by the private memory it
-holds, resident or swapped (RssAnon + VmSwap). Past the limit it ends that process with SIGKILL,
-through a pidfd and after checking the name again, so a pid the kernel gave to another process
-meanwhile is never hit. WebKit reports it as a crash to the view that process served, and the
-view asks recent_kill() whether it was this guard.
+holds, resident or swapped (RssAnon + VmSwap). Past its limit and growing like a runaway, or far
+past it whatever it does, the guard ends that process with SIGKILL, through a pidfd and after
+checking the name again, so a pid the kernel gave to another process meanwhile is never hit.
+WebKit reports it as a crash to the view that process served, and the view asks recent_kill()
+whether it was this guard.
 
 It logs from its own thread too, so the journal has it while the main loop is stalled. Sizes
 only: which of the page's threads are busy and what shape its biggest regions have tell what
@@ -34,19 +35,25 @@ GiB = 1024 ** 3
 MiB = 1024 ** 2
 PROC = Path("/proc")
 GUARD_POLL = 2.0  # seconds between looks
-# A page may hold this share of the computer's memory, within these bounds, and never more than
+# A page's limit is this share of the computer's memory, within these bounds, and never more than
 # half of it. An idle WhatsApp page holds 1.0-1.4 GB; a 16 GB laptop (14.8 GiB to the kernel)
 # gives 3.7 GiB.
 PAGE_SHARE, PAGE_FLOOR, PAGE_CEILING = 0.25, int(2.5 * GiB), 6 * GiB
-# During a call a page may hold this much more: WhatsApp's call engine only grows, well over a
-# gigabyte in a long call, and ending the page ends the call. Past that too it's ended only when
-# it also grows faster than CALL_RATE at two looks in a row, as a runaway does (a video's frames
-# decoded and kept grew 130-1000 MB/s), and a long call doesn't. A slower runaway in a call is
-# left to the unit's backstop (system.py).
+# Past its limit a page is ended once it grows like a runaway: faster than RUNAWAY_RATE at two
+# looks in a row (a video's frames decoded and kept grew 130-1000 MB/s; an idle page creeps about
+# 140 MB an hour). One that holds still there is left alone for up to CALL_ROOM more: WhatsApp's
+# call engine only grows, well over a gigabyte in a long call, and the page keeps that after the
+# call until Natter gives it a fresh page once the window has been hidden a while (app.py). On an
+# 8 GB computer that's past the limit, a minute after the call, with the window still in use.
+# Past that room it's ended whatever it does.
+RUNAWAY_RATE = 64 * MiB  # bytes a second
+# During a call both move up by CALL_ROOM, as ending the page ends the call; past that, a page
+# growing like a runaway is ended all the same, and at CALL_MARGIN more whatever it does, before
+# the unit's backstop (below) does it. The call's room lasts CALL_GRACE after the call, so a call
+# whose connection drops and comes back isn't ended in the gap. A call in one account's page
+# counts for every page: WebKit doesn't say which web process is whose.
 CALL_ROOM = int(1.5 * GiB)
-CALL_RATE = 200 * MiB  # bytes a second
-# The call's room lasts this long after it ends, so a call whose connection drops and comes back
-# isn't ended in the gap.
+CALL_MARGIN = GiB // 2
 CALL_GRACE = 60.0
 # Natter's unit (system.py) is the kernel's backstop, for when the guard couldn't act: room for
 # one page at its limit, the call engine of every account's page, and Natter itself; never more
@@ -106,6 +113,17 @@ def scope_limits(total: int, accounts: int) -> tuple[int, int]:
     if total > 0:
         memory_max = min(memory_max, int(total * UNIT_SHARE))
     return memory_max, UNIT_SWAP
+
+
+def page_ceiling(total: int) -> int:
+    """The most a page may hold (resident or swapped), whatever it does and call or not, on a
+    computer with `total` bytes of memory: what Natter's unit with one account leaves a page
+    beside Natter, swap and all, less CALL_MARGIN for the growth between two looks. The guard
+    has to act first: past the unit's limit the kernel ends the page, and a launcher's unit
+    (Ada's) then stops all of Natter. It only comes below the call's room on small computers,
+    where the unit is held to UNIT_SHARE."""
+    memory_max, swap_max = scope_limits(total, 1)
+    return memory_max + swap_max - NATTER_ROOM - CALL_MARGIN
 
 
 def in_flatpak() -> bool:
@@ -291,15 +309,19 @@ class _Page:
 
 class MemoryGuard:
     """Looks at each of Natter's pages every `poll` seconds from a thread of its own, and ends
-    one that holds more than `limit_bytes` (page_limit). `calling()`, when given, says whether a
-    call is on in any page (it's asked from the guard's thread). `on_kill(pid, held)` runs on the
-    main loop after a kill: the kill itself and its log line don't wait for it."""
+    one past `limit_bytes` (page_limit) that grows like a runaway, or one past the room above it
+    whatever it does (limits). `ceiling` (page_ceiling), when given, is the most any page may
+    hold. `calling()`, when given, says whether a call is on in any page (it's asked from the
+    guard's thread). `on_kill(pid, held)` runs on the main loop after a kill: the kill itself
+    and its log line don't wait for it."""
 
     def __init__(self, limit_bytes: int, on_kill: Optional[Callable[[int, int], None]] = None,
                  poll: float = GUARD_POLL, calling: Optional[Callable[[], bool]] = None, *,
-                 pid: Optional[int] = None, proc: Path = PROC, flatpak: Optional[bool] = None,
-                 killer: Optional[Callable[[int], bool]] = None, idle_add: Optional[Callable] = None) -> None:
+                 ceiling: Optional[int] = None, pid: Optional[int] = None, proc: Path = PROC,
+                 flatpak: Optional[bool] = None, killer: Optional[Callable[[int], bool]] = None,
+                 idle_add: Optional[Callable] = None) -> None:
         self.limit = limit_bytes
+        self.ceiling = ceiling
         self.on_kill = on_kill
         self.poll = poll
         self.calling = calling
@@ -329,8 +351,9 @@ class MemoryGuard:
         self._thread = threading.Thread(target=self._run, args=(self._stop,), name="natter-memguard", daemon=True)
         self._thread.start()
         if os.environ.get("NATTER_DEBUG"):
-            print(f"natter: memory: a page may hold {self.limit >> 20} MB, "
-                  f"{(self.limit + CALL_ROOM) >> 20} MB in a call", flush=True)
+            (soft, hard), (call_soft, call_hard) = self.limits(False), self.limits(True)
+            print(f"natter: memory: a page may hold {soft >> 20} MB, {hard >> 20} MB holding still; in a call "
+                  f"{call_soft >> 20} MB, {call_hard >> 20} MB holding still", flush=True)
 
     def stop(self) -> None:
         self._stop.set()
@@ -343,6 +366,15 @@ class MemoryGuard:
                 if not self._failed:
                     self._failed = True
                     print(f"natter: memory: a look at the pages failed ({type(error).__name__})", flush=True)
+
+    def limits(self, in_call: bool) -> tuple[int, int]:
+        """(soft, hard) for a page now: past soft it's ended when it grows like a runaway, past
+        hard whatever it does."""
+        soft = self.limit + (CALL_ROOM if in_call else 0)
+        hard = soft + (CALL_MARGIN if in_call else CALL_ROOM)
+        if self.ceiling is not None:
+            soft, hard = min(soft, self.ceiling), min(hard, self.ceiling)
+        return soft, hard
 
     def _in_call(self, now: float) -> bool:
         if self.calling is not None:
@@ -373,15 +405,15 @@ class MemoryGuard:
             page.looks.append((now, size))
             rates = page.rates()
             rate = round(rates[-1] / MiB) if rates else 0
-            limit = self.limit + (CALL_ROOM if in_call else 0)
-            # In a call, a page past even the call's room is ended only when it grows like a runaway.
-            if size > limit and (not in_call or (len(rates) >= 2 and min(rates[-2:]) > CALL_RATE)) \
-                    and self._end(pid, now):
+            soft, hard = self.limits(in_call)
+            runaway = len(rates) >= 2 and min(rates[-2:]) > RUNAWAY_RATE
+            if (size > hard or (size > soft and runaway)) and self._end(pid, now):
                 del self._pages[pid]
                 self._ended.add(pid)
                 ended.append(pid)
-                print(f"natter: memory: page {pid} held {size >> 20} MB, past its limit of {limit >> 20} MB"
-                      f"{' in a call' if in_call else ''}, growing {rate} MB/s; ended it", flush=True)
+                print(f"natter: memory: page {pid} held {size >> 20} MB, past its limit of "
+                      f"{(hard if size > hard else soft) >> 20} MB{' in a call' if in_call else ''}, "
+                      f"growing {rate} MB/s; ended it", flush=True)
                 if self.on_kill is not None:
                     self._idle_add(self._report, pid, size)
                 continue

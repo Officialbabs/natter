@@ -4,7 +4,8 @@ rtc.js rewrites a call's H.264 decoders for WebKitGTK and puts a ceiling on ever
 encoder in the page: after a video attached to a chat was decoded whole with its frames kept
 (12 GB). Its code runs here in gjs against fake codecs that behave as WebKitGTK's do on the points
 that matter (state, key frames, queue sizes, "Decode error" for Annex B without a description,
-frames as pooled pictures), on a virtual clock. Without gjs those tests skip.
+frames as pooled pictures, a frame made from a frame sharing its picture), on a virtual clock.
+Without gjs those tests skip.
 """
 
 import json
@@ -19,17 +20,19 @@ from natter import rtc
 
 RTC_JS = Path(__file__).resolve().parent.parent / "natter" / "rtc.js"
 GJS = shutil.which("gjs") or ("/usr/bin/gjs" if Path("/usr/bin/gjs").exists() else None)
-_results = None
+_results: dict = {}
 
 
-def results() -> dict:
-    """Every scenario's result, from one run of the harness."""
-    global _results
-    if _results is None:
+def results(mode: str = "") -> dict:
+    """Every scenario's result, from one run of the harness. `mode` "native-rtc" runs it in a
+    page whose WebKit has an RTCPeerConnection of its own, "no-calls" in one without the calls'
+    answering handler (calls in a window of their own), "no-handlers" in one with neither."""
+    if mode not in _results:
         with tempfile.TemporaryDirectory() as folder:
             script = Path(folder) / "harness.js"
             script.write_text(HARNESS)
-            done = subprocess.run([GJS, str(script), str(RTC_JS)], capture_output=True, text=True, timeout=120)
+            argv = [GJS, str(script), str(RTC_JS)] + (["bounded", mode] if mode else [])
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=180)
         found = {}
         for line in done.stdout.splitlines():
             if line.startswith("RESULT "):
@@ -39,14 +42,14 @@ def results() -> dict:
                 found["problems"] = json.loads(line[9:])
         if "problems" not in found:
             raise AssertionError(f"the harness didn't finish: {done.stdout[-2000:]}{done.stderr[-2000:]}")
-        _results = found
-    return _results
+        _results[mode] = found
+    return _results[mode]
 
 
 @unittest.skipUnless(GJS, "needs gjs")
 class HarnessCase(unittest.TestCase):
-    def scenario(self, name: str) -> dict:
-        found = results()
+    def scenario(self, name: str, mode: str = "") -> dict:
+        found = results(mode)
         self.assertEqual(found["problems"], [])
         self.assertNotIn("harnessError", found[name], found[name].get("harnessError"))
         return found[name]
@@ -164,6 +167,47 @@ class HeldFramesTest(HarnessCase):
             self.assertEqual((failed["state"], failed["queue"]), ("closed", 0), mode)
             self.assertEqual(failed["flush"], "QuotaExceededError", mode)  # a flush waiting with them fails too
 
+    def test_a_frame_made_from_a_frame_holds_it_too(self):
+        # new VideoFrame(frame, {timestamp}) shares the picture in WebKit: kept while the frame it
+        # was made from is let go, it's still held (a decoder with a description, at file speed).
+        found = self.scenario("rewrap")
+        self.assertEqual(found["described"]["outputs"], 64)
+        self.assertEqual(found["described"]["live"], 64)
+        self.assertEqual(found["described"]["queue"], 236)
+        self.assertEqual(found["describedFailed"]["errors"],
+                         ["QuotaExceededError: Too many decoded video frames are held at once"])
+        self.assertEqual(found["describedFailed"]["state"], "closed")
+        self.assertLessEqual(found["describedFailed"]["maxLive"], 64)
+        self.assertEqual(found["openLogged"], 64)
+
+    def test_a_frame_made_again_from_a_made_frame_and_letting_go(self):
+        found = self.scenario("rewrap")
+        self.assertEqual(found["chain"], {"outputs": 64, "afterLetGo": 74})
+        self.assertEqual(found["unrelated"], {"outputs": 10, "live": 10})  # frames not from a decoder aren't counted
+
+    def test_reset_between_key_frames_doesnt_start_over(self):
+        # A call's decoder reset and configured again between GOPs, fed at file speed: the pace
+        # check starts over each time, the ceiling doesn't.
+        found = self.scenario("rewrap")["resetBetween"]
+        self.assertEqual(found["outputs"], 64)
+        self.assertLessEqual(found["maxLive"], 64)
+
+    def test_fresh_decoders_one_after_another_share_the_pages_ceiling(self):
+        # A new decoder for each 30-frame GOP, frames kept: each stays under its own 64, so the
+        # page's 128 for all of them together is what holds.
+        found = self.scenario("split")
+        for kind in ("described", "rewritten"):
+            self.assertEqual(found[kind]["outputs"], 128, kind)
+            self.assertLessEqual(found[kind]["maxLive"], 128, kind)
+            self.assertEqual(found[kind]["errors"], ["QuotaExceededError"] * 4, kind)
+            self.assertEqual(found[kind]["states"], ["configured"] * 4 + ["closed"] * 4, kind)
+        self.assertEqual(found["pageOpen"], 128)  # in the page's counts for the log
+        self.assertEqual(found["afterLetGo"], {"outputs": 138, "errors": []})  # room on the page goes to who waits
+
+    def test_a_group_call_is_never_held_back(self):
+        found = self.scenario("groupCall")
+        self.assertEqual(found, {"outputs": 32 * 60, "errors": [], "held": 0})
+
     def test_in_a_call_it_waits_as_long_as_it_takes(self):
         found = self.scenario("held")
         self.assertEqual(found["inCall"], {"outputs": 64, "errors": [], "state": "configured", "queue": 36})
@@ -182,7 +226,7 @@ class CountsTest(HarnessCase):
         allowed = {"dec": common | {"id", "codec", "desc", "lat", "rewrite", "w", "h", "out", "open", "held", "queue",
                                     "drops", "err"},
                    "enc": common | {"id", "codec", "mode", "w", "h", "out", "queue", "drops", "err"},
-                   "page": common | {"workers", "annexb"}}
+                   "page": common | {"workers", "annexb", "open"}}
         for kind, keys in found["keys"].items():
             self.assertLessEqual(set(keys), allowed[kind], kind)
         for message in found["sample"] + found["plain"]:
@@ -206,21 +250,56 @@ class CountsTest(HarnessCase):
         self.assertTrue(found["isNative"])
 
 
+class WithoutTheStandInTest(HarnessCase):
+    """The ceilings are for every page: also where WebKit has WebRTC of its own, or calls open in
+    a window of their own (no answering handler), or no handler at all."""
+
+    def test_every_decoder_and_encoder_still_has_its_ceiling(self):
+        for mode in ("native-rtc", "no-calls", "no-handlers"):
+            found = self.scenario("bounded", mode)
+            self.assertEqual(found["kept"]["outputs"], 64, mode)
+            self.assertEqual(found["kept"]["errors"], ["QuotaExceededError"], mode)
+            self.assertEqual(found["flood"]["errors"], ["QuotaExceededError"], mode)
+            self.assertEqual(found["flood"]["maxQueue"], 32, mode)
+            self.assertEqual(found["rewrap"], 64, mode)
+
+    def test_no_stand_in(self):
+        for mode in ("native-rtc", "no-calls", "no-handlers"):
+            found = self.scenario("bounded", mode)
+            self.assertEqual(found["natterRtc"], "undefined", mode)  # bridge.js sees no calls of Natter's
+            self.assertEqual(found["added"], [], mode)
+            self.assertFalse(found["sinkId"], mode)  # the call's sound is the stand-in's
+            self.assertFalse(found["cameraWrapped"], mode)
+        self.assertEqual(self.scenario("bounded", "native-rtc")["rtc"], "native")
+
+    def test_counts_go_up_where_there_is_a_handler(self):
+        self.assertGreater(self.scenario("bounded", "native-rtc")["codecMessages"], 0)
+        self.assertGreater(self.scenario("bounded", "no-calls")["codecMessages"], 0)
+        self.assertEqual(self.scenario("bounded", "no-handlers")["codecMessages"], 0)
+
+
 class LooksNativeTest(HarnessCase):
     def test_tostring_is_the_browsers(self):
         found = self.scenario("looks")
         for key, name in (("decoder", "VideoDecoder"), ("encoder", "VideoEncoder"), ("worker", "Worker"),
-                          ("decode", "decode"), ("state", "state"), ("close", "close"), ("clone", "clone")):
+                          ("decode", "decode"), ("state", "state"), ("close", "close"), ("clone", "clone"),
+                          ("frame", "VideoFrame")):
             self.assertEqual(found[key], f"function {name}() {{\n    [native code]\n}}")
-        self.assertEqual(found["names"], ["VideoDecoder", "VideoEncoder", "Worker", "close"])
+        self.assertEqual(found["names"], ["VideoDecoder", "VideoEncoder", "Worker", "close", "VideoFrame"])
         self.assertEqual(found["workerLength"], 1)
+
+    def test_video_frame_is_the_browsers_own_underneath(self):
+        # Wrapped, not subclassed: frames WebKit makes pass instanceof, and the rest is WebKit's.
+        found = self.scenario("looks")
+        self.assertEqual(found["frameChecks"], {"instanceof": True, "constructor": True, "prototype": True,
+                                                "static": True, "withoutNew": "TypeError", "length": True})
 
     def test_webkits_own_classes_underneath_and_no_new_globals(self):
         found = self.scenario("looks")
         self.assertTrue(found["inheritsSupport"])  # isConfigSupported is WebKit's
         self.assertTrue(found["subclasses"])
         self.assertTrue(found["closeReplaced"])
-        self.assertEqual(found["enumerable"], [])
+        self.assertEqual(found["enumerable"], [])  # VideoFrame too
         self.assertEqual(found["added"], ["RTCCertificate", "RTCDataChannel", "RTCIceCandidate", "RTCPeerConnection",
                                           "RTCSessionDescription", "__natterRtc"])
         self.assertEqual(found["ownProps"], [])  # nothing of Natter's on a decoder
@@ -249,7 +328,9 @@ class CodecLineTest(unittest.TestCase):
         self.assertEqual(rtc.webcodecs_line(ENCODER),
                          ("enc#1", "enc#1 avc1.42001f mode=realtime 1280x720 out=30 queue=2 drops=4"))
         self.assertEqual(rtc.webcodecs_line({"op": "webcodecs", "kind": "page", "workers": 5, "annexb": 1}),
-                         ("page", "workers=5 annexb-without-latency=1"))
+                         ("page", "workers=5 annexb-without-latency=1 open=0"))
+        self.assertEqual(rtc.webcodecs_line({"op": "webcodecs", "kind": "page", "workers": 0, "annexb": 0,
+                                             "open": 128}), ("page", "workers=0 annexb-without-latency=0 open=128"))
         fresh = {"op": "webcodecs", "kind": "dec", "id": 1, "codec": "", "w": 0, "h": 0}
         self.assertEqual(rtc.webcodecs_line(fresh)[1],
                          "dec#1 ? desc=no lat=no rewrite=off size=? out=0 open=0 held=0 queue=0 drops=0")
@@ -324,6 +405,32 @@ class CodecLogTest(unittest.TestCase):
         rtc.Host.post(host, dict(DECODER))
         self.assertEqual(taken, [DECODER])
 
+    def test_without_calls_in_the_page_too(self):
+        # Calls in a window of their own: rtc.js still bounds the codecs, and its counts still
+        # reach the log; nothing else it could send does anything.
+        from natter.account import Account
+
+        taken, posted = [], []
+        page = types.SimpleNamespace(rtc=None, _codec_log=types.SimpleNamespace(take=taken.append))
+        for message in (dict(DECODER), {"op": "send", "ch": 1, "text": "x"}):
+            page._rtc_message = lambda value, message=message: dict(message)
+            Account._on_rtc_message(page, None, None)
+        self.assertEqual(taken, [DECODER])
+        page.rtc = types.SimpleNamespace(post=posted.append)
+        Account._on_rtc_message(page, None, None)
+        self.assertEqual(posted, [{"op": "send", "ch": 1, "text": "x"}])
+
+    def test_rtc_js_goes_in_every_page(self):
+        import inspect
+
+        from natter.account import Account
+
+        source = inspect.getsource(Account.__init__)
+        injected, gated = source.index("RTC.replace(\"__NATTER_TOKEN__\""), source.index("if app.calls_in_page:")
+        self.assertLess(injected, gated)
+        self.assertLess(source.index('register_script_message_handler("natterRtc"'), gated)
+        self.assertGreater(source.index('register_script_message_handler_with_reply("natterRtcCall"'), gated)
+
 
 HARNESS = r"""
 // rtc.js's video codec code in gjs, against fake codecs that behave as WebKitGTK's do on the
@@ -332,6 +439,7 @@ HARNESS = r"""
 const { GLib } = imports.gi;
 const System = imports.system;
 const TOKEN = "harness-token";
+const MODE = ARGV[2] || "";  // "native-rtc", "no-calls", "no-handlers": see results() in the test
 const RESULTS = {};
 const problems = [];
 
@@ -398,6 +506,11 @@ globalThis.webkit = { messageHandlers: {
     return Promise.resolve({});
   } },
 } };
+if (MODE === "no-calls") delete globalThis.webkit.messageHandlers.natterRtcCall;
+if (MODE === "no-handlers") globalThis.webkit = { messageHandlers: {} };
+if (MODE === "native-rtc") globalThis.RTCPeerConnection = function RTCPeerConnection() {};
+class FakeAudioContext {}
+globalThis.AudioContext = FakeAudioContext;
 
 // ---- Fake WebCodecs, as WebKitGTK's -------------------------------------------------------------
 const stats = { live: 0, maxLive: 0 };
@@ -410,7 +523,13 @@ class Picture {  // one decoded picture: a 1.5 MB buffer from openh264dec's pool
 const pictureOfCollected = new FinalizationRegistry((picture) => picture.unref());
 
 class VideoFrame {
-  constructor(picture, init) {
+  constructor(source, init = {}) {
+    let picture = source;
+    if (source instanceof VideoFrame) {  // a frame from a frame: the same picture, another timestamp if asked
+      if (source._closed) throw new DOMException("VideoFrame is closed", "InvalidStateError");
+      picture = source._picture;
+      init = { timestamp: source.timestamp, codedWidth: source.codedWidth, codedHeight: source.codedHeight, ...init };
+    }
     if (!(picture instanceof Picture)) throw new TypeError("the harness only makes frames in its decoder");
     this._picture = picture;
     picture.refs++;
@@ -430,6 +549,7 @@ class VideoFrame {
     if (this._closed) throw new DOMException("VideoFrame is closed", "InvalidStateError");
     return new VideoFrame(this._picture, this);
   }
+  static get harnessStatic() { return 42; }
 }
 
 class EncodedVideoChunk {
@@ -635,6 +755,9 @@ class FakeWorker {
 
 Object.assign(globalThis, { VideoFrame, EncodedVideoChunk, VideoDecoder: FakeVideoDecoder, VideoEncoder: FakeVideoEncoder,
                             Worker: FakeWorker });
+globalThis.navigator.mediaDevices = { getUserMedia() {}, enumerateDevices() {}, addEventListener() {} };
+globalThis.MediaStreamTrack = class MediaStreamTrack { applyConstraints() {} };
+const nativeGetUserMedia = globalThis.navigator.mediaDevices.getUserMedia;
 const nativeClose = VideoFrame.prototype.close;
 const globalsBefore = new Set(Object.getOwnPropertyNames(globalThis));
 
@@ -650,6 +773,9 @@ const annexB = (units) => new Uint8Array(units.flatMap((unit) => [0, 0, 0, 1, ..
 const avcc = (units) => new Uint8Array(units.flatMap((unit) => [unit.length >> 24, (unit.length >> 16) & 255, (unit.length >> 8) & 255, unit.length & 255, ...unit]));
 const DESCRIPTION = new Uint8Array([1, SPS[1], SPS[2], SPS[3], 0xff, 0xe1, 0, SPS.length, ...SPS, 1, 0, PPS.length, ...PPS]);
 const FRAME_US = 33333;
+
+// What the page sees as VideoFrame: rtc.js's, where the harness's own class (WebKit's) is shadowed.
+const PageFrame = () => globalThis.VideoFrame;
 
 function annexBChunk(i, gop = 30) {
   const key = i % gop === 0;
@@ -918,6 +1044,194 @@ const scenarios = {
     return out;
   },
 
+  async rewrap() {
+    const out = {};
+    // A decoder with a description (WebKit's own, no pace check), fed a file at once; the page
+    // gives each frame another timestamp, keeps that, and lets the decoder's frame go.
+    let liveBase = stats.live;
+    stats.maxLive = stats.live;
+    let kept = [], errors = [], outputs = 0;
+    let d = new VideoDecoder({
+      output(frame) {
+        outputs++;
+        kept.push(new (PageFrame())(frame, { timestamp: frame.timestamp + 7 }));
+        frame.close();
+      },
+      error(e) { errors.push(e.name + ": " + e.message); },
+    });
+    d.configure({ codec: "avc1.42001f", description: DESCRIPTION });
+    await feed(d, Array.from({ length: 300 }, (_, i) => avccChunk(i)), 0);
+    await advance(2000);
+    out.described = { outputs, queue: d.decodeQueueSize, live: stats.live - liveBase };
+    await advance(3000);
+    const pages = posted.filter((p) => p.message.op === "webcodecs" && p.message.kind === "dec" && p.message.open);
+    out.openLogged = pages.length ? pages[pages.length - 1].message.open : null;
+    await advance(7000);
+    out.describedFailed = { errors: [...errors], state: d.state, maxLive: stats.maxLive - liveBase };
+    for (const frame of kept.splice(0)) frame.close();
+    await advance(100);
+    // A frame made from a made frame counts once; letting the last go makes room.
+    liveBase = stats.live;
+    outputs = 0;
+    d = new VideoDecoder({
+      output(frame) {
+        outputs++;
+        const once = new (PageFrame())(frame, { timestamp: 1 });
+        kept.push(new (PageFrame())(once, { timestamp: 2 }));
+        once.close();
+        frame.close();
+      },
+      error() {},
+    });
+    d.configure({ codec: "avc1.42001f", description: DESCRIPTION });
+    await feed(d, Array.from({ length: 100 }, (_, i) => avccChunk(i)), 0);
+    await advance(1000);
+    out.chain = { outputs };
+    for (const frame of kept.splice(0, 10)) frame.close();
+    await advance(500);
+    out.chain.afterLetGo = outputs;
+    d.close();
+    for (const frame of kept.splice(0)) frame.close();
+    await advance(100);
+    // Frames the page makes from its own pictures are none of a decoder's.
+    liveBase = stats.live;
+    const own = Array.from({ length: 10 }, (_, i) => new (PageFrame())(new Picture(), { timestamp: i }));
+    out.unrelated = { outputs: own.length, live: stats.live - liveBase };
+    own.forEach((frame) => frame.close());
+    // A call's decoder, reset and configured again between 30-frame GOPs, at file speed.
+    liveBase = stats.live;
+    stats.maxLive = stats.live;
+    outputs = 0;
+    d = new VideoDecoder({
+      output(frame) { outputs++; kept.push(new (PageFrame())(frame, { timestamp: frame.timestamp })); frame.close(); },
+      error() {},
+    });
+    for (let gop = 0; gop < 10; gop++) {
+      d.reset();
+      d.configure(P13);
+      await feed(d, Array.from({ length: 30 }, (_, i) => annexBChunk(gop * 30 + i)), 2);
+    }
+    await advance(500);
+    out.resetBetween = { outputs, maxLive: stats.maxLive - liveBase };
+    d.close();
+    for (const frame of kept.splice(0)) frame.close();
+    await advance(100);
+    return out;
+  },
+
+  async split() {
+    const out = {};
+    for (const [name, config, chunkOf] of [["described", { codec: "avc1.42001f", description: DESCRIPTION }, avccChunk],
+                                          ["rewritten", P13, annexBChunk]]) {
+      const liveBase = stats.live;
+      stats.maxLive = stats.live;
+      const decoders = [], errors = [], kept = [];
+      let outputs = 0;
+      for (let gop = 0; gop < 8; gop++) {
+        const d = new VideoDecoder({ output(frame) { outputs++; kept.push(frame); },
+                                     error(e) { errors.push(e.name); } });
+        d.configure(config);
+        await feed(d, Array.from({ length: 30 }, (_, i) => chunkOf(gop * 30 + i)), 0);
+        decoders.push(d);
+        await advance(300);
+      }
+      await advance(3000);
+      if (name === "described") {
+        const pages = posted.filter((p) => p.message.op === "webcodecs" && p.message.kind === "page");
+        out.pageOpen = pages.length ? pages[pages.length - 1].message.open : null;
+      }
+      await advance(9000);
+      out[name] = { outputs, errors, maxLive: stats.maxLive - liveBase, states: decoders.map((d) => d.state) };
+      if (name === "described") {
+        // One that waits gets the room another's frames leave.
+        const [d, seen] = decoder({ keep: true });
+        d.configure({ codec: "avc1.42001f", description: DESCRIPTION });
+        await feed(d, Array.from({ length: 10 }, (_, i) => avccChunk(i)), 0);
+        await advance(200);
+        for (const frame of kept.splice(0, 10)) frame.close();
+        await advance(500);
+        out.afterLetGo = { outputs: outputs + seen.outputs, errors: seen.errors };
+        d.close();
+        for (const frame of seen.kept.splice(0)) frame.close();
+      }
+      for (const d of decoders) if (d.state !== "closed") d.close();
+      for (const frame of kept.splice(0)) frame.close();
+      await advance(100);
+    }
+    return out;
+  },
+
+  async groupCall() {
+    // 32 people's video in a call, each decoder with up to 3 frames out: never held back.
+    await startCall();
+    const decoders = [], errors = [];
+    let outputs = 0, held = 0;
+    for (let k = 0; k < 32; k++) {
+      const out = [];
+      const d = new VideoDecoder({
+        output(frame) { outputs++; out.push(frame); while (out.length > 3) out.shift().close(); },
+        error(e) { errors.push(e.name); },
+      });
+      d.configure(P13);
+      decoders.push([d, out]);
+    }
+    const from = posted.length;
+    for (let i = 0; i < 60; i++) {
+      for (const [d] of decoders) d.decode(annexBChunk(i));
+      await advance(33);
+    }
+    await advance(200);
+    for (const { message } of posted.slice(from))
+      if (message.op === "webcodecs" && message.held) held = Math.max(held, message.held);
+    for (const [d, out] of decoders) {
+      out.splice(0).forEach((frame) => frame.close());
+      d.close();
+    }
+    await endCall();
+    return { outputs, errors, held };
+  },
+
+  async bounded() {
+    // MODE: no stand-in. The ceilings all the same.
+    const out = {};
+    const [d, seen] = decoder({ keep: true });
+    d.configure({ codec: "avc1.42001f", description: DESCRIPTION });
+    await feed(d, Array.from({ length: 200 }, (_, i) => avccChunk(i)), 0);
+    await advance(12000);
+    out.kept = { outputs: seen.outputs, errors: seen.errors.map((e) => e.split(":")[0]) };
+    for (const frame of seen.kept.splice(0)) frame.close();
+    const errors = [];
+    const e = new VideoEncoder({ output() {}, error(err) { errors.push(err.name); } });
+    e.configure({ codec: "avc1.42001f", width: 1366, height: 766 });
+    for (let i = 0; i < 100 && e.state === "configured"; i++) {
+      const frame = new VideoFrame(new Picture(), { timestamp: i * FRAME_US });
+      e.encode(frame);
+      frame.close();
+      await advance(1);
+    }
+    await advance(1000);
+    out.flood = { errors, maxQueue: e.maxQueue };
+    const kept = [];
+    const r = new VideoDecoder({
+      output(frame) { kept.push(new (PageFrame())(frame, { timestamp: 0 })); frame.close(); },
+      error() {},
+    });
+    r.configure({ codec: "avc1.42001f", description: DESCRIPTION });
+    await feed(r, Array.from({ length: 100 }, (_, i) => avccChunk(i)), 0);
+    await advance(1000);
+    out.rewrap = kept.length;
+    r.close();
+    kept.splice(0).forEach((frame) => frame.close());
+    await advance(3000);
+    out.natterRtc = typeof globalThis.__natterRtc;
+    out.added = globalsAdded.sort();
+    out.rtc = globalThis.RTCPeerConnection ? "native" : "none";
+    out.sinkId = "setSinkId" in FakeAudioContext.prototype;
+    out.cameraWrapped = globalThis.navigator.mediaDevices.getUserMedia !== nativeGetUserMedia;
+    out.codecMessages = posted.filter((p) => p.message.op === "webcodecs").length;
+    return out;
+  },
+
   async workers() {
     for (const url of ["a.js", "b.js", "c.js"]) new Worker(url);
     let thrown = null;
@@ -958,14 +1272,35 @@ const scenarios = {
     return {
       decoder: shown(VideoDecoder), encoder: shown(VideoEncoder), worker: shown(Worker),
       decode: shown(VideoDecoder.prototype.decode), state: shown(Object.getOwnPropertyDescriptor(VideoDecoder.prototype, "state").get),
-      close: shown(VideoFrame.prototype.close), clone: shown(VideoFrame.prototype.clone),
-      names: [VideoDecoder.name, VideoEncoder.name, Worker.name, VideoFrame.prototype.close.name],
+      close: shown(VideoFrame.prototype.close), clone: shown(VideoFrame.prototype.clone), frame: shown(PageFrame()),
+      names: [VideoDecoder.name, VideoEncoder.name, Worker.name, VideoFrame.prototype.close.name, PageFrame().name],
+      frameChecks: await (async () => {
+        const [d, seen] = decoder({ keep: true });
+        d.configure({ codec: "avc1.42001f", description: DESCRIPTION });
+        d.decode(avccChunk(0));
+        await advance(50);
+        const frame = seen.kept[0];  // one WebKit made, not the page
+        let withoutNew = null;
+        try {
+          PageFrame()(frame);
+        } catch (e) {
+          withoutNew = e.name;
+        }
+        const checks = { instanceof: frame instanceof PageFrame(), constructor: frame.constructor === PageFrame(),
+                         prototype: PageFrame().prototype === VideoFrame.prototype,
+                         static: PageFrame().harnessStatic === 42,
+                         withoutNew, length: PageFrame().length === VideoFrame.length };
+        frame.close();
+        d.close();
+        return checks;
+      })(),
       workerLength: Worker.length,
       inheritsSupport: VideoDecoder.isConfigSupported === FakeVideoDecoder.isConfigSupported
         && VideoEncoder.isConfigSupported === FakeVideoEncoder.isConfigSupported,
       subclasses: Object.getPrototypeOf(VideoDecoder) === FakeVideoDecoder && Object.getPrototypeOf(VideoEncoder) === FakeVideoEncoder,
       closeReplaced: VideoFrame.prototype.close !== nativeClose,
-      enumerable: ["VideoDecoder", "VideoEncoder", "Worker"].filter((k) => Object.getOwnPropertyDescriptor(globalThis, k).enumerable),
+      enumerable: ["VideoDecoder", "VideoEncoder", "Worker", "VideoFrame"]
+        .filter((k) => Object.getOwnPropertyDescriptor(globalThis, k).enumerable),
       added: globalsAdded.sort(),
       ownProps: Object.getOwnPropertyNames((() => { const [d] = decoder(); return d; })()).filter((k) => !k.startsWith("_") && k !== "nativeLog"),
     };

@@ -82,8 +82,12 @@ def hide_system_bus(environ=None, sandboxed: Optional[bool] = None) -> bool:
 
 
 def give_system_bus(launcher) -> None:
-    """Give a program Natter starts (not a WebKit one) the system bus Natter hid from itself.
+    """Give a program Natter starts (not a WebKit one) the system bus Natter hid from itself,
+    and take off the camera fix's GStreamer settings, which are for WebKit only (gstfix.py).
     `launcher` is a Gio.SubprocessLauncher or a Gio.AppLaunchContext."""
+    from .gstfix import launch_env
+
+    launch_env(launcher)
     if _system_bus_before is None:
         return
     address = _system_bus_before[0]
@@ -99,11 +103,14 @@ def open_uri(uri: str, window=None) -> None:
     """Open `uri` (a link, or a file's file:// address) in the app the desktop has for it.
 
     Outside Flatpak and Snap GTK starts that app itself, with Natter's environment, so a browser
-    it started would have no system bus (hide_system_bus). So Natter starts it, with the system
-    bus given back. Inside a sandbox GTK asks the OpenURI portal, and nothing was hidden."""
+    it started would have no system bus (hide_system_bus) and would load the camera fix's
+    GStreamer tracer (gstfix.py). So Natter starts it, with the system bus given back and the
+    tracer taken off. Inside a sandbox GTK asks the OpenURI portal, and nothing was changed."""
     from gi.repository import Gdk, Gtk
 
-    if _system_bus_before is None:
+    from .gstfix import cleaned
+
+    if _system_bus_before is None and not cleaned():
         Gtk.UriLauncher.new(uri).launch(window, None, None, None)
         return
     display = window.get_display() if window is not None else Gdk.Display.get_default()
@@ -376,6 +383,19 @@ def footprint(cgroup: Optional[Path] = None) -> int:
     except ValueError:
         swapped = 0
     return anon + swapped
+
+
+def memory_events(cgroup: Optional[Path] = None) -> dict[str, int]:
+    """The kernel's counts for Natter's unit (memory.events), by name: `high`, times it held the
+    unit back past a MemoryHigh (a launcher's: Natter sets none); `max`, times it reached its
+    MemoryMax; `oom_kill`, processes it ended there. Empty when they can't be read."""
+    cgroup = cgroup or own_cgroup()
+    events = {}
+    for line in (_read(cgroup / "memory.events") if cgroup else "").splitlines():
+        name, _, value = line.partition(" ")
+        if value.strip().isdigit():
+            events[name] = int(value)
+    return events
 
 
 def memory_tight(meminfo: Optional[str] = None) -> bool:

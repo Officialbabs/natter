@@ -541,7 +541,7 @@ class AppearanceTest(unittest.TestCase):
         fake.ada_style = SimpleNamespace(close=lambda: closed.append(True))
         for name in ("notifier", "reclaimer", "call_sound", "audio_follower"):
             setattr(fake, name, Recorder())
-        fake.tray = fake.calls = fake.window = fake.desktop_media = None
+        fake.tray = fake.calls = fake.window = fake.desktop_media = fake.memory_guard = None
         fake.quit = lambda: None
         Natter.quit_natter(fake)
         self.assertEqual(closed, [True])
@@ -654,7 +654,7 @@ class PageLookTest(unittest.TestCase):
         account = Page(look(tokens=False))
         fake = fake_app(self, accounts=[account])
         fake._show_unread = fake._check_media = lambda: None
-        fake._linking, fake.calls = set(), None
+        fake._linking, fake._memory_told, fake.calls = set(), set(), None
         patches, _provider, _added = libraries(Manager())
         with patches, contextlib.redirect_stdout(io.StringIO()):
             Natter._on_account_state(fake, account)

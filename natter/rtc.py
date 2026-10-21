@@ -8,6 +8,9 @@ RTCPeerConnection, and everything for the page goes back in order, in batches.
 
 GStreamer calls back from its own threads; those only queue events here. The page is told on
 GLib's main loop, and what the page asks is done there too.
+
+rtc.js also counts what the page's video decoders and encoders do; those counts go to the log
+here (CodecLog).
 """
 
 from __future__ import annotations
@@ -565,7 +568,7 @@ _ERROR_NAME = re.compile(r"[A-Za-z]{1,40}")
 _FIELDS = {"dec": {"op", "kind", "id", "codec", "desc", "lat", "rewrite", "w", "h", "out", "open", "held", "queue",
                    "drops", "err"},
            "enc": {"op", "kind", "id", "codec", "mode", "w", "h", "out", "queue", "drops", "err"},
-           "page": {"op", "kind", "workers", "annexb"}}
+           "page": {"op", "kind", "workers", "annexb", "open"}}
 
 
 def webcodecs_line(message: dict) -> Optional[tuple[str, str]]:
@@ -589,10 +592,10 @@ def webcodecs_line(message: dict) -> Optional[tuple[str, str]]:
         return words[value] if type(value) is bool else None
 
     if kind == "page":
-        workers, annexb = count("workers"), count("annexb")
-        if workers is None or annexb is None:
+        workers, annexb, held = count("workers"), count("annexb"), count("open")
+        if workers is None or annexb is None or held is None:
             return None
-        return "page", f"workers={workers} annexb-without-latency={annexb}"
+        return "page", f"workers={workers} annexb-without-latency={annexb} open={held}"
 
     codec, error = message.get("codec", ""), message.get("err", "")
     if not isinstance(codec, str) or (codec and not _CODEC_NAME.fullmatch(codec)):

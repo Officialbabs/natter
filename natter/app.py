@@ -29,14 +29,16 @@ from .media import KINDS as MEDIA_KINDS, DesktopMedia
 from .ada import AdaStyle, on_ada
 from .calls import CallWindow, available as calls_available
 from .distro import os_release
+from .gstfix import debug_line as camera_fix_line
 from .links import chat_link, page_link
 from .launcher import Badge, chat_key, exec_quote, set_menu_chats
+from .memguard import KILL_MEMORY, MemoryGuard, mem_total, page_ceiling, page_limit
 from .notify import Notifier
 from .search import SearchProvider
 from .settings import AUTOSTART, CACHE, CONFIG, DATA, Chat, ChatIndex, Settings, private_folder
-from .system import (SWAP_BUDGET_MB, AudioFollower, CallSound, Reclaimer, footprint, in_sandbox, limit_own_scope,
-                     media_report, memory_tight, move_to_own_scope, network_processes, open_uri, own_swap,
-                     request_background, swap_full)
+from .system import (SWAP_BUDGET_MB, AudioFollower, CallSound, Reclaimer, footprint, in_own_scope, in_sandbox,
+                     limit_own_scope, media_report, memory_events, memory_tight, move_to_own_scope, network_processes,
+                     open_uri, own_swap, request_background, swap_full)
 from .tray import MenuItem, Tray, tray_host_available
 
 HERE = Path(__file__).resolve().parent
@@ -60,6 +62,8 @@ def app_icon() -> Gio.Icon:
     can show (Ada's doesn't look icons up by name in ~/.local/share/icons), else the theme name."""
     svg = ICONS / "hicolor" / "scalable" / "apps" / f"{DEFAULT_APP_ID}.svg"
     return Gio.FileIcon.new(Gio.File.new_for_path(str(svg))) if svg.is_file() else Gio.ThemedIcon.new(DEFAULT_APP_ID)
+
+
 MEMORY_LIMIT = 1536  # MB
 MEMORY_THRESHOLDS = (0.55, 0.8)  # conservative, strict: fractions of the limit
 MEMORY_POLL = 30  # seconds between WebKit's memory checks
@@ -67,6 +71,10 @@ MEMORY_POLL = 30  # seconds between WebKit's memory checks
 # not a crash: Account._on_crash). Without it the limit only ever freed caches, while what
 # WhatsApp's call engine keeps after a call grew on to several gigabytes. 2.5 leaves room for a
 # call on top of an idle page (about 1.2 GB): ending the page during a call ends the call.
+# It's the second net, not the first: WebKit counts only what's resident (a page pushed into
+# swap passes under it), and looks from a timer on the page's own main thread, which a page
+# busy growing never lets run (on 20 Oct 2026 one stayed past it for 45 s, on to 12 GB).
+# Natter's guard (memguard.py, started in do_startup) looks from outside the page.
 MEMORY_KILL = 2.5
 MEMORY_CHECK = 60  # seconds between Natter's own checks (_check_memory)
 NETWORK_CHECK = 5  # seconds between looks at WebKit's network process (_check_network_process)
@@ -168,6 +176,18 @@ def memory_pressure(limit: Optional[str], thresholds: Optional[str]) -> Optional
     if not 0 < conservative < strict < 1:
         conservative, strict = MEMORY_THRESHOLDS
     return megabytes, conservative, strict
+
+
+def stall_line(stalled: float, held: int, swapped: int, before: dict[str, int], after: dict[str, int]) -> str:
+    """The log line for a main loop that didn't run for `stalled` seconds: Ada froze the hidden
+    window, or the computer was too short of memory to run it. What Natter's unit holds (`held`,
+    `swapped` of it, in bytes), and what the kernel did to it meanwhile: memory.events (`before`
+    and `after` the gap) counts the times it was held back (high), kept at its limit (max), and
+    the processes it ended (oom_kill)."""
+    line = f"natter: main loop stalled {stalled:.0f} s; {held >> 20} MB held, {swapped >> 20} MB of it in swap"
+    counts = [f"{name} +{after[name] - before.get(name, after[name])}" for name in ("high", "max", "oom_kill")
+              if name in after]
+    return line + (f"; memory.events {', '.join(counts)}" if counts else "")
 
 
 def find_chat(key: str, indexes: Iterable[tuple[str, ChatIndex]]) -> Optional[tuple[str, str]]:
@@ -298,6 +318,7 @@ def debug_info(calls: str, missing: Optional[list[str]], sandboxed: bool, device
         f"Desktop: {GLib.getenv('XDG_CURRENT_DESKTOP') or 'unknown'} ({GLib.getenv('XDG_SESSION_TYPE') or 'unknown'})",
         f"Sandboxed (Flatpak or Snap): {'yes' if sandboxed else 'no'}",
         f"Calls: {calls}",
+        camera_fix_line(),
         f"Codecs for videos and voice messages: {codecs}",
         *devices,
     ]) + "\n"
@@ -326,12 +347,21 @@ class Natter(Adw.Application):
         self._after_unlock: Optional[Callable[[], None]] = None
         self._last_activity = awake_time()
         self._fresh_timer = 0
+        # Natter's own watch on its pages' memory (memguard.py, started in do_startup), and the
+        # kernel's counts for its unit (system.memory_events): as at the last look, how many of
+        # its oom_kills have been seen, and when each of those no page has claimed yet was
+        # (ended_for_memory).
+        self.memory_guard: Optional[MemoryGuard] = None
+        self._memory_events: dict[str, int] = {}
+        self._oom_kills = 0
+        self._oom_unclaimed: list[float] = []
         self._media: Optional[tuple[list[str], str]] = None
         self._media_waiting: list[Callable[[list[str], str], None]] = []
         self._media_checked = False
         self._media_banner = False  # some media can't play, and Preferences hasn't been opened since
         self._told: set[str] = set()  # one-time notices already given this session
         self._linking: set[str] = set()  # accounts whose "needs linking" was seen or announced
+        self._memory_told: set[str] = set()  # accounts with a notification out that their page stopped
         self._tray_menu_shown: list[tuple] = []
         self.calls: Optional[CallWindow] = None
         # Calls made by WhatsApp in Natter's own page, its data channels done by GStreamer (rtc.py).
@@ -352,7 +382,11 @@ class Natter(Adw.Application):
         self.microphone_present: Optional[bool] = None
         self._media_watchers: dict[int, Callable[[], None]] = {}
         self._media_watch_next = 0
+        # Natter's own question to the desktop about the camera (ask_camera): who waits on its
+        # answer while it's out, and the answer Natter kept before it was asked.
         self._asking_camera = False
+        self._camera_waiting: list[Callable[[Optional[str]], None]] = []
+        self._camera_gate_before: Optional[str] = None
         self._camera_gate_was: Optional[str] = None  # the desktop's answer as Natter last acted on it
         self.add_main_option("background", ord("b"), GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
                              "Start in the background, without opening the window", None)
@@ -381,9 +415,13 @@ class Natter(Adw.Application):
     def do_startup(self) -> None:
         # Only the first instance gets here. Group Natter's processes under a scope of its
         # own before WebKit starts any (Ada's launcher already makes one; a terminal doesn't).
-        self.scope = move_to_own_scope()
+        accounts = len(self.settings["accounts"])
+        self.scope = move_to_own_scope(accounts=accounts)
         if self.scope is None:
-            limit_own_scope()  # a launcher's scope (Ada's): the same backstop as Natter's own
+            limit_own_scope(accounts)  # a launcher's scope (Ada's): the same backstop as Natter's own
+        # Counted from here: an oom_kill from before this start (in a launcher's scope) isn't a page's.
+        self._memory_events = memory_events()
+        self._oom_kills = self._unit_events().get("oom_kill", 0)
         Adw.Application.do_startup(self)
         Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(str(ICONS))
         Gtk.Window.set_default_icon_name(DEFAULT_APP_ID)  # a separate instance (NATTER_APP_ID) has no icon of its own
@@ -396,6 +434,13 @@ class Natter(Adw.Application):
         # for its menu entry on some desktops): WebKit's processes, started later, need it set.
         self.calls_in_page = GLib.getenv("NATTER_CALLS") != "window" and rtc.available()
         self._make_web_context()
+        # WebKit's own limit (MEMORY_KILL) can't stop a page that grows while it's busy, or into
+        # swap: the guard looks at every page from a thread of Natter's own, window shown or not,
+        # and ends one past its limit (a crash its view puts down to memory: Account._on_crash).
+        # A call gets more room, as ending the page would end it.
+        total = mem_total()
+        self.memory_guard = MemoryGuard(page_limit(total), calling=lambda: self.calling, ceiling=page_ceiling(total))
+        self.memory_guard.start()
         self._apply_spelling()
 
         bus = self.get_dbus_connection()
@@ -469,6 +514,9 @@ class Natter(Adw.Application):
         page.connect("activate", lambda _a, v: v.get_string() in PREFERENCES_PAGES
                      and self.show_preferences(v.get_string()))
         self.add_action(page)
+        account = Gio.SimpleAction.new("show-account", GLib.VariantType("s"))  # by its id
+        account.connect("activate", lambda _a, v: self.open_account(v.get_string()))
+        self.add_action(account)
         open_chat = Gio.SimpleAction.new("open-chat", GLib.VariantType("(ss)"))
         open_chat.connect("activate", lambda _a, v: self.open_chat(v[0], v[1]))
         self.add_action(open_chat)
@@ -512,9 +560,9 @@ class Natter(Adw.Application):
             path, lambda target: self._page_snapshot(self.window.account, target)))
         # "/path/file.png": what Ctrl+V does with a picture once it's read.
         add("debug-attach", lambda path: self.window and self.window.account and self.window.account.attach(
-            [Path(path)], lambda ok: print("natter: attached:", ok, flush=True)))
+            [Path(path)], lambda ok: print("natter: attached:", ok, flush=True), how="debug"))
         # "/path/file.pdf": what dropping that file on the chat does.
-        add("debug-drop", lambda path: self.send_files([Path(path)]))
+        add("debug-drop", lambda path: self.send_files([Path(path)], "debug"))
 
     def _snapshot(self, path: str, save: Callable[[str], None]) -> None:
         target = snapshot_path(path)
@@ -596,26 +644,30 @@ class Natter(Adw.Application):
         sandbox after the first it started, and that one is gone, so the portal now refuses every
         web process's camera with an error, not an answer. WebKit 2.52 waits for an answer on the
         page's main thread, spinning, for good: WhatsApp's next device listing (a call, a voice
-        message) would never finish, and would hold a processor core while it waits. Nothing in a
-        page's permissions stops a listing (WebKit lists before it asks), so the pages lose the
-        microphone and camera altogether until NAME starts again: calls and voice messages say
-        they can't, rather than hang. Only natively: in the Flatpak each sandbox is its own."""
+        message) would never finish, and would hold a processor core while it waits. That's for a
+        new web process (a fresh page, one after a crash): the page that's up was named while the
+        anchor lived, and keeps working. Nothing in a page's permissions stops a listing (WebKit
+        lists before it asks), so pages loaded from now on have no microphone or camera until
+        Natter starts again (Account.lose_media): calls and voice messages say they can't, rather
+        than hang. Only natively: in the Flatpak each sandbox is its own."""
         if self._quitting or self.media_lost:
             return
         nick = getattr(reason, "value_nick", str(reason))
         if in_sandbox():
             print(f"natter: WebKit's first sandbox stopped ({nick})", flush=True)
             return
-        print(f"natter: WebKit's first sandbox stopped ({nick}); the microphone and camera are off "
-              f"for WhatsApp until {NAME} restarts", flush=True)
+        print(f"natter: WebKit's first sandbox stopped ({nick}); WhatsApp's pages loaded from now on have "
+              f"no microphone or camera until {NAME} restarts", flush=True)
         self.media_lost = True
         for account in self.accounts:
             account.lose_media()
+        # Worded to be true whether the page that's up keeps them or was ended along with the
+        # anchor (the kernel short of memory takes both), and as Preferences says it.
         if self.window is not None and self.window.get_visible():
-            self.window.toast(f"Restart {NAME} to use the microphone and camera again", timeout=10)
+            self.window.toast(f"Restart {NAME} to use the microphone and camera", timeout=10)
         elif self.window is not None:
             self.tell("media-lost", f"Restart {NAME} to use the microphone and camera",
-                      "Calls and voice messages can't use them until then.")
+                      f"Calls and voice messages may not be able to use them until {NAME} restarts.")
         self._media_changed()
 
     def _build(self, hidden: bool = False) -> bool:
@@ -692,6 +744,7 @@ class Natter(Adw.Application):
             ("download-done", self._on_download),
             ("call-requested", lambda a, video: self.start_call(a, video)),
             ("in-call", self._on_page_call),
+            ("memory-ended", self._on_memory_ended),
         )]
         self.accounts.append(account)
         self.window.add_account(account)
@@ -739,7 +792,7 @@ class Natter(Adw.Application):
             if not self._held_while_locked(lambda link=link: (self.window.account or self.accounts[0]).open_link(link)):
                 (self.window.account or self.accounts[0]).open_link(link)
         if files:
-            self.go_to_chat(files)
+            self.go_to_chat(files, how="share")
         return 0
 
     def _devices_changed(self) -> None:
@@ -755,6 +808,7 @@ class Natter(Adw.Application):
         self._window_services = True
         self.audio_follower.start()
         self.desktop_media = DesktopMedia(self._on_desktop_media, self.get_dbus_connection())
+        self._camera_gate_was = self.camera_gate()  # "waiting", until the store answers
         self._check_microphone()
         if calls_available() and not self.calls_in_page:
             microphone, camera = self._call_window_media()
@@ -775,6 +829,14 @@ class Natter(Adw.Application):
 
     def account_by_id(self, account_id: Optional[str]) -> Optional[Account]:
         return next((a for a in self.accounts if a.id == account_id), None)
+
+    def open_account(self, account_id: str) -> None:
+        """The window, on the account with this id (a toast's Show, a notification about it)."""
+        if self._held_while_locked(lambda: self.open_account(account_id)):
+            return
+        account = self.account_by_id(account_id)
+        if self.present_window() and account is not None:
+            self.window.show_account(account)
 
     # ---- The app lock -----------------------------------------------------------------------
 
@@ -934,13 +996,14 @@ class Natter(Adw.Application):
 
     # ---- Chats -----------------------------------------------------------------------------
 
-    def go_to_chat(self, files: Optional[list[Path]] = None, query: str = "") -> None:
+    def go_to_chat(self, files: Optional[list[Path]] = None, query: str = "", how: str = "") -> None:
+        """Ctrl+K's chat search; with `files`, Send To, for files that came `how` (Account.attach)."""
         from .palette import Palette
 
-        if self._held_while_locked(lambda: self.go_to_chat(files, query)):
+        if self._held_while_locked(lambda: self.go_to_chat(files, query, how)):
             return
         if self.present_window():
-            Palette(self, files, query).present(self.window)
+            Palette(self, files, query, how).present(self.window)
 
     def open_chat(self, account_id: str, name: str) -> None:
         """Open a chat given by account id: from desktop search or the open-chat action."""
@@ -948,8 +1011,9 @@ class Natter(Adw.Application):
             return
         self.go_to(self.account_by_id(account_id), name)
 
-    def go_to(self, account: Optional[Account], name: str, files: Optional[list[Path]] = None) -> None:
-        if self._held_while_locked(lambda: self.go_to(account, name, files)):
+    def go_to(self, account: Optional[Account], name: str, files: Optional[list[Path]] = None,
+              how: str = "") -> None:
+        if self._held_while_locked(lambda: self.go_to(account, name, files, how)):
             return
         if account is None or not self.present_window():
             return
@@ -959,16 +1023,17 @@ class Natter(Adw.Application):
             if not ok:
                 self.window.toast(f"Couldn't find “{name}” in WhatsApp's chat list")
             elif files:
-                account.attach(files, lambda sent: sent or self.window.toast("WhatsApp didn't take the files"))
+                account.attach(files, lambda sent: sent or self.window.toast("WhatsApp didn't take the files"), how)
 
         account.open_chat(name, opened)
 
-    def message_number(self, account: Account, digits: str, files: Optional[list[Path]] = None) -> None:
+    def message_number(self, account: Account, digits: str, files: Optional[list[Path]] = None,
+                       how: str = "") -> None:
         self.present_window()
         self.window.show_account(account)
         account.open_link(f"https://wa.me/{digits}")
         if files:
-            account.when_ready(lambda: GLib.timeout_add(1500, lambda: account.attach(files) and False))
+            account.when_ready(lambda: GLib.timeout_add(1500, lambda: account.attach(files, how=how) and False))
 
     def _search_chats(self) -> list[tuple[str, str, Chat]]:
         """Every account's chats for desktop search. A Natter started just for a search reads
@@ -1116,22 +1181,23 @@ class Natter(Adw.Application):
 
         def got(paths: list[Path]) -> None:
             if paths:
-                self.send_files(paths)
+                self.send_files(paths, "paste")
             else:
                 account.view.execute_editing_command(WebKit.EDITING_COMMAND_PASTE)
 
         return clipboard.read(window.get_clipboard(), got)
 
-    def send_files(self, paths: list[Path]) -> None:
-        """Files pasted or dropped on the window: into the open chat, or ask which chat."""
-        if self._held_while_locked(lambda: self.send_files(paths)):
+    def send_files(self, paths: list[Path], how: str = "") -> None:
+        """Files pasted or dropped on the window (`how`: "paste", "drop"): into the open chat,
+        or ask which chat."""
+        if self._held_while_locked(lambda: self.send_files(paths, how)):
             return
         window = self.window
         account = window.account if window else None
         if account is None or not paths:
             return
         if not account.active_chat:
-            self.go_to_chat(paths)
+            self.go_to_chat(paths, how=how)
             return
         def done(ok: bool) -> None:
             if GLib.getenv("NATTER_DEBUG"):
@@ -1139,7 +1205,7 @@ class Natter(Adw.Application):
             if not ok:
                 window.toast("WhatsApp didn't take the files")
 
-        account.attach(paths, done)
+        account.attach(paths, done, how)
 
     # ---- Unread, notifications, focus -----------------------------------------------------
 
@@ -1153,7 +1219,10 @@ class Natter(Adw.Application):
         self._refresh_tray()
 
     def _on_account_state(self, account: Account) -> None:
-        self._show_unread()  # the window says when an account needs linking
+        self._show_unread()  # the window says when an account needs linking, or has stopped
+        if account.id in self._memory_told and not account.memory_stopped:
+            self._memory_told.discard(account.id)  # loaded again (Try Again): the notification is out of date
+            self.withdraw_notification(f"memory-{account.id}")
         hidden = not (self.window and self.window.get_visible())
         if account.ready:
             self._linking.discard(account.id)  # linked again (not just reloading: that says nothing yet)
@@ -1183,15 +1252,20 @@ class Natter(Adw.Application):
         self.tell("page-changed", "WhatsApp has changed its layout",
                   f"Some of {NAME}'s extras may pause until an update ({', '.join(missing)}).")
 
-    def tell(self, key: str, title: str, body: str = "", button: Optional[tuple[str, str, GLib.Variant]] = None) -> None:
-        """A desktop notification from Natter itself, not from a chat. Clicking it opens the window."""
+    def tell(self, key: str, title: str, body: str = "", button: Optional[tuple[str, str, GLib.Variant]] = None,
+             account: Optional[Account] = None) -> None:
+        """A desktop notification from Natter itself, not from a chat. Clicking it opens the
+        window, on `account` when it's about one."""
         notification = Gio.Notification.new(title)
         if body:
             notification.set_body(body)
         notification.set_icon(app_icon())
-        notification.set_default_action("app.show")
+        if account is not None:
+            notification.set_default_action_and_target("app.show-account", GLib.Variant("s", account.id))
+        else:
+            notification.set_default_action("app.show")
         if button:
-            notification.add_button_with_target_value(*button)
+            notification.add_button_with_target(*button)  # PyGObject's name for add_button_with_target_value
         self.send_notification(key, notification)
 
     def _on_notify_message(self, account: Account, page_id: int, title: str, body: str, tag: str, icon: str) -> None:
@@ -1312,11 +1386,18 @@ class Natter(Adw.Application):
     def camera_gate(self) -> Optional[str]:
         """The desktop's answer about the camera that Natter keeps itself (media.refusal):
         natively, where WebKit can find the camera without the portal (camera_fallback) and the
-        call window's Chromium always does. None in the Flatpak, where the portal keeps it, and
-        while it isn't known."""
-        if self.desktop_media is None or self.desktop_media.sandboxed:
+        call window's Chromium always does. "no" also while the desktop has cameras off for
+        every app (the portal would refuse them all), "waiting" while its store hasn't answered
+        (a "no" may be stored), "ask" with nothing stored. None in the Flatpak, where the portal
+        keeps it, and where there's no store."""
+        desktop = self.desktop_media
+        if desktop is None or desktop.sandboxed:
             return None
-        return self.desktop_media.answer
+        if desktop.lockdown:
+            return "no"
+        if not desktop.known:
+            return "waiting"
+        return desktop.answer
 
     def media_state(self, kind: str) -> dict:
         """What's known about the microphone or the camera (`kind`), for Preferences' line under
@@ -1327,7 +1408,8 @@ class Natter(Adw.Application):
         desktop = self.desktop_media
         sandboxed = desktop.sandboxed if desktop is not None else in_sandbox()
         if kind == "camera":
-            answer = desktop.answer if desktop is not None else None
+            # Natively the answer Natter keeps (a stored "ask" is a no to it, "waiting" until it's read).
+            answer = None if desktop is None else desktop.answer if sandboxed else self.camera_gate()
             present = desktop.present if desktop is not None else None
             lockdown = bool(desktop is not None and desktop.lockdown)
         else:
@@ -1381,41 +1463,60 @@ class Natter(Adw.Application):
         self.window.toast(title)
 
     def _on_desktop_media(self) -> None:
-        """The desktop's answer, its camera or its lockdown changed (DesktopMedia). A new "no"
-        does what the switch turned off would; a "no" gone, what turning it on would. While Natter
-        asks again itself, the answers it passes through on the way don't count."""
-        if not self._asking_camera:
-            gate, was = self.camera_gate(), self._camera_gate_was
-            self._camera_gate_was = gate
-            if gate == "no" and was != "no":
-                self._media_stopped([account for account in self.accounts if account.stop_media("camera")],
-                                    "Your desktop blocked the camera. WhatsApp's video has stopped")
-            elif was == "no" and gate != "no":
-                for account in self.accounts:
-                    account.media_allowed_again("camera")
+        """The desktop's answer, its camera or its lockdown changed (DesktopMedia). A new refusal
+        (a "no", its lockdown) does what the switch turned off would, at once, also while Natter
+        asks the desktop itself: what was allowed meanwhile mustn't outlast it. A refusal gone
+        does what turning it on would, but not for the answers a question of Natter's own passes
+        through on its way (a forgotten "no" reads "ask"): ask_camera sees to that once it's
+        answered."""
+        gate, was = self.camera_gate(), self._camera_gate_was
+        self._camera_gate_was = gate
+        blocked, was_blocked = (media.refusal("camera", True, answer) is not None for answer in (gate, was))
+        if blocked and not was_blocked:
+            self._media_stopped([account for account in self.accounts if account.stop_media("camera")],
+                                "Your desktop blocked the camera. WhatsApp's video has stopped")
+        elif was_blocked and not blocked and not self._asking_camera:
+            for account in self.accounts:
+                account.media_allowed_again("camera")
         if self.calls is not None:
             self.calls.set_media(*self._call_window_media())
         self._media_changed()
 
-    def ask_camera_again(self, done: Callable[[Optional[str]], None]) -> None:
-        """Have the desktop ask again whether Natter may use the camera (media.ask_camera_again),
-        once the user has said yes to that in Natter. `done(answer)`: "yes", "no", or None when
-        the desktop couldn't be asked. One question at a time."""
-        bus = None if self._asking_camera else media.private_bus()
+    def ask_camera(self, done: Callable[[Optional[str]], None], again: bool = False) -> None:
+        """Have the desktop ask whether Natter may use the camera (media.ask_camera_again): for
+        WhatsApp's request when nothing is stored (Account._on_media_request), or `again`, once
+        the user has said yes to that in Natter, forgetting its "no" first. `done(answer)`:
+        "yes", "no", or None when the desktop couldn't be asked. One question at a time: asked
+        while one is out, `done` hears that one's answer."""
+        if self._asking_camera:
+            self._camera_waiting.append(done)
+            return
+        bus = media.private_bus()
         if bus is None:
             done(None)
             return
-        self._asking_camera = True
+        self._asking_camera, self._camera_waiting = True, [done]
+        self._camera_gate_before = self.camera_gate()
 
         def asked(answer: Optional[str]) -> None:
+            waiting, self._camera_waiting = self._camera_waiting, []
             self._asking_camera = False
             bus.close(None, None)
+            # Refused before the question: its answer is weighed against that, not against the
+            # answers on the way, so a yes does what turning the camera on would.
+            if media.refusal("camera", True, self._camera_gate_before) is not None:
+                self._camera_gate_was = self._camera_gate_before
             if self.desktop_media is not None:
                 self.desktop_media.asked(answer)  # and reads the store again
             self._on_desktop_media()
-            done(answer)
+            for wants in waiting:
+                wants(answer)
 
-        media.ask_camera_again(bus, asked)
+        media.ask_camera_again(bus, asked, forget=again)
+
+    def ask_camera_again(self, done: Callable[[Optional[str]], None]) -> None:
+        """Preferences → Ask Again…: the desktop asks again, its "no" forgotten (ask_camera)."""
+        self.ask_camera(done, again=True)
 
     def _check_microphone(self) -> None:
         """Whether there's a microphone (media.microphone_present), on a thread: pactl is a
@@ -1548,10 +1649,11 @@ class Natter(Adw.Application):
         """WebKit's network process holds all of WhatsApp's connections: its websocket, its
         database, every load. When it dies WebKit starts another, but the page stays cut off from
         it (its database calls fail, its loads fail) and WhatsApp never recovers on its own."""
-        now = time.monotonic()
+        now, events = time.monotonic(), memory_events()
         if now - self._last_look > THAW_GAP:
-            self._thawed(now - self._last_look)
-        self._last_look = now
+            self._thawed(now - self._last_look, self._memory_events, events)
+        self._last_look, self._memory_events = now, events
+        self._note_oom_kills(events if in_own_scope() else {}, now)
         found = network_processes()
         lost = self._network_processes - found
         self._network_processes = found
@@ -1571,9 +1673,60 @@ class Natter(Adw.Application):
               f"{own_swap() >> 20} MB in swap)", flush=True)
         return GLib.SOURCE_REMOVE
 
-    def _thawed(self, paused: float) -> None:
-        print(f"natter: running again after about {paused:.0f} s paused; {footprint() >> 20} MB held", flush=True)
+    def _thawed(self, stalled: float, before: dict[str, int], after: dict[str, int]) -> None:
+        print(stall_line(stalled, footprint(), own_swap(), before, after), flush=True)
         self._fresh_pages_for_memory()
+
+    def ended_for_memory(self) -> Optional[str]:
+        """Who ended the page that just stopped (a crash, to WebKit) for the memory it held: "the
+        guard" (memguard.py), "the kernel" (at the unit's MemoryMax, system.py; memory.events
+        counts it), else None. Each ending answers once: WebKit reports it to the one view whose
+        page it was."""
+        if self.memory_guard is not None and self.memory_guard.recent_kill():
+            return "the guard"
+        self._note_oom_kills(self._unit_events(), time.monotonic())
+        if self._oom_unclaimed:
+            self._oom_unclaimed.pop(0)
+            return "the kernel"
+        return None
+
+    def _unit_events(self) -> dict[str, int]:
+        """memory.events of Natter's own unit; empty in another's (a terminal's, a session's),
+        whose counts are other programs' too."""
+        return memory_events() if in_own_scope() else {}
+
+    def _note_oom_kills(self, events: dict[str, int], now: float) -> None:
+        """Note the processes the kernel ended in Natter's unit since the last look (`events`'
+        oom_kill), each with when it was first seen. One that no page's crash claims within
+        KILL_MEMORY wasn't a page's (the sandbox anchor, WebKit's network process, the call
+        window), and is forgotten: kept, it would be pinned on a later, ordinary crash."""
+        count = events.get("oom_kill")
+        if count is None:
+            return
+        if count < self._oom_kills:  # first counted in another cgroup, before Natter's own took over
+            self._oom_kills = count
+        self._oom_unclaimed += [now] * (count - self._oom_kills)
+        self._oom_kills = count
+        self._oom_unclaimed = [seen for seen in self._oom_unclaimed if now - seen <= KILL_MEMORY]
+
+    def _on_memory_ended(self, account: Account, stopped: bool) -> None:
+        """An account's page was ended for its memory (Account._on_memory_ended): reloaded, or
+        `stopped` after twice. WhatsApp reloading in front of you, or not coming back, needs a
+        word: a toast while you're using the window, with a way to that account when another is
+        shown. Otherwise (hidden, behind other windows, minimized, locked: a toast would go
+        unseen) a reload goes unsaid, but a stop is said in a notification that opens that
+        account: no messages arrive until WhatsApp is reloaded there."""
+        several = len(self.accounts) > 1
+        where = f" ({account.name})" if several else ""
+        if self.window is not None and self.window.is_active() and not self.locked:
+            elsewhere = several and self.window.account is not account
+            self.window.toast(f"WhatsApp used too much memory and was {'stopped' if stopped else 'reloaded'}{where}",
+                              *(("Show", "app.show-account", GLib.Variant("s", account.id)) if elsewhere else ()),
+                              timeout=8)
+        elif stopped:
+            self._memory_told.add(account.id)
+            self.tell(f"memory-{account.id}", f"WhatsApp used too much memory{where}",
+                      f"It won't reload on its own. Open {NAME} and choose Try Again.", account=account)
 
     def _on_terminate(self) -> bool:
         print("natter: asked to stop (SIGTERM); quitting", flush=True)
@@ -1732,8 +1885,12 @@ class Natter(Adw.Application):
                                      "startup settings:")
         # A label of its own, so the command can be selected. It wraps between words only: broken
         # inside the app id, the command reads wrong, so the dialog grows to fit the id instead.
-        alert.set_extra_child(Gtk.Label(label=command, selectable=True, wrap=True, wrap_mode=Pango.WrapMode.WORD,
-                                        css_classes=["monospace"]))
+        label = Gtk.Label(label=command, selectable=True, wrap=True, wrap_mode=Pango.WrapMode.WORD,
+                          css_classes=["monospace"])
+        # Out of the focus chain (selectable made it focusable): as the dialog's first focus it
+        # would open with all of it selected. Co_py Command is the way in from the keyboard.
+        label.set_focusable(False)
+        alert.set_extra_child(label)
         alert.add_response("close", "_Close")
         alert.add_response("copy", "Co_py Command")  # "_Close" has C
         alert.set_response_appearance("copy", Adw.ResponseAppearance.SUGGESTED)
@@ -1918,6 +2075,7 @@ class Natter(Adw.Application):
         info = {"id": f"account-{n}", "name": f"Account {len(self.accounts) + 1}"}
         self.settings["accounts"] = self.settings["accounts"] + [info]
         account = self._make_account(info)
+        limit_own_scope(len(self.accounts))  # room for one more page's call engine
         self.window.show_account(account)
         self.window.toast("Scan the code with WhatsApp on your phone to link this account")
         return account
@@ -1934,12 +2092,16 @@ class Natter(Adw.Application):
         if len(self.accounts) < 2:
             return
         self.notifier.withdraw(account.id)
+        if account.id in self._memory_told:
+            self._memory_told.discard(account.id)
+            self.withdraw_notification(f"memory-{account.id}")
         self.window.remove_account(account)
         self.accounts.remove(account)
         self._after_call.discard(account)
         for handler in getattr(account, "app_handlers", []):
             account.disconnect(handler)
         self.settings["accounts"] = [a for a in self.settings["accounts"] if a["id"] != account.id]
+        limit_own_scope(len(self.accounts))
 
         def removed() -> None:
             # Only once WebKit has let go of the session's files.
@@ -2028,6 +2190,8 @@ class Natter(Adw.Application):
         self.reclaimer.stop()
         self.call_sound.stop()
         self.audio_follower.stop()
+        if self.memory_guard is not None:
+            self.memory_guard.stop()  # the pages end now: nothing for it to watch
         if self.ada_style is not None:
             self.ada_style.close()
             self.ada_style = None

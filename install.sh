@@ -19,6 +19,8 @@ SYMBOLIC="$DATA/icons/hicolor/symbolic/apps"
 SEARCH="$DATA/gnome-shell/search-providers"
 SERVICES="$DATA/dbus-1/services"
 AUTOSTART="$CONFIG/autostart"
+# The camera fix's GStreamer plugin (natter/camfix), where natter/gstfix.py looks for it.
+CAMFIX_DIR="$HOME/.local/lib/natter/gstreamer-1.0"
 
 # $1 made safe as the replacement in a sed s|…|…| command.
 sed_escape() { printf '%s\n' "$1" | sed -e 's/[\\&|]/\\&/g'; }
@@ -62,6 +64,40 @@ refresh_caches() {
     if command -v gtk-update-icon-cache >/dev/null; then gtk-update-icon-cache -q -t "$DATA/icons/hicolor" 2>/dev/null || true; fi
 }
 
+# The camera fix: WebKit's camera freezes on its first frame with GStreamer 1.28 and newer, and
+# natter/camfix/nattercamfix.c, a GStreamer tracer, prevents it (natter/gstfix.py turns it on only
+# where it's needed). Built when there's a C compiler, pkg-config and GStreamer's headers; Natter
+# runs without it. $1: the Python that runs Natter, which tells whether GStreamer needs it.
+build_camfix() {
+    python="$1"
+    # The compiler, as make takes $CC: a command that may carry arguments ("ccache gcc", "gcc -m64").
+    # Split into this function's own arguments ($1 is the program); no file name globbing.
+    set -f
+    # shellcheck disable=SC2086
+    set -- ${CC:-cc}
+    set +f
+    if ! command -v "$1" >/dev/null 2>&1 || ! command -v pkg-config >/dev/null 2>&1 ||
+        ! pkg-config --exists gstreamer-1.0 2>/dev/null; then
+        # A hint only where the camera needs it: GStreamer 1.28 or newer (or a version unknown).
+        if "$python" -c 'import sys; sys.path.insert(0, sys.argv[1]); from natter.gstfix import FIRST_AFFECTED, gstreamer_version
+v = gstreamer_version(); sys.exit(0 if v is None or v >= FIRST_AFFECTED else 1)' "$HERE" 2>/dev/null; then
+            echo "Note: skipped the camera fix, which needs a C compiler, pkg-config and GStreamer's headers (on Debian and Ubuntu: build-essential pkg-config libgstreamer1.0-dev); without it the camera can freeze in calls. Run this again once they're installed."
+        fi
+        return 0
+    fi
+    echo "==> Building the camera fix into $CAMFIX_DIR"
+    mkdir -p "$CAMFIX_DIR"
+    # Built beside the old one and moved over it, so a running Natter keeps the copy it loaded.
+    # shellcheck disable=SC2046  # pkg-config's flags are meant to split
+    if "$@" -shared -fPIC -O2 -Wall -o "$CAMFIX_DIR/libnattercamfix.so.new" "$HERE/natter/camfix/nattercamfix.c" \
+            $(pkg-config --cflags --libs gstreamer-1.0); then
+        mv -f "$CAMFIX_DIR/libnattercamfix.so.new" "$CAMFIX_DIR/libnattercamfix.so"
+    else
+        rm -f "$CAMFIX_DIR/libnattercamfix.so.new"
+        echo "Note: the camera fix didn't build (see above); $APP_NAME works without it, but the camera can freeze in calls."
+    fi
+}
+
 # Whether a Natter with the id $1 is running: it owns that name on the session bus.
 running() {
     command -v gdbus >/dev/null &&
@@ -93,7 +129,8 @@ if [ -z "$FORCE" ]; then
 fi
 
 if [ -n "$UNINSTALL" ]; then
-    rm -f "$LAUNCHER" "$AUTOSTART/$APP_ID.desktop" "$AUTOSTART/$OLD_APP_ID.desktop"
+    rm -f "$LAUNCHER" "$AUTOSTART/$APP_ID.desktop" "$AUTOSTART/$OLD_APP_ID.desktop" "$CAMFIX_DIR/libnattercamfix.so"
+    rmdir "$CAMFIX_DIR" "$(dirname "$CAMFIX_DIR")" 2>/dev/null || true
     remove_installed "$APP_ID"
     remove_installed "$OLD_APP_ID"
     refresh_caches
@@ -142,6 +179,7 @@ case ":$PATH:" in
     *":$BIN:"*) ;;
     *) echo "Note: $BIN isn't on your PATH, so typing 'natter' in a terminal won't find it. The menu entry works anyway." ;;
 esac
+build_camfix "$PYTHON"
 
 echo "==> Installing the menu entry, icons and desktop search"
 EXEC="$(exec_quote "$LAUNCHER")"

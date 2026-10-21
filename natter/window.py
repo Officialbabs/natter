@@ -148,13 +148,14 @@ def drop_description(chat: str, blurred: bool) -> str:
     return "" if blurred else f"To {chat}"
 
 
-def tab_look(needs_link: bool, reloading: bool, unread: int) -> tuple[str, int]:
+def tab_look(needs_link: bool, reloading: bool, unread: int, stopped: bool = False) -> tuple[str, int]:
     """An account's tab: its icon and badge. With several accounts the tabs replace the header's
-    subtitle, so a tab says itself that its account is reloading or needs linking (and one that
-    needs linking has no chats to count)."""
+    subtitle, so a tab says itself that its account is reloading, needs linking, or has stopped
+    (WhatsApp won't come back there until Try Again). One that needs linking has no chats to
+    count, and one that stopped no count to trust."""
     if reloading:
         return "view-refresh-symbolic", unread
-    if needs_link:
+    if needs_link or stopped:
         return "dialog-warning-symbolic", 0
     return ACCOUNT_ICON, unread
 
@@ -163,16 +164,20 @@ def refused_toast(kind: str, reason: str, account: str = "") -> tuple[str, str, 
     """The toast for WhatsApp being refused the microphone or the camera (`kind`), as (title,
     button, action, target). Refused by NAME's own switch ("off"), it offers to turn it on, never
     to switch it over, so an old toast can't turn it off again. Refused because the desktop said no
-    ("desktop"), it points to Privacy, which says what NAME can do about that. `account` names the
-    account WhatsApp asked in, for when there are several."""
+    ("desktop"), or before its answer could be read ("waiting"), it points to Privacy, which says
+    what NAME can do about that. `account` names the account WhatsApp asked in, for when there are
+    several, as the app's other media toasts do."""
     if reason == "desktop":
         title = f"Your desktop blocks the {kind} for {NAME}"
+        button, action, target = "Details", "app.preferences-page", GLib.Variant("s", "privacy")
+    elif reason == "waiting":
+        title = "Waiting for your desktop's privacy settings"
         button, action, target = "Details", "app.preferences-page", GLib.Variant("s", "privacy")
     else:
         title = f"The {kind} is off in {NAME}"
         button, action, target = "Turn On", "app.allow-media", GLib.Variant("s", kind)
     if account:
-        title = f"{account}: {title[0].lower()}{title[1:]}"
+        title += f" ({account})"
     return title, button, action, target
 
 
@@ -234,7 +239,11 @@ class AccountPage(Gtk.Overlay):
 
     def _show_state(self) -> None:
         account = self.account
-        if account.crashing:
+        if account.crashing and account.memory_stopped:
+            self.notice.set_icon_name("dialog-warning-symbolic")
+            self.notice.set_title("WhatsApp Used Too Much Memory")
+            self.notice.set_description("Its page grew too big twice in ten minutes, so it won't reopen on its own.")
+        elif account.crashing:
             self.notice.set_icon_name("dialog-warning-symbolic")
             self.notice.set_title("WhatsApp Keeps Stopping")
             self.notice.set_description("Its page closed three times in two minutes, so it won't reopen on its own.")
@@ -245,7 +254,9 @@ class AccountPage(Gtk.Overlay):
                 f"Check your internet connection. {NAME} tries again as soon as you're back online.", -1))
         self.detail.set_label(account.failed or "")
         self.detail.set_visible(bool(account.failed) and not account.crashing)
-        self.software.set_visible(bool(account.crashing) and self.settings["hardware_acceleration"])
+        # Graphics drivers can make a page crash; they don't make it grow.
+        self.software.set_visible(bool(account.crashing) and not account.memory_stopped
+                                  and self.settings["hardware_acceleration"])
         self.notice.set_visible(bool(account.crashing or account.failed))
 
     def _turn_off_acceleration(self) -> None:
@@ -513,14 +524,15 @@ class Window(Adw.ApplicationWindow):
         account.view.grab_focus()
 
     def show_status(self, total: int) -> None:
-        """The unread count, whether an account needs linking or is reloading, in the title and on each tab."""
+        """The unread count, whether an account needs linking, is reloading or has stopped, in the
+        title and on each tab."""
         for account in self.app.accounts:
             page = self.pages.get(account.id)
             if page is not None:
-                icon, badge = tab_look(account.needs_link, account.reloading, account.unread)
+                icon, badge = tab_look(account.needs_link, account.reloading, account.unread, account.crashing)
                 page.set_icon_name(icon)
                 page.set_badge_number(badge)
-                page.set_needs_attention(account.unread > 0 or account.needs_link)
+                page.set_needs_attention(account.unread > 0 or account.needs_link or account.crashing)
         self._show_subtitle()
         self._show_reloading()
         self.set_title(f"({total}) {NAME}" if total else NAME)
@@ -612,13 +624,13 @@ class Window(Adw.ApplicationWindow):
         if not paths:
             self.toast("Only files can be dropped here (not folders)")
             return False
-        self.app.send_files(paths)
+        self.app.send_files(paths, "drop")
         return True
 
     def _media_refused(self, account: Account, kind: str, reason: str) -> None:
         """WhatsApp asked for the microphone or the camera, and NAME said no (Account's
         media-refused): say why, with what to do about it."""
-        if kind not in ("microphone", "camera") or reason not in ("off", "desktop") or self.app.locked:
+        if kind not in ("microphone", "camera") or reason not in ("off", "desktop", "waiting") or self.app.locked:
             return  # behind the lock it would wait unseen, and be out of date by the time it showed
         now = time.monotonic()
         if not refused_due(self._refused_at.get(kind), now):
@@ -641,13 +653,19 @@ class Window(Adw.ApplicationWindow):
 
     def toast(self, title: str, button: Optional[str] = None, action: Optional[str] = None,
               target: Optional[GLib.Variant] = None, timeout: int = 4) -> None:
+        """A toast where it can be seen: over Preferences while that's open (the window's own
+        are under it, and a sheet on a narrow window covers them whole), else the window's."""
         toast = Adw.Toast(title=title, timeout=timeout, use_markup=False)
         if button and action:
             toast.set_button_label(button)
             toast.set_action_name(action)
             if target is not None:
                 toast.set_action_target_value(target)
-        self.toasts.add_toast(toast)
+        dialog = self.get_visible_dialog()
+        if isinstance(dialog, Adw.PreferencesDialog):  # other dialogs have no toasts of their own
+            dialog.add_toast(toast)
+        else:
+            self.toasts.add_toast(toast)
 
     def set_banner(self, title: str, button: str = "", action: str = "",
                    target: Optional[GLib.Variant] = None) -> None:
