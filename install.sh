@@ -217,6 +217,7 @@ fi
 # whatsapp:// links: take them only if no other app had them (ZapZap, say) or the old Natter
 # did, and say so explicitly, since Natter's entry in ~/.local would otherwise win on its own.
 if command -v xdg-mime >/dev/null; then
+    mkdir -p "$CONFIG"  # xdg-mime writes mimeapps.list there and fails if the folder isn't there yet
     case "$handler" in
         "" | "$APP_ID.desktop" | "$OLD_APP_ID.desktop")
             xdg-mime default "$APP_ID.desktop" x-scheme-handler/whatsapp ;;
