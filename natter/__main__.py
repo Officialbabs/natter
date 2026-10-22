@@ -32,26 +32,122 @@ def too_old(found: dict[str, tuple[int, ...]]) -> list[str]:
 
 def problems() -> list[str]:
     """What stops Natter from running here, in words; empty when nothing does."""
+    old, missing = _problems()
+    return old + missing
+
+
+def _problems() -> tuple[list[str], list[str]]:
+    """problems(), as (versions too old, what isn't installed). NATTER_TEST_MISSING (test-only,
+    see distro.py) can add to what isn't installed, never take anything away."""
+    from .distro import pretend_missing
+
+    pretend = pretend_missing()
     try:
+        if "gi" in pretend:
+            raise ImportError("NATTER_TEST_MISSING")
         import gi
     except ImportError:
-        return ["PyGObject (GTK for Python) isn't installed"]
+        return [], ["PyGObject (GTK for Python) isn't installed"]
     old = too_old({"PyGObject": tuple(gi.version_info)})
     missing = []
     for namespace, version, name in LIBRARIES:
         try:
             gi.require_version(namespace, version)
+            if namespace in pretend:
+                raise ValueError("NATTER_TEST_MISSING")
         except ValueError:
             missing.append(f"{name} for Python isn't installed")
     if missing:
-        return old + missing
+        return old, missing
     from gi.repository import Adw, Gtk, WebKit
 
     return old + too_old({
         "GTK": (Gtk.get_major_version(), Gtk.get_minor_version(), Gtk.get_micro_version()),
         "libadwaita": (Adw.get_major_version(), Adw.get_minor_version(), Adw.get_micro_version()),
         "WebKitGTK": (WebKit.get_major_version(), WebKit.get_minor_version(), WebKit.get_micro_version()),
-    })
+    }), []
+
+
+# The GStreamer elements calls need (rtc.available(), kept in step by tests/test_install_deps.py),
+# by the piece (distro.PIECES) whose packages bring them.
+CALL_ELEMENTS = {"webrtc": ("webrtcbin", "sctpenc", "sctpdec", "dtlsenc"), "nice": ("nicesrc",)}
+# The introspection data for each piece that is one, as gi.require_version takes it.
+TYPELIBS = {"Gtk": "4.0", "Adw": "1", "WebKit": "6.0", "Soup": "3.0", "GdkPixbuf": "2.0", "Gst": "1.0",
+            "GstWebRTC": "1.0", "GstSdp": "1.0"}
+
+
+def missing_pieces(environ=None) -> set[str]:
+    """The pieces (distro.PIECES) that aren't here: what install.sh offers to install. One that
+    can't be checked (GStreamer's plugins, without GStreamer for Python) counts as missing."""
+    import os
+    import shlex
+    import shutil
+    import subprocess
+
+    from .distro import pretend_missing
+
+    environ = os.environ if environ is None else environ
+    missing = pretend_missing(environ)
+    try:
+        if "gi" in missing:
+            raise ImportError("NATTER_TEST_MISSING")
+        import gi
+    except ImportError:
+        missing |= {"gi", *TYPELIBS}
+    else:
+        for namespace, version in TYPELIBS.items():
+            try:
+                gi.require_version(namespace, version)
+            except ValueError:
+                missing.add(namespace)
+    if "Gst" in missing:
+        missing |= {"codecs", *CALL_ELEMENTS}
+    else:
+        try:
+            from gi.repository import Gst
+
+            from .system import media_report
+
+            Gst.init(None)
+            for piece, elements in CALL_ELEMENTS.items():
+                if not all(Gst.ElementFactory.find(name) for name in elements):
+                    missing.add(piece)
+            if media_report()[0]:
+                missing.add("codecs")
+        except Exception:
+            missing |= {"codecs", *CALL_ELEMENTS}
+    # The camera fix's build, as install.sh's build_camfix does it: $CC (make's: "ccache gcc"…).
+    try:
+        compiler = shlex.split(environ.get("CC") or "cc")[0]
+    except (ValueError, IndexError):
+        compiler = "cc"
+    if not shutil.which(compiler, path=environ.get("PATH")):
+        missing.add("cc")
+    pkg_config = shutil.which("pkg-config", path=environ.get("PATH"))
+    if not pkg_config:
+        missing |= {"pkg-config", "gst-dev"}
+    else:
+        try:
+            headers = subprocess.run([pkg_config, "--exists", "gstreamer-1.0"], timeout=30).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            headers = False
+        if not headers:
+            missing.add("gst-dev")
+    return missing
+
+
+def deps() -> int:
+    """For install.sh: what's missing here, by group, and the packages that bring it on this
+    distribution (distro.report says how it's written). The camera fix's build tools only where
+    GStreamer is 1.28 or newer, where the fix is needed."""
+    from .distro import PIECE, REQUIRED, os_release, report
+    from .gstfix import FIRST_AFFECTED, gstreamer_version
+
+    missing = missing_pieces()
+    old = [] if any(PIECE[name].group == REQUIRED for name in missing if name in PIECE) else _problems()[0]
+    version = gstreamer_version()
+    print("\n".join(report(os_release(), missing, old, optional=version is not None and version >= FIRST_AFFECTED)))
+    return 0
 
 
 def explain(trouble: list[str]) -> None:

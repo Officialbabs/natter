@@ -1,0 +1,72 @@
+# Maintainer: Oluwasegun Babalola <133790822+Officialbabs@users.noreply.github.com>
+
+pkgname=natter-den-git
+pkgver=r6.ab3e527
+pkgrel=1
+pkgdesc='Unofficial WhatsApp client that fits your desktop'
+arch=(x86_64 aarch64)
+url='https://github.com/Officialbabs/natter'
+license=(GPL-3.0-or-later)
+depends=(
+  python
+  python-gobject
+  glib2
+  gtk4
+  libadwaita
+  webkitgtk-6.0
+  libsoup3
+  gdk-pixbuf2
+  hicolor-icon-theme
+  # WhatsApp's videos (H.264, AAC) and voice messages (Opus); the camera fix links GStreamer and glibc
+  glibc
+  gstreamer
+  gst-plugins-base
+  gst-plugins-base-libs
+  gst-plugins-good
+  gst-libav
+  # Calls inside Natter Den: webrtcbin, SCTP, DTLS, SRTP, libnice's GStreamer plugin, and
+  # openssl for the call's certificate (rtc.py, where python-cryptography isn't installed)
+  gst-plugins-bad
+  gst-plugins-bad-libs
+  libnice
+  openssl
+)
+makedepends=(git meson)
+optdepends=(
+  'gst-plugin-pipewire: cameras through PipeWire'
+  "xdg-desktop-portal: the desktop's camera permission, running in the background"
+  'gnome-shell-extension-appindicator: the tray icon on GNOME'
+  'python-pyqt6-webengine: calls in a separate window (NATTER_CALLS=window)'
+)
+provides=(natter-den)
+conflicts=(natter-den)
+source=('git+https://github.com/Officialbabs/natter.git')
+sha256sums=('SKIP')
+
+pkgver() {
+  cd natter
+  printf 'r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+build() {
+  arch-meson natter build
+  meson compile -C build
+}
+
+check() {
+  # In a home of their own: the tests make Natter's folders, and must not reach a running Natter Den.
+  local home="$srcdir/check-home"
+  mkdir -p "$home/run"
+  chmod 700 "$home/run"
+  env -u DISPLAY -u WAYLAND_DISPLAY \
+    HOME="$home" XDG_CONFIG_HOME="$home/.config" XDG_DATA_HOME="$home/.local/share" \
+    XDG_CACHE_HOME="$home/.cache" XDG_RUNTIME_DIR="$home/run" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$home/run/no-bus" \
+    meson test -C build --print-errorlogs
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+  # meson.build leaves byte-compiling to the packager when installing into a DESTDIR.
+  python -m compileall -q -d /usr/share/natter "$pkgdir/usr/share/natter"
+}

@@ -12,10 +12,43 @@
 WhatsApp for Linux that feels like part of your desktop. Natter Den shows WhatsApp Web in
 a native GTK 4 / libadwaita window and connects it to the rest of the desktop:
 notifications, the dock, the tray and the keyboard. It works on GNOME, KDE Plasma, Xfce,
-Sway, Ada and the rest, installed from a checkout or as a Flatpak.
+Sway, Ada and the rest.
 
 Natter Den is unofficial: it isn't made by, endorsed by or affiliated with WhatsApp or Meta. It
 runs the real WhatsApp Web and nothing else, the same way your browser would.
+
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Officialbabs/natter/master/get.sh | sh
+```
+
+Then open Natter Den from your apps and scan the code with WhatsApp on your phone (*Settings →
+Linked devices*). To update, run the same command again.
+
+That works as it is on Ubuntu 24.04, Debian 13, Fedora 40, Arch, openSUSE Tumbleweed and their
+newer releases and derivatives. If a package is missing, it says which, and the command that
+installs it.
+
+- **Arch and derivatives:** the command above works there too. For a system-wide package instead,
+  run `makepkg -si` in [packaging/aur/natter-den-git](packaging/aur/natter-den-git) (an AUR listing will follow).
+- **From a downloaded copy or zip:** run `sh install.sh` in its folder. (The one-line command above
+  needs the GitHub repository to be public.)
+- **Older systems** (Ubuntu 22.04, Debian 12, openSUSE Leap 15), **Fedora Atomic and Bazzite:**
+  get the Flatpak instead, which brings everything it needs:
+  ```sh
+  curl -fsSL https://raw.githubusercontent.com/Officialbabs/natter/master/get.sh | sh -s -- --flatpak
+  ```
+- **Uninstall:** `~/.local/lib/natter/source/install.sh --uninstall && rm -rf ~/.local/lib/natter`.
+  The Flatpak: `flatpak uninstall --user io.github.Officialbabs.Natter && rm -rf ~/.local/lib/natter/source ~/.cache/natter-den-flatpak`.
+  Your WhatsApp sessions stay in `~/.local/share/natter` (the Flatpak's in
+  `~/.var/app/io.github.Officialbabs.Natter`) until you delete them.
+
+[get.sh](get.sh) installs Natter Den for you alone: it fetches it into
+`~/.local/lib/natter/source` and runs its `install.sh`, which lists anything your system is
+missing and asks once before installing it with your package manager (`sudo` asks for your
+password). To read it first, download it and run `sh get.sh`. The steps by hand are in
+[Install in detail](#install-in-detail).
 
 ## What it does that a browser tab (or ZapZap) doesn't
 
@@ -92,18 +125,20 @@ through the Background portal (where the desktop's portals offer it, as GNOME's 
 elsewhere the switch turns itself back off), and the dock badge and recent chats in the dock
 menu aren't available (the tray shows the count). Desktop search works the same.
 
-## Install
+## Install in detail
+
+[The command above](#install) does what this section says, for you. These are the steps by hand.
 
 ### Flatpak
 
 The Flatpak brings its own GTK, libadwaita, WebKitGTK and codecs, so it runs on any
 distribution, old ones included. It needs `flatpak` and `flatpak-builder` (on Ubuntu and Debian:
 `sudo apt install flatpak flatpak-builder`) and the Flathub remote. To build and install it from a
-checkout:
+checkout, for you alone (`get.sh --flatpak` does the same, building in `~/.cache/natter-den-flatpak`):
 
 ```sh
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-flatpak install flathub org.gnome.Sdk//50 org.gnome.Platform//50
+flatpak install --user flathub org.gnome.Sdk//50 org.gnome.Platform//50
 flatpak-builder --user --install --force-clean build-flatpak packaging/io.github.Officialbabs.Natter.yml
 flatpak run io.github.Officialbabs.Natter
 ```
@@ -155,27 +190,45 @@ introspection data. Without them Natter Den still runs, and calls open in your b
 sudo apt install gstreamer1.0-plugins-bad gstreamer1.0-nice gir1.2-gst-plugins-bad-1.0 gir1.2-gst-plugins-base-1.0
 ```
 
-Then:
+Then get the source and install it:
 
 ```sh
-./install.sh            # adds Natter Den to your apps and `natter` to ~/.local/bin
+git clone https://github.com/Officialbabs/natter.git ~/natter
+cd ~/natter && ./install.sh   # adds Natter Den to your apps and `natter` to ~/.local/bin
 ```
 
-`install.sh` picks the Python that has everything (the system's `/usr/bin/python3` first),
-writes `~/.local/bin/natter` for it, pointing at this checkout, and installs the menu entry,
-icons, desktop search files and the `whatsapp://` handler (unless another app already has
-it). It says if `~/.local/bin` isn't on your `PATH`, or if codecs are missing. While Natter Den is
-running it stops and asks you to quit it first; `--force` goes ahead anyway.
+`install.sh` checks what Natter Den needs. If packages are missing, it lists them in three
+groups and asks once whether to install them with your package manager (apt-get, dnf, pacman or
+zypper, through `sudo`):
+
+- **Required:** for Natter Den to run.
+- **Recommended:** the codecs WhatsApp's videos and voice messages need, and GStreamer's WebRTC
+  parts for calls.
+- **Optional:** a compiler and GStreamer's headers, to build the camera fix. Asked for only with
+  GStreamer 1.28 or newer.
+
+It asks on the terminal, so it also works through `curl … | sh`. Then it picks the Python that
+has everything (the system's `/usr/bin/python3` first), writes `~/.local/bin/natter` for it,
+pointing at this checkout, and installs the menu entry, icons, desktop search files and the
+`whatsapp://` handler (unless another app already has it). It says if `~/.local/bin` isn't on
+your `PATH`. While Natter Den is running it stops and asks you to quit it first; `--force` goes
+ahead anyway. `--yes` installs missing packages without asking; `--no-deps` never installs (it
+prints the command and stops if a required package is missing), and neither does a run with no
+terminal to ask on. On a release too old for Natter Den (Ubuntu 22.04, Debian 12, openSUSE
+Leap 15…) it says so and points to the Flatpak. The package names for each distribution are in
+`natter/distro.py`.
 
 Open Natter Den and scan the code with WhatsApp on your phone (*Settings → Linked devices*).
-`./install.sh --uninstall` removes it all; your sessions stay in `~/.local/share/natter`
-until you delete that folder.
+To update, `git pull` and run `./install.sh` again. `./install.sh --uninstall` removes it all;
+your sessions stay in `~/.local/share/natter` until you delete that folder.
 
 ### Packages
 
 `meson.build` installs Natter Den the way distribution packages want it: the `natter` package in
 `/usr/share/natter`, the `natter` command, desktop file, icons, AppStream metainfo, D-Bus
-service and search provider. The Flatpak builds with it too.
+service and search provider. The Flatpak builds with it too. On Arch and its derivatives,
+[packaging/aur/natter-den-git](packaging/aur/natter-den-git) has a PKGBUILD (`makepkg -si`); it isn't on
+the AUR yet.
 
 ```sh
 meson setup build --prefix=/usr && meson install -C build

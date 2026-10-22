@@ -2,6 +2,10 @@
 # Natter for one user, run from this checkout: the `natter` command, the menu entry, icons,
 # desktop search and whatsapp:// links. `./install.sh --uninstall` removes them. Either stops
 # while Natter runs, unless --force is given too.
+# First it installs the packages Natter needs and this system lacks, with the distribution's
+# package manager and sudo, once the person agrees on the terminal: --yes agrees without asking,
+# --no-deps never installs (it says what to install, and stops if Natter can't run without it).
+# With no terminal to ask on and no --yes, nothing is installed, as with --no-deps.
 # (Distribution packages and the Flatpak install with meson.build instead.)
 set -e
 APP_ID=io.github.Officialbabs.Natter
@@ -107,11 +111,15 @@ running() {
 
 UNINSTALL=""
 FORCE=""
+YES=""
+NO_DEPS=""
 for arg in "$@"; do
     case "$arg" in
         --uninstall) UNINSTALL=1 ;;
         --force) FORCE=1 ;;
-        *) echo "Usage: $0 [--uninstall] [--force]" >&2; exit 2 ;;
+        --yes | -y) YES=1 ;;
+        --no-deps) NO_DEPS=1 ;;
+        *) echo "Usage: $0 [--yes | --no-deps] [--force] | --uninstall [--force]" >&2; exit 2 ;;
     esac
 done
 
@@ -145,13 +153,201 @@ CHECK='import sys
 if sys.version_info < (3, 9):
     sys.exit("Natter Den needs Python 3.9 or newer, and this is Python %d.%d: install the Natter Den Flatpak instead (see README.md)." % sys.version_info[:2])
 sys.path.insert(0, sys.argv[1]); from natter.__main__ import check; sys.exit(check())'
-PYTHON=""
-for candidate in /usr/bin/python3 "$(command -v python3 || true)"; do
-    if [ -n "$candidate" ] && [ -x "$candidate" ] && "$candidate" -c "$CHECK" "$HERE" >/dev/null 2>&1; then
-        PYTHON="$candidate"
-        break
+find_python() {
+    PYTHON=""
+    for candidate in /usr/bin/python3 "$(command -v python3 || true)"; do
+        if [ -n "$candidate" ] && [ -x "$candidate" ] && "$candidate" -c "$CHECK" "$HERE" >/dev/null 2>&1; then
+            PYTHON="$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# The first Python there is, which says what's missing (it needs no PyGObject for that).
+any_python() {
+    if [ -x /usr/bin/python3 ]; then echo /usr/bin/python3; else command -v python3 || true; fi
+}
+
+# What's missing here and the packages that bring it on this distribution, a group per line:
+# natter/__main__.py's deps(), with the package names in natter/distro.py.
+DEPS='import sys
+if sys.version_info < (3, 9):
+    sys.exit(1)
+sys.path.insert(0, sys.argv[1]); from natter.__main__ import deps; sys.exit(deps())'
+
+# The rest of the report's line that starts with the word $1 ("" when there's none).
+field() { printf '%s\n' "$REPORT" | sed -n "s/^$1 //p" | head -n 1; }
+
+# Whether there's a terminal to ask on. Under "curl … | sh" stdin is the script, but /dev/tty is
+# still the person's terminal.
+have_tty() { (: </dev/tty >/dev/tty) 2>/dev/null; }
+
+# Ask $1 on the terminal: yes unless the answer is no. --yes says yes without asking.
+ask() {
+    if [ -n "$YES" ]; then return 0; fi
+    printf '%s [Y/n] ' "$1" >/dev/tty
+    answer=""
+    if ! read -r answer </dev/tty; then
+        echo >/dev/tty
+        return 1
     fi
-done
+    case "$answer" in
+        "" | [Yy]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# The package manager's install command, as people type it.
+install_words() {
+    case "$MANAGER" in
+        apt) echo "apt-get install" ;;
+        dnf) echo "dnf install" ;;
+        pacman) echo "pacman -S --needed" ;;
+        zypper) echo "zypper install" ;;
+    esac
+}
+
+# The command that installs the packages $@, to show.
+shown() { echo "${SUDO:+sudo }$(install_words) $*"; }
+
+# Install the packages $@, as root, answering the package manager's own question: the person
+# agreed to these already.
+run_install() {
+    case "$MANAGER" in
+        apt) set -- apt-get install -y "$@" ;;
+        dnf) set -- dnf install -y "$@" ;;
+        pacman) set -- pacman -S --needed --noconfirm "$@" ;;
+        zypper) set -- zypper --non-interactive install "$@" ;;
+    esac
+    if [ -n "$SUDO" ]; then set -- sudo "$@"; fi
+    if have_tty; then "$@" </dev/tty; else "$@" </dev/null; fi
+}
+
+# This system is too old for Natter as it is, for the reason $1: the Flatpak is the way.
+too_old() {
+    echo "$APP_NAME can't run here as it is: $1."
+    echo "This system is too old for the native version of $APP_NAME. Install its Flatpak instead, which"
+    echo "brings everything it needs and runs on older systems too: see \"Flatpak\" in README.md."
+    if [ -f "$HERE/get.sh" ]; then
+        echo "  sh \"$HERE/get.sh\" --flatpak   # builds and installs it for you"
+    fi
+}
+
+# Offer to install what Natter needs and this system lacks, in three groups: required (Natter
+# doesn't run without it), recommended (WhatsApp's media and calls) and optional (the camera
+# fix's build tools, where GStreamer needs the fix). Never runs sudo unless the person agrees,
+# or gave --yes. Exits when Natter still can't run; on a distribution whose packages Natter
+# doesn't know by name, it leaves that to the start-up check's own explanation.
+get_missing() {
+    py="${PYTHON:-$(any_python)}"  # the one that runs Natter, when there is one
+    if [ -z "$py" ]; then return 0; fi
+    REPORT="$("$py" -c "$DEPS" "$HERE" 2>/dev/null)" || REPORT=""
+    MANAGER="$(field manager)"
+    required="$(field required)"
+    recommended="$(field recommended)"
+    optional="$(field optional)"
+    reason="$(field too-old)"
+    if [ -n "$reason" ] && [ -z "$PYTHON" ]; then
+        too_old "$reason"
+        exit 1
+    fi
+    if [ -z "$MANAGER" ]; then
+        # A distribution whose packages Natter doesn't know by name: what's missing, in words.
+        # (Natter can't run either: the start-up check's own explanation says so, below.)
+        if [ -n "$PYTHON" ]; then
+            words="$(field recommended-words)"
+            if [ -n "$words" ]; then echo "Recommended, and not installed here (your distribution's packages have them): $words."; fi
+            words="$(field optional-words)"
+            if [ -n "$words" ]; then echo "Optional, to build the camera fix, and not installed here: $words."; fi
+        fi
+        return 0
+    fi
+    if [ -z "$required$recommended$optional" ]; then return 0; fi
+
+    if [ "$(id -u)" -eq 0 ]; then SUDO=""; can=1
+    elif command -v sudo >/dev/null 2>&1; then SUDO=sudo; can=1
+    else SUDO=""; can=""
+    fi
+    echo "$APP_NAME needs packages that aren't installed here:"
+    if [ -n "$required" ]; then
+        echo "  Required, for $APP_NAME to run:"
+        echo "    $required"
+    fi
+    if [ -n "$recommended" ]; then
+        echo "  Recommended, for WhatsApp's videos and voice messages, and for calls:"
+        echo "    $recommended"
+    fi
+    if [ -n "$optional" ]; then
+        echo "  Optional, to build the camera fix (without it the camera can freeze in calls):"
+        echo "    $optional"
+    fi
+    printf '%s\n' "$REPORT" | sed -n 's/^note /Note: /p'
+
+    # Lists of package names, one word each: unquoted, they join with single spaces.
+    # shellcheck disable=SC2086
+    main="$(echo $required $recommended)"
+    chosen=""
+    left="$main $optional"
+    if [ -n "$NO_DEPS" ]; then
+        :
+    elif [ -z "$can" ]; then
+        echo "There's no sudo here to install them with: install them as root."
+    elif [ -z "$YES" ] && ! have_tty; then
+        echo "There's no terminal to ask on, so nothing was installed: run this with --yes to install them."
+    else
+        left=""
+        if [ -n "$main" ]; then
+            if [ -n "$required" ] && [ -n "$recommended" ]; then what="the required and recommended ones"
+            elif [ -n "$required" ]; then what="the required ones"
+            else what="the recommended ones"
+            fi
+            if ask "Install $what now ($(shown "…"))?"; then chosen="$main"; else left="$main"; fi
+        fi
+        if [ -n "$optional" ] && [ -n "$required" ] && [ -z "$chosen" ]; then
+            left="$left $optional"  # no use without the required ones
+        elif [ -n "$optional" ]; then
+            if [ -n "$chosen" ]; then question="And the optional ones?"; else question="Install the optional ones now ($(shown "…"))?"; fi
+            if ask "$question"; then chosen="$chosen $optional"; else left="$left $optional"; fi
+        fi
+    fi
+    # shellcheck disable=SC2086
+    chosen="$(echo $chosen)" left="$(echo $left)"
+    installed=""
+    if [ -n "$chosen" ]; then
+        echo "==> Installing them: $(shown "$chosen")"
+        # shellcheck disable=SC2086
+        if run_install $chosen; then
+            installed="$chosen"
+        else
+            echo "Couldn't install them (see above)."
+            case "$MANAGER" in
+                apt) echo "If some couldn't be found or downloaded, update the package lists first (${SUDO:+sudo }apt-get update)." ;;
+                pacman) echo "If some couldn't be found or downloaded, update the system first (${SUDO:+sudo }pacman -Syu)." ;;
+            esac
+            # shellcheck disable=SC2086
+            left="$(echo $chosen $left)"
+        fi
+        find_python || true
+    fi
+    if [ -n "$left" ]; then
+        echo "To install them yourself:"
+        echo "  $(shown "$left")"
+    fi
+    if [ -z "$PYTHON" ]; then
+        if [ -n "$installed" ] && [ -n "$main" ] && [ "${installed#"$main"}" != "$installed" ]; then
+            "$py" -c "$CHECK" "$HERE" || true  # what's still wrong, and what to do about it
+        else
+            echo "$APP_NAME can't run without the required ones: install them, then run this again."
+        fi
+        exit 1
+    fi
+}
+
+find_python || true
+if [ -z "$NO_DEPS" ] || [ -z "$PYTHON" ]; then
+    get_missing
+fi
 if [ -z "$PYTHON" ]; then
     first="$(command -v python3 || true)"
     if [ -z "$first" ]; then
