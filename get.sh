@@ -3,9 +3,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/Officialbabs/natter/master/get.sh | sh
 #
-# Gets Natter Den's source into ~/.local/lib/natter/source (or updates it there) and runs its
-# install.sh. Run it again to update. With --flatpak it builds and installs the Flatpak instead,
-# for systems too old to run Natter Den as it is:
+# Downloads Natter Den into ~/.local/lib/natter/source (or replaces it there with the latest) and
+# runs its install.sh. Needs only curl (or wget) and tar: no git. Run it again to update. With
+# --flatpak it builds and installs the Flatpak instead, for systems too old to run Natter Den as it is:
 #
 #   curl -fsSL https://raw.githubusercontent.com/Officialbabs/natter/master/get.sh | sh -s -- --flatpak
 #
@@ -14,8 +14,8 @@ set -eu
 
 APP_ID=io.github.Officialbabs.Natter
 APP_NAME="Natter Den"
-# NATTER_REPO: another repository to clone, for testing get.sh only.
-REPO="${NATTER_REPO:-https://github.com/Officialbabs/natter.git}"
+# NATTER_ARCHIVE: another .tar.gz to install, for testing get.sh only.
+ARCHIVE="${NATTER_ARCHIVE:-https://github.com/Officialbabs/natter/archive/refs/heads/master.tar.gz}"
 GET="curl -fsSL https://raw.githubusercontent.com/Officialbabs/natter/master/get.sh | sh"
 # Next to the camera fix (install.sh's CAMFIX_DIR), away from the WhatsApp data in ~/.local/share/natter.
 SOURCE="$HOME/.local/lib/natter/source"
@@ -52,36 +52,54 @@ flatpak_missing() {
     echo "$missing"
 }
 
-# Natter Den's source in SOURCE: cloned the first time, brought up to date after that.
+# Natter Den's source in SOURCE: the latest from GitHub, as an archive (no git needed). A new
+# copy is unpacked next to SOURCE and only then put in its place, so a failed download leaves the
+# installed one as it was.
 get_source() {
-    if ! have git; then
-        echo "$APP_NAME needs git to fetch its source. Install it, then run this again:"
-        echo "  $(install_command git)"
-        exit 1
-    fi
-    if [ -e "$SOURCE/.git" ]; then
-        # Natter Den runs from SOURCE: updating it underneath a running one could break it.
-        if running; then
-            echo "$APP_NAME is running. Quit it first (Quit in its tray menu, or Ctrl+Q in its window),"
-            echo "then run this again."
-            exit 1
-        fi
-        echo "==> Updating $SHOWN"
-        if ! GIT_TERMINAL_PROMPT=0 git -C "$SOURCE" pull --ff-only --quiet </dev/null; then
-            echo "Couldn't update $SHOWN (see above). To start over: rm -rf $SHOWN, then run this again."
-            exit 1
-        fi
-    elif [ -e "$SOURCE" ]; then
-        echo "$SHOWN is there but isn't a git checkout. Move it out of the way, then run this again."
-        exit 1
+    if have curl; then fetch="curl -fsSL"
+    elif have wget; then fetch="wget -qO-"
     else
-        echo "==> Getting $APP_NAME into $SHOWN"
-        mkdir -p "$(dirname "$SOURCE")"
-        if ! GIT_TERMINAL_PROMPT=0 git clone --quiet "$REPO" "$SOURCE" </dev/null; then
-            echo "Couldn't download $APP_NAME from $REPO (see above). Check your connection, then run this again."
-            exit 1
-        fi
+        echo "$APP_NAME needs curl or wget to download itself. Install one, then run this again:"
+        echo "  $(install_command curl)"
+        exit 1
     fi
+    if ! have tar; then
+        echo "$APP_NAME needs tar to unpack itself. Install it, then run this again:"
+        echo "  $(install_command tar)"
+        exit 1
+    fi
+    if [ -e "$SOURCE" ] && ! [ -f "$SOURCE/install.sh" ]; then
+        echo "$SHOWN is there but isn't $APP_NAME. Move it out of the way, then run this again."
+        exit 1
+    fi
+    # Natter Den runs from SOURCE: replacing it underneath a running one could break it.
+    if [ -e "$SOURCE" ] && running; then
+        echo "$APP_NAME is running. Quit it first (Quit in its tray menu, or Ctrl+Q in its window),"
+        echo "then run this again."
+        exit 1
+    fi
+    mkdir -p "$(dirname "$SOURCE")"
+    work="$(mktemp -d "$(dirname "$SOURCE")/.download.XXXXXX")"
+    trap 'rm -rf "$work"' EXIT
+    echo "==> Downloading $APP_NAME"
+    # shellcheck disable=SC2086  # $fetch is the command and its options
+    if ! $fetch "$ARCHIVE" >"$work/source.tar.gz" </dev/null; then
+        echo "Couldn't download $APP_NAME. Check your connection, then run this again."
+        exit 1
+    fi
+    mkdir "$work/source"
+    if ! tar -xzf "$work/source.tar.gz" -C "$work/source" --strip-components=1 ||
+        ! [ -f "$work/source/install.sh" ]; then
+        echo "The download wasn't a complete copy of $APP_NAME. Run this again in a moment."
+        exit 1
+    fi
+    if [ -e "$SOURCE" ]; then
+        echo "==> Updating $SHOWN"
+        mv "$SOURCE" "$work/old"
+    else
+        echo "==> Putting $APP_NAME in $SHOWN"
+    fi
+    mv "$work/source" "$SOURCE"
 }
 
 # Whether Natter Den runs here as the system is: its own start-up check, with the Pythons
@@ -105,14 +123,10 @@ running() {
 }
 
 install_native() {
-    if have pacman; then
-        if pacman -Qq natter-den-git >/dev/null 2>&1; then
-            echo "$APP_NAME is already installed as a system package (natter-den-git). To update it, run"
-            echo "makepkg -si again in packaging/aur/natter-den-git of a fresh copy of the source."
-            exit 0
-        fi
-        echo "Note: this installs $APP_NAME for you alone. For a system-wide Arch package instead, run"
-        echo "makepkg -si in packaging/aur/natter-den-git of the source."
+    if have pacman && pacman -Qq natter-den-git >/dev/null 2>&1; then
+        echo "$APP_NAME is already installed as a system package (natter-den-git): update it the way"
+        echo "you installed it."
+        exit 0
     fi
     old="$(launcher_dir)"
     get_source
