@@ -52,6 +52,7 @@ password). To read it first, download it and run `sh get.sh`. The steps by hand 
 |---|---|
 | **Native** | libadwaita window in the system's light or dark style (or the one you pick), on the system's WebKitGTK instead of a bundled Chromium. |
 | **One notification per chat** | New messages replace that chat's notification and add a count, with the sender's picture. Clicking one opens that exact chat. *Mute for an hour* is right on the notification. |
+| **Reply from the notification** | Reply on a message's notification opens a small window with that chat's latest messages: type, and press Enter (Shift+Enter starts a new line). On KDE Plasma, when notifications show who wrote, you can type right in the notification. Natter Den sends it the way you would: WhatsApp opens that chat, your words go into its empty message box, and its Send button is pressed once. It checks it's the right chat first, never touches words you left unsent there, never tries twice, and never starts a send while Natter Den is locked ([how](#replies-from-notifications)). *Show Reply Button* in Preferences → Notifications turns it off. |
 | **Quiet hours** | No notifications in a time window you choose; the unread count still updates. |
 | **Do not disturb** | From the tray or Ctrl+K: pause notifications for an hour, two, or until you turn them back on. |
 | **Unread count** | In the tray, on each account's tab, and on the dock icon where the dock shows badges. |
@@ -62,7 +63,7 @@ password). To read it first, download it and run `sh get.sh`. The steps by hand 
 | **WhatsApp links** | `wa.me/…`, `api.whatsapp.com/send…` and `whatsapp://` links open in Natter Den, both from other apps and from inside chats, and so do group invites (`chat.whatsapp.com/…`, with WhatsApp's own *Join group* preview) and channels (`whatsapp.com/channel/…`). Other links open in your browser. |
 | **Themes** | In Preferences → Appearance: Den (the default, in the icon's orange); WhatsApp's own 22 chat themes, with WhatsApp's names and colours in the order its picker has them (WhatsApp green, Pearl indigo, Tyrian purple, Sunset orange, Merino teal, Royal blue, Dark cerulean, Charcoal green, Persian plum, Dune mono, Default blue, Default mono, Sky blue, Brown, Cream, Emerald, Lemon, Lime, Pink, Red, Sunrise orange, Warm yellow); Custom, a theme in any colour you pick, made the way WhatsApp makes its own; or Plain for WhatsApp's and your system's own colours. Each recolours the accent, links, read ticks, sent bubbles and chat background on WhatsApp's page and the accent in Natter Den's window, in light and dark, and switches live. Light, Dark or Follow System passes through to WhatsApp; on Ada, Follow System follows Ada's own Light, Dark or Dune. Themes only redefine WhatsApp's colour names in a local style sheet: nothing is loaded, clicked or stored in WhatsApp ([how](#themes)). |
 | **Privacy blur** | Ctrl+Shift+B blurs names, pictures and messages until you point at them. It can also blur everything while Natter Den is in the background. |
-| **App lock** | A passcode keeps WhatsApp out of sight: when Natter Den starts, when its window closes, or after being idle; Ctrl+L locks it now. While it's locked, notifications don't say who wrote or what, and recent chats leave the dock and search. |
+| **App lock** | A passcode keeps WhatsApp out of sight: when Natter Den starts, when its window closes, or after being idle; Ctrl+L locks it now. While it's locked, notifications don't say who wrote or what, their Reply asks for the passcode first, and recent chats leave the dock and search. While the passcode is on screen, the account behind it keeps loading for up to two minutes, so its chats are there when you unlock. |
 | **Microphone and camera** | Switches in Preferences → Privacy, the main menu and Ctrl+K turn them off for WhatsApp, the way a browser blocks a site; turned off during a call, that device stops at once. If your desktop has blocked the camera, Natter Den says so and can have your desktop ask again (in the Flatpak, it shows where to allow it). |
 | **Multiple accounts** | Each with its own session. Ctrl+1, Ctrl+2… switch between them. |
 | **Stays out of the way** | Closing the window keeps Natter Den in the tray. It can start hidden at login. The tray menu keeps to the essentials: show or hide, privacy blur, pause notifications, lock and quit. |
@@ -100,6 +101,7 @@ desktop:
 | | GNOME | KDE Plasma | Ada | Xfce | Sway |
 |---|---|---|---|---|---|
 | Notifications, one per chat, click to open | ✓ | ✓ | ✓ | ✓ | ✓ with a notification daemon (mako, dunst, SwayNC) |
+| Reply from a notification | ✓ reply window | ✓ typed in the notification (the reply window in the Flatpak, or while notifications hide who wrote) | ✓ reply window ([docs/ada.md](docs/ada.md)) | ✓ reply window | ✓ reply window, with a daemon that shows actions; typed in the notification where the daemon offers KDE's inline reply |
 | Tray icon with unread count and menu | with the AppIndicator extension (on by default in Ubuntu) | ✓ | ✓ | ✓ Status Tray plugin | ✓ Waybar's tray; swaybar's shows the icon and opens Natter Den on a click, but has no menu |
 | Unread badge on the dock icon | Ubuntu Dock, Dash to Dock | ✓ | ✓ | – | – |
 | Recent chats in the dock's right-click menu | ✓ | ✓ | ✓ | – | – |
@@ -303,6 +305,34 @@ hash rather than by name on the command line.
 Desktop search answers from the chat lists on disk: a search doesn't start WhatsApp. The
 provider file says `AutoStart=false`, so the desktop only asks a Natter Den that's already running.
 
+### Replies from notifications
+
+A reply goes through WhatsApp's own page, the way you would send it by hand, once for each time
+you press Send:
+
+1. WhatsApp's own handler for its notification opens the chat by its id (unless that chat is
+   open already).
+2. The bridge checks the open chat is that chat, by the chat id in its messages' keys, not by
+   its name, and that its message box is empty: words you left there are never touched.
+3. Your words go into the box through the page's own editing commands, a line at a time, and
+   must land exactly as you typed them (WhatsApp's own swap of `:-)` for an emoji aside).
+4. WhatsApp's Send button is pressed once, never the Enter key, and the reply counts as sent
+   when WhatsApp empties the box or shows your new message.
+
+Anything that doesn't look right stops it before Send, and the reply window says why and keeps
+your words: a picture waiting to be sent, a profile or a new group open in WhatsApp, a voice
+message being recorded or waiting to be sent, a draft or a message you were replying to in that
+chat, a chat that takes no messages from you, a call. These are looked at whether Natter Den's
+window is open or not, as WhatsApp keeps them while it's hidden. If Send was pressed but the
+reply wasn't seen to go, it says so and doesn't send again. Nothing is read from or written to
+WhatsApp's code or storage, and a notification's id and actions name no chat (each has a random
+reference), as desktops may keep them. While a reply is under way nothing else acts on that page,
+and a hidden window's page isn't slowed down meanwhile. A locked Natter Den starts no send: Reply
+asks for the passcode first, words typed in a KDE notification while it's locked wait in the
+reply window until you press Send, and a reply window the lock closes with words in it comes back
+after the passcode. Natter Den's log says how each reply ended (`natter: reply: sent`), never who
+to or what.
+
 ### Themes
 
 WhatsApp Web paints through its own colour names (`--WDS-accent`,
@@ -470,11 +500,20 @@ says where to look in `natter/bridge.js`:
 | call buttons in `#main header`, by their label, title or icon name ("call", "video") | calls opening in the browser |
 | the search box in `#side`, and the message box in `#main footer` | opening chats by name, pasting files |
 | WhatsApp's colour names (`--WDS-accent`, `--WDS-surface-default-RGB` and the rest) and its `body.dark` class | themes: when they're gone, the theme comes off that page and WhatsApp's own colours stay (`natter/themes.py`) |
+| the open chat's messages' keys (`#main [data-id]`, `<mine>_<chat id>_<id>`), its message box in `#main footer`, and the Send button by its icon's name ("send") | replies from notifications |
+| `[data-testid="drawer-left"]` and `[data-testid="drawer-middle"]`, which WhatsApp keeps in the page and fills when a profile, a new group or a picture to send is open | replies waiting rather than closing what's open |
+| the row of the message box in `#main footer` (the box, up to the voice message button by its icon's name), with nothing else shown in the footer | replies not going out as a reply to a message picked in WhatsApp; a voice message's controls by their icons' names |
+
+When a landmark replies lean on moves, replies stop before Send and the log says which
+(`natter: reply: mismatch (no-ids)`, `left-as-draft (no-button)`); a footer laid out anew could
+make every reply stop as `draft (quote)`. *Show Reply Button* in Preferences → Notifications takes
+Reply off notifications until there's a fix.
 
 The link screen, filter chips and call buttons are the least sure: so far only the mock
-confirms them. `tests/mock-whatsapp.html` copies these landmarks, so you can try changes
-without your account. Run it as a separate instance, with its own app id and folders, so it
-doesn't touch the Natter Den you use:
+confirms them. So are the reply landmarks: they're read from WhatsApp Web's own code, but not
+yet seen on a live chat. `tests/mock-whatsapp.html` copies these landmarks, so you can try
+changes without your account. Run it as a separate instance, with its own app id and folders,
+so it doesn't touch the Natter Den you use:
 
 ```sh
 NATTER_APP_ID=io.github.Officialbabs.Natter.Dev XDG_CONFIG_HOME=/tmp/nd/config \

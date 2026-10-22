@@ -383,7 +383,7 @@ class AttachLogTest(unittest.TestCase):
                          "natter: attach: 1 file, 0.0 MB, image/png, via share")
 
     def test_attach_logs_before_anything_else(self):
-        page = SimpleNamespace(run=lambda *args: None, _picked=None)
+        page = SimpleNamespace(run=lambda *args: None, _picked=None, _held=lambda run: False)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             Account.attach(page, [Path("/nonexistent/clip.webm")], None, "paste")

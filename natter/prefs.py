@@ -588,13 +588,15 @@ class Preferences(Adw.PreferencesDialog):
         page = Adw.PreferencesPage(name="notifications", title="Notifications",
                                    icon_name="preferences-system-notifications-symbolic")
         group = Adw.PreferencesGroup(
-            description="One notification per chat, replaced as new messages come in. Clicking it opens that chat. "
-                        "Sounds follow WhatsApp's own setting, under Settings → Notifications in WhatsApp.")
+            description="One notification per chat, replaced as new messages come in. Clicking it opens that chat; "
+                        "Reply answers it in a small window. Sounds follow WhatsApp's own setting, under Settings → "
+                        "Notifications in WhatsApp.")
         shown = self._switch("notifications", "Show Notifications")
         group.add(shown)
         sender = self._switch("notify_sender", "Show Who It's From", "Their name and picture")
         preview = self._switch("notify_preview", "Show Message Text")
-        for row in (sender, preview):
+        reply = self._switch("notify_reply", "Show Reply Button", f"Answer a message without opening {NAME}")
+        for row in (sender, preview, reply):
             shown.bind_property("active", row, "sensitive", SYNC)
             group.add(row)
         page.add(group)
@@ -743,7 +745,8 @@ class Preferences(Adw.PreferencesDialog):
         group = Adw.PreferencesGroup(
             title="Lock", description="Hides WhatsApp behind a passcode while you're away. Ctrl+L locks now.")
         self.lock_switch = Adw.SwitchRow(title="Lock With a Passcode",
-                                         subtitle="While locked, notifications and recent chats don't show names",
+                                         subtitle="While locked, notifications and recent chats don't show names, "
+                                                  "and Reply asks for the passcode first",
                                          active=bool(self.settings["lock_hash"]))
         self.lock_switch.connect("notify::active", self._lock_switched)
         group.add(self.lock_switch)

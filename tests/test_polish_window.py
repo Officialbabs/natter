@@ -360,7 +360,7 @@ class ToastTest(unittest.TestCase):
     def test_over_preferences(self):
         adw = self.adw()
         dialog = adw.PreferencesDialog()
-        fake = Fake(toasts=Fake(), get_visible_dialog=lambda: dialog)
+        fake = Fake(toasts=Fake(), get_visible_dialog=lambda: dialog, app=SimpleNamespace(locked=False))
         with mock.patch.object(window, "Adw", adw):
             Window.toast(fake, "Microphone turned off. WhatsApp can't hear you")
         self.assertEqual(len(dialog.called("add_toast")), 1)
@@ -370,13 +370,21 @@ class ToastTest(unittest.TestCase):
     def test_in_the_window_otherwise(self):
         adw = self.adw()
         for dialog in (None, Fake()):  # no dialog, or one with no toasts of its own (an alert)
-            fake = Fake(toasts=Fake(), get_visible_dialog=lambda dialog=dialog: dialog)
+            fake = Fake(toasts=Fake(), get_visible_dialog=lambda dialog=dialog: dialog,
+                        app=SimpleNamespace(locked=False))
             with mock.patch.object(window, "Adw", adw):
                 Window.toast(fake, "Saved", "Open", "app.open-file", GLib.Variant("s", "/x"))
             toast = fake.toasts.called("add_toast")[0][0]
             self.assertEqual(toast.called("set_button_label"), [("Open",)])
             if dialog is not None:
                 self.assertEqual(dialog.called("add_toast"), [])
+
+    def test_none_while_locked(self):
+        # Unseen under the lock, but a screen reader would read it out, and some name a chat.
+        fake = Fake(toasts=Fake(), get_visible_dialog=lambda: None, app=SimpleNamespace(locked=True))
+        with mock.patch.object(window, "Adw", self.adw()):
+            Window.toast(fake, "The call window couldn't find “Mum” in its chats")
+        self.assertEqual(fake.toasts.called("add_toast"), [])
 
 
 class NoticeTest(unittest.TestCase):

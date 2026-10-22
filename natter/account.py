@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import base64
+import collections
 import json
 import os
 import re
 import secrets
 import time
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import quote, urlparse
@@ -50,6 +52,33 @@ BLANK_TRIES, BLANK_WINDOW = 3, 10 * 60  # reloads of a blank or stalled page wit
 # WebKit hands a page the microphone or camera again without asking Natter while it captures,
 # and for about this long after its last capture ended (its idle watchdog then forgets).
 GRANT_REUSE = 10 * 60
+
+# Replies from notifications (send_reply, bridge.js reply).
+REPLY_LIMIT = 4096  # UTF-16 code units, as the page counts them (reply_length): a quick reply, not an essay
+REPLY_BUDGET_MS = 25000  # the page's own time to reach the chat and press Send; it never presses later
+# How long Natter waits for the page's answer: the budget, WhatsApp emptying the box after the
+# press (10 s), and slack. Then "unknown", and the page is left alone until it answers, or until
+# REPLY_LET_GO, when Natter stops waiting for it at all.
+REPLY_GUARD = 45
+REPLY_LET_GO = 120
+REPLY_QUEUE_WAIT = 60  # seconds a reply may wait behind another before it's answered "busy", untouched
+REPLY_HELD = 8  # page actions kept for after a reply (_held), the latest
+# WhatsApp's ids for people and groups, as its notifications' tags carry them: not channels,
+# status, calls or anything else (bridge.js CHAT_ID).
+CHAT_ID = re.compile(r"\d{5,24}(-\d{5,24})?@(c\.us|g\.us|lid)")
+# What send_reply answers. Only "sent" withdraws anything; "unsure" and "unknown" may have been
+# sent and are never tried again; "left-as-draft" is typed in the chat's message box, not sent.
+# The rest typed nothing: "locked", "calling", "busy", "draft" (the chat has a draft of its own),
+# "cant-send" (the chat takes no messages from them), "mismatch" (the chat that opened isn't that
+# one), "gone" (no way to open it), "not-ready", "needs-link" (WhatsApp shows its link screen),
+# "removed", "too-long" (or nothing to send).
+REPLY_RESULTS = frozenset({"sent", "locked", "calling", "busy", "draft", "cant-send", "mismatch", "gone",
+                           "not-ready", "needs-link", "removed", "too-long", "unsure", "unknown",
+                           "left-as-draft"})
+PAGE_REPLY_RESULTS = REPLY_RESULTS - {"locked", "needs-link", "removed", "unknown"}  # what the bridge answers
+REPLY_SCRIPT = """if (!window.__natter || !window.__natter.reply) return {result: "not-ready", why: "no-bridge"};
+const result = await window.__natter.reply(request);
+return {result, why: request.why || ""};"""
 
 # After a crash the page reloads after 1, 5, 30, then 120 s; a crash more than ten minutes
 # after the one before counts as the first again. Three within two minutes is a crash loop:
@@ -214,6 +243,39 @@ def parse_message(message) -> Optional[dict]:
     return None
 
 
+def reply_length(text: str) -> int:
+    """`text`'s length as the page counts it (String.length: UTF-16 code units), for REPLY_LIMIT.
+    An emoji counts two or more."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def reply_text(text) -> str:
+    """A reply's words as they go to the page: line breaks as \\n. "" for what isn't text."""
+    return text.replace("\r\n", "\n").replace("\r", "\n") if isinstance(text, str) else ""
+
+
+def reply_answer(value) -> tuple[str, str]:
+    """The bridge's answer to a reply (REPLY_SCRIPT), checked: (result, why). Anything else, or
+    nothing (the page went, or the call failed), is "unknown": it may have been sent."""
+    if not isinstance(value, dict) or value.get("result") not in PAGE_REPLY_RESULTS:
+        return "unknown", "lost" if value is None else "odd-answer"
+    why = value.get("why")
+    return value["result"], why if isinstance(why, str) and re.fullmatch(r"[a-z-]{1,24}", why) else ""
+
+
+@dataclass(eq=False)
+class _Reply:
+    """One reply asked for (Account.send_reply), from the queue to its answer."""
+
+    page_id: int
+    chat_id: str
+    text: str
+    done: Callable[[str], None]
+    timer: int = 0  # waiting in the queue (REPLY_QUEUE_WAIT), then in the page (REPLY_GUARD, REPLY_LET_GO)
+    in_page: bool = False  # the page has it and hasn't answered
+    answered: bool = False
+
+
 def reload_delay(crashes: list[float]) -> Optional[int]:
     """Seconds to wait before reloading a page that crashed at these times; None in a crash loop.
 
@@ -350,6 +412,14 @@ class Account(GObject.Object):
         self._fresh_after_call: set[str] = set()
         # WhatsApp's camera requests waiting on Natter's own question to the desktop (_on_media_request).
         self._held_media: list = []
+        # Replies from notifications (send_reply): waiting their turn, the one whose turn it is,
+        # how many the page has and hasn't answered, and what else would act on the page
+        # meanwhile, held until it has (_held), a fresh page among them.
+        self._replies: collections.deque[_Reply] = collections.deque()
+        self._reply: Optional[_Reply] = None
+        self._in_page = 0
+        self._held_actions: list[Callable[[], None]] = []
+        self._fresh_held = False
 
         data, cache = DATA / "accounts" / self.id / "web", CACHE / "accounts" / self.id
         data.mkdir(parents=True, exist_ok=True)
@@ -537,6 +607,8 @@ class Account(GObject.Object):
 
     def open_chat(self, name: str, done: Optional[Callable[[bool], None]] = None) -> None:
         def go() -> None:
+            if self._held(go):
+                return
             self.run("return window.__natter ? await window.__natter.openChat(name) : false", {"name": name},
                      lambda ok: done(bool(ok)) if done else None)
 
@@ -549,6 +621,8 @@ class Account(GObject.Object):
 
         If the page doesn't have it (it has reloaded since, say), the chat `title` opens instead.
         """
+        if self._held(lambda: self.click_notification(page_id, title)):
+            return
         if page_id < 0:
             notification = self._fallback.pop(page_id, None)
             if notification is not None:
@@ -563,6 +637,170 @@ class Account(GObject.Object):
 
         self.run("return window.__natter ? window.__natter.clickNotification(id) : false", {"id": page_id}, clicked)
 
+    # ---- Replying from a notification ------------------------------------------------------
+    # One reply is one act of the person's, so one send through WhatsApp's own page, the way
+    # their hands would do it (bridge.js reply): never retried, never two at once in a page,
+    # never begun while Natter is locked or a call is on. The words go to the page as arguments,
+    # never in a script, and Natter's log has the outcome only: no names, ids or words.
+
+    @property
+    def replying(self) -> int:
+        """Replies the page has and hasn't answered. Meanwhile nothing else acts on the page (_held)."""
+        return self._in_page
+
+    def send_reply(self, page_id: int, chat_id: str, text: str, done: Callable[[str], None]) -> None:
+        """Send `text` to WhatsApp's chat `chat_id`, the one the page's notification `page_id`
+        came from: WhatsApp's handler for that notification opens it (unless it's open already),
+        and only if the chat that opens has that id do the words go into its message box, only
+        if the box was empty, and Send is pressed once. `done(result)` later, once, with one of
+        REPLY_RESULTS. One at a time in the page, in the order asked; the same words for the same
+        chat asked for again while the first is still going are "busy" (one act, one send).
+        """
+        job = _Reply(page_id, chat_id, reply_text(text), done)
+        refused = self._reply_refusal()
+        if self.removed:
+            self._answer(job, "removed")
+        elif not (_page_id(page_id) and isinstance(chat_id, str) and CHAT_ID.fullmatch(chat_id)):
+            self._answer(job, "gone", "not-a-chat")  # a call's, the WebKit fallback's, a status's
+        elif not job.text.strip() or reply_length(job.text) > REPLY_LIMIT:
+            self._answer(job, "too-long")
+        elif refused:
+            self._answer(job, refused)
+        elif any(other.chat_id == job.chat_id and other.text == job.text for other in self._replies_asked()):
+            self._answer(job, "busy", "repeat")
+        else:
+            self._replies.append(job)
+            job.timer = GLib.timeout_add_seconds(REPLY_QUEUE_WAIT, self._reply_waited, job)
+            self._next_reply()
+
+    def _replies_asked(self) -> list[_Reply]:
+        return ([self._reply] if self._reply is not None and not self._reply.answered else []) + list(self._replies)
+
+    def _reply_refusal(self) -> Optional[str]:
+        """Why no reply may begin now, at the moment the page would be touched; None if one may."""
+        if self.app.locked:
+            return "locked"
+        if self.calling:
+            return "calling"
+        return None
+
+    def _next_reply(self) -> None:
+        if self._reply is not None or not self._replies:
+            return
+        job = self._reply = self._replies.popleft()
+        if job.timer:
+            GLib.source_remove(job.timer)
+            job.timer = 0
+        self.when_ready(lambda: self._start_reply(job), lambda: self._end_turn(
+            job, "removed" if self.removed else "needs-link" if self.needs_link else "not-ready"))
+
+    def _reply_waited(self, job: _Reply) -> bool:
+        """REPLY_QUEUE_WAIT passed with `job` still behind another: it never reached the page."""
+        job.timer = 0
+        if job in self._replies:
+            self._replies.remove(job)
+            self._answer(job, "busy", "queue")
+        return GLib.SOURCE_REMOVE
+
+    def _start_reply(self, job: _Reply) -> None:
+        # Checked again now: the lock or a call may have come on while it waited.
+        refused = "removed" if self.removed else self._reply_refusal()
+        if refused is None and not (self.ready and self._trusted()):
+            refused = "not-ready"  # the page is somewhere else (an error page, say), or loading again
+        if refused:
+            self._end_turn(job, refused)
+            return
+        job.in_page = True
+        self._in_page += 1
+        self._apply_throttle()
+        self.app.reclaimer.stop()  # nothing of the page's goes to swap under it
+        job.timer = GLib.timeout_add_seconds(REPLY_GUARD, self._reply_guard, job)
+        request = {"pageId": job.page_id, "chatId": job.chat_id, "text": job.text, "budgetMs": REPLY_BUDGET_MS,
+                   "visible": self.view.get_mapped()}
+        self.run(REPLY_SCRIPT, {"request": request}, lambda value: self._reply_answered(job, value))
+
+    def _reply_answered(self, job: _Reply, value) -> None:
+        result, why = reply_answer(value)
+        if job.answered:  # after the guard: Natter has said "unknown" already
+            print(f"natter: reply: {result}" + (f" ({why})" if why else "") + ", answered after the wait ran out",
+                  flush=True)
+        self._leave_page(job)
+        self._end_turn(job, result, why)
+
+    def _reply_guard(self, job: _Reply) -> bool:
+        """The page hasn't answered in REPLY_GUARD: "unknown" (it may have sent). The page keeps it
+        until it answers, or for REPLY_LET_GO in all, so nothing else switches chats under it."""
+        if not job.answered:
+            self._answer(job, "unknown", "late")
+            job.timer = GLib.timeout_add_seconds(REPLY_LET_GO - REPLY_GUARD, self._reply_guard, job)
+            return GLib.SOURCE_REMOVE
+        job.timer = 0
+        self._leave_page(job)
+        self._end_turn(job, "unknown")
+        return GLib.SOURCE_REMOVE
+
+    def _leave_page(self, job: _Reply) -> None:
+        if job.timer:
+            GLib.source_remove(job.timer)
+            job.timer = 0
+        if job.in_page:
+            job.in_page = False
+            self._in_page -= 1
+            self._apply_throttle()
+
+    def _end_turn(self, job: _Reply, result: str, why: str = "") -> None:
+        """`job` is over (answered `result` unless it was already): the next reply's turn, and
+        then, with none in the page, what was held for it."""
+        self._answer(job, result, why)
+        if self._reply is job:
+            self._reply = None
+        self._next_reply()
+        if not self._in_page:
+            self._release_held()
+
+    def _answer(self, job: _Reply, result: str, why: str = "") -> None:
+        if job.answered:
+            return
+        job.answered = True
+        print(f"natter: reply: {result}" + (f" ({why})" if why else ""), flush=True)
+        GLib.idle_add(lambda: job.done(result) and False)
+
+    def _held(self, run: Callable[[], None]) -> bool:
+        """While the page has a reply, what else would act on it (open a chat, a link, files, a
+        fresh page) waits until it has answered: switching chats between typing and Send would
+        leave the reply as a draft. True if `run` waits. Checked when the page would be touched."""
+        if not self._in_page:
+            return False
+        self._held_actions = (self._held_actions + [run])[-REPLY_HELD:]
+        return True
+
+    def _release_held(self) -> None:
+        actions, self._held_actions = self._held_actions, []
+        if self._fresh_held:
+            # First: whatever was held then runs in the new page, once it's up.
+            self._fresh_held = False
+            self.fresh_page()
+        for run in actions:
+            run()
+
+    def _drop_replies(self) -> None:
+        """The account goes: every reply not yet in the page is answered "removed"."""
+        self._held_actions, self._fresh_held = [], False
+        while self._replies:
+            job = self._replies.popleft()
+            if job.timer:
+                GLib.source_remove(job.timer)
+                job.timer = 0
+            self._answer(job, "removed")
+
+    def _apply_throttle(self) -> None:
+        """Hidden, WebKit runs the page's timers once a second at most. WhatsApp's calls need them
+        on time, and so do replies (WhatsApp shows its Send button a timer tick after the words):
+        throttling is off while either is on, so neither turns it back on under the other."""
+        throttling = ("HiddenPageDOMTimerThrottling",)
+        busy = self.calling or self._in_page > 0
+        _features(self.view.get_settings(), off=throttling if busy else (), on=() if busy else throttling)
+
     def open_link(self, uri: str) -> bool:
         """Open a wa.me / whatsapp:// link, in the page if WhatsApp takes it there.
 
@@ -570,13 +808,15 @@ class Account(GObject.Object):
         click, or the chat doesn't open within LINK_WAIT seconds, the link's WhatsApp Web address
         is loaded instead, which reloads WhatsApp.
         """
+        if not (page_link(uri) or chat_link(uri)):
+            return False
+        if self._held(lambda: self.open_link(uri)):
+            return True
         shown = page_link(uri)
         if shown:
             self._open_in_page(shown)
             return True
         target = chat_link(uri)
-        if target is None:
-            return False
         if not self.ready or self._link is not None:
             self._load(target)
             return True
@@ -635,6 +875,8 @@ class Account(GObject.Object):
         finish = (lambda ok: done(bool(ok))) if done else (lambda ok: None)
         if not paths:
             finish(False)
+            return
+        if self._held(lambda: self.attach(paths, done, how)):
             return
         print(attach_line(paths, how), flush=True)
         self._picked = [str(Path(p).resolve()) for p in paths]  # plain paths: a file:// URI gives empty files
@@ -747,8 +989,12 @@ class Account(GObject.Object):
         """WhatsApp again in a new web process. After a call, WhatsApp keeps its call engine
         loaded: twenty threads and memory that WebKit can't give back (it only grows), well over
         a gigabyte. Only a new process lets it go. The chat that was open opens again. A page
-        that stopped (crashing) stays stopped until Try Again."""
+        that stopped (crashing) stays stopped until Try Again. With a reply in the page, once it
+        has answered (_held): a new page under it would turn "sent" into "unknown"."""
         if self.removed or self.calling or self.crashing:
+            return
+        if self._in_page:
+            self._fresh_held = True
             return
         self.fresh_at = time.monotonic()
         self._reopen_after_load()
@@ -808,6 +1054,7 @@ class Account(GObject.Object):
             self._reload_timer = 0
         self._watch_page(0, None)
         self._end_link()
+        self._drop_replies()
         self._drop_pending()
         self._fallback.clear()
         self.ready = False
@@ -867,9 +1114,7 @@ class Account(GObject.Object):
         return self.rtc is not None and self.rtc.calling
 
     def _on_page_call(self, active: bool) -> None:
-        # Hidden, WebKit runs the page's timers once a second; WhatsApp's call needs them on time.
-        throttling = ("HiddenPageDOMTimerThrottling",)
-        _features(self.view.get_settings(), off=throttling if active else (), on=() if active else throttling)
+        self._apply_throttle()
         self.emit("in-call", active)
         if not active and self._fresh_after_call:
             # A device switched off during the call: WebKit would still hand it out without asking.

@@ -543,6 +543,8 @@ class AppearanceTest(unittest.TestCase):
             setattr(fake, name, Recorder())
         fake.tray = fake.calls = fake.window = fake.desktop_media = fake.memory_guard = None
         fake.quit = lambda: None
+        fake.withdraw_notification = lambda key: None
+        fake.replies = {}
         Natter.quit_natter(fake)
         self.assertEqual(closed, [True])
         self.assertIsNone(fake.ada_style)

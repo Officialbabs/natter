@@ -33,12 +33,13 @@ from .gstfix import debug_line as camera_fix_line
 from .links import chat_link, page_link
 from .launcher import Badge, chat_key, exec_quote, set_menu_chats
 from .memguard import KILL_MEMORY, MemoryGuard, mem_total, page_ceiling, page_limit
-from .notify import Notifier
+from .notify import Notifier, ReplyTarget
+from .reply import LIMIT as REPLY_LIMIT, ReplyWindow, notice as reply_notice, units as reply_units
 from .search import SearchProvider
 from .settings import AUTOSTART, CACHE, CONFIG, DATA, Chat, ChatIndex, Settings, private_folder
-from .system import (SWAP_BUDGET_MB, AudioFollower, CallSound, Reclaimer, footprint, in_own_scope, in_sandbox,
-                     limit_own_scope, media_report, memory_events, memory_tight, move_to_own_scope, network_processes,
-                     open_uri, own_swap, request_background, swap_full)
+from .system import (SWAP_BUDGET_MB, AudioFollower, CallSound, Reclaimer, footprint, give_system_bus, in_own_scope,
+                     in_sandbox, limit_own_scope, media_report, memory_events, memory_tight, move_to_own_scope,
+                     network_processes, open_uri, own_swap, request_background, swap_full)
 from .tray import MenuItem, Tray, tray_host_available
 
 HERE = Path(__file__).resolve().parent
@@ -92,6 +93,7 @@ RECLAIM_AGAIN = 15 * 60  # and again this often while it stays hidden
 SEARCH_LINGER = 30_000  # ms a Natter started only for desktop search stays after the last search
 MEDIA_CHECK_DELAY = 10  # seconds after WhatsApp is up, so the check doesn't slow its start
 SNAPSHOTS = CACHE / "snapshots"  # the only folder debug snapshots are saved to
+UNLOCK_QUEUE = 4  # requests that wait for the unlock at most (_held_while_locked), oldest dropped
 CALLS_START_DELAY = 15  # seconds after WhatsApp is up before the call window starts, to ring for calls
 CALL_FAILURES = {
     "no-chat": "The call window couldn't find “{chat}” in its chats",
@@ -266,15 +268,20 @@ def snapshot_path(path: str, folder: Path = SNAPSHOTS) -> Optional[Path]:
     return target if target != inside and target.is_relative_to(inside) else None
 
 
-def banner_for(dnd_until, media_missing: bool, now: float) -> Optional[tuple[str, str, str, str]]:
+def banner_for(dnd_until, media_missing: bool, now: float,
+               restart: bool = False) -> Optional[tuple[str, str, str, str]]:
     """What the window's banner says, as (title, button, action, page), else None. Only states
     that last go there, one at a time: paused notifications first, as they're the one that keeps
-    messages from you, then media that can't play. `page` is the action's target, if it takes one."""
+    messages from you, then a restart that would give calls back the microphone and camera
+    (`restart`, _on_anchor_gone), then media that can't play. `page` is the action's target, if
+    it takes one."""
     if isinstance(dnd_until, (int, float)) and dnd_until != 0 and (dnd_until < 0 or dnd_until > now):
         if dnd_until < 0:
             return "Notifications paused", "Resume", "app.resume-notifications", ""
         until = time.strftime("%H:%M", time.localtime(dnd_until))
         return f"Notifications paused until {until}", "Resume", "app.resume-notifications", ""
+    if restart:
+        return f"Restart {NAME} to use the microphone and camera", "Restart", "app.restart", ""
     if media_missing:
         return "Some videos and voice messages can't play", "Details", "app.preferences-page", "general"
     return None
@@ -324,6 +331,89 @@ def debug_info(calls: str, missing: Optional[list[str]], sandboxed: bool, device
     ]) + "\n"
 
 
+# ---- Starting again (app.restart) ---------------------------------------------------------------
+# Run by Python in a process of its own, started as Natter quits: it waits for that Natter and
+# the processes it started to end, then becomes the new Natter (same process, so the desktop's
+# note of which app it is, GIO_LAUNCHED_DESKTOP_FILE_PID, is put right first). Waiting matters
+# twice over: two WebKits writing one WhatsApp session can damage it, and a new Natter that found
+# the old one's name still on the bus would hand its start over to the one that's ending. So if
+# the old Natter itself is still there when the wait is over, none starts: there's one Natter
+# either way, and a stuck one is better found than hidden behind a second.
+RESTART_WAIT = 30  # seconds at most
+RESTARTER = """
+import os, sys, time
+
+try:
+    os.setsid()  # a session of its own: what ends the old one's doesn't end this
+except OSError:
+    pass
+
+def alive(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as stat:
+            return stat.read().rpartition(")")[2].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+deadline = time.monotonic() + float(sys.argv[1])
+waits = sys.argv[2].split(",")
+for pid in waits:
+    while alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+if alive(waits[0]):
+    sys.exit("natter: not started again: the one that was restarting is still running")
+if "GIO_LAUNCHED_DESKTOP_FILE_PID" in os.environ:
+    os.environ["GIO_LAUNCHED_DESKTOP_FILE_PID"] = str(os.getpid())
+os.execv(sys.argv[3], sys.argv[3:])
+"""
+
+
+def own_children(pid: Optional[int] = None, proc: Path = Path("/proc")) -> list[int]:
+    """The processes `pid` (this one) started that are still there: WebKit's, mostly."""
+    pid = os.getpid() if pid is None else pid
+    found = []
+    try:
+        tasks = os.listdir(proc / str(pid) / "task")
+    except OSError:
+        return found
+    for task in tasks:
+        try:
+            found += [int(child) for child in (proc / str(pid) / "task" / task / "children").read_text().split()]
+        except (OSError, ValueError):
+            pass
+    return found
+
+
+def restart_command(args: list[str], argv0: Optional[str] = None, python: str = sys.executable) -> list[str]:
+    """The command that starts this Natter again with `args`: the `natter` script it was started
+    with, else this Python with the package it runs from (`python3 -m natter` in a checkout)."""
+    started = os.path.abspath(argv0 if argv0 is not None else (sys.argv[0] if sys.argv else ""))
+    if os.path.basename(started) == "natter" and os.path.isfile(started) and os.access(started, os.X_OK):
+        return [started, *args]
+    return [python, "-m", "natter", *args]
+
+
+def start_again(args: list[str]) -> bool:
+    """Have a new Natter start once this one has ended (RESTARTER). False if it couldn't be."""
+    waits = [os.getpid(), *own_children()]
+    command = restart_command(args)
+    launcher = Gio.SubprocessLauncher.new(Gio.SubprocessFlags.NONE)  # its input from /dev/null
+    if command[1:3] == ["-m", "natter"]:
+        # `python3 -m natter` finds the package from the folder it's started in: the checkout's.
+        launcher.set_cwd(str(Path(__file__).resolve().parent.parent))
+    # Started as from the desktop: with the system bus this Natter hid from itself and WebKit,
+    # and without the camera fix's settings. The new Natter makes both again, and it couldn't
+    # tell what it was given from what it would make: programs it opens would go without the bus.
+    give_system_bus(launcher)
+    try:
+        launcher.spawnv([sys.executable, "-I", "-c", RESTARTER, str(RESTART_WAIT), ",".join(map(str, waits)), *command])
+    except GLib.Error as error:
+        print(f"natter: couldn't start again ({error.message}); start {NAME} from your apps", file=sys.stderr,
+              flush=True)
+        return False
+    return True
+
+
 class Natter(Adw.Application):
     def __init__(self) -> None:
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
@@ -344,7 +434,7 @@ class Natter(Adw.Application):
         # would show a chat waits for the unlock.
         self.locked = False
         self._attempts = applock.Attempts(self.settings)
-        self._after_unlock: Optional[Callable[[], None]] = None
+        self._after_unlock: list[tuple[str, Callable[[], None]]] = []  # (key, run), oldest first
         self._last_activity = awake_time()
         self._fresh_timer = 0
         # Natter's own watch on its pages' memory (memguard.py, started in do_startup), and the
@@ -372,6 +462,13 @@ class Natter(Adw.Application):
         # and the Preferences dialog that's open, which shows it too.
         self.style_hint = ""
         self.preferences = None
+        # Replies from notifications (reply.py): the reply window of each chat that has one, by
+        # (account id, chat), and what was typed for a chat whose window has closed (memory only).
+        self.replies: dict[tuple[str, str], object] = {}
+        self.reply_drafts: dict[tuple[str, str], str] = {}
+        self.restart_args: Optional[list[str]] = None  # quitting to start again (restart): its options
+        self._restart_wait = 0  # restart, waiting for a reply under way to be answered
+        self._restart_alert = None  # restart, asking about replies not sent yet
         # The microphone and the camera (media.py): what the desktop says about the camera, once
         # the window's services start; whether WebKit may find the camera itself (udev); whether
         # calls lost their devices for this run (_on_anchor_gone); whether there's a microphone;
@@ -444,7 +541,7 @@ class Natter(Adw.Application):
         self._apply_spelling()
 
         bus = self.get_dbus_connection()
-        self.notifier = Notifier(self, self._open_from_notification)
+        self.notifier = Notifier(self, self._open_from_notification, self.on_reply)
         self.badge = Badge(bus)
         self.reclaimer = Reclaimer(on_done=self._reclaimed)
         self.call_sound = CallSound()
@@ -523,6 +620,15 @@ class Natter(Adw.Application):
         open_file = Gio.SimpleAction.new("open-file", GLib.VariantType("s"))
         open_file.connect("activate", lambda _a, v: self._open_file(v.get_string()))
         self.add_action(open_file)
+        # A reply window that failed out of sight, by its own reference (its notice's Show Reply).
+        show_reply = Gio.SimpleAction.new("show-reply", GLib.VariantType("s"))
+        show_reply.connect("activate", lambda _a, v: self.show_reply(v.get_string()))
+        self.add_action(show_reply)
+        # Only once a restart would help (_on_anchor_gone): anything on the bus can call an action.
+        restart = Gio.SimpleAction.new("restart", None)
+        restart.connect("activate", lambda *_: self.restart())
+        restart.set_enabled(False)
+        self.add_action(restart)
         if GLib.getenv("NATTER_DEBUG"):
             self._debug_actions()
 
@@ -661,14 +767,73 @@ class Natter(Adw.Application):
         self.media_lost = True
         for account in self.accounts:
             account.lose_media()
+        restart = self.lookup_action("restart")
+        if restart is not None:
+            restart.set_enabled(True)
         # Worded to be true whether the page that's up keeps them or was ended along with the
-        # anchor (the kernel short of memory takes both), and as Preferences says it.
-        if self.window is not None and self.window.get_visible():
-            self.window.toast(f"Restart {NAME} to use the microphone and camera", timeout=10)
+        # anchor (the kernel short of memory takes both), and as Preferences says it. The banner
+        # stays until the restart; the toast or notification says it when it happens.
+        title = f"Restart {NAME} to use the microphone and camera"
+        if self.window is not None and self.window.get_visible() and not self.locked:
+            if banner_for(self.settings["dnd_until"], self._media_banner, time.time(), restart=True)[2] == "app.restart":
+                # The banner says it, with its own Restart: not a toast too, but read out, as a
+                # banner coming up isn't.
+                self.window.say(title)
+            else:  # the banner says notifications are paused
+                self.window.toast(title, "Restart", "app.restart", timeout=10)
         elif self.window is not None:
-            self.tell("media-lost", f"Restart {NAME} to use the microphone and camera",
-                      f"Calls and voice messages may not be able to use them until {NAME} restarts.")
+            self.tell("media-lost", title,
+                      f"Calls and voice messages may not be able to use them until {NAME} restarts.",
+                      ("Restart", "app.restart", None))
+        self._show_banner()
         self._media_changed()
+
+    def restart(self) -> None:
+        """Quit and start again (app.restart, offered once WebKit's first sandbox has stopped):
+        only a new start gives calls and voice messages the microphone and camera back. Not
+        during a call, which it would end; a reply being sent finishes first; replies still
+        being written are lost, so that's asked first, past the passcode."""
+        if not self.media_lost or self.restart_args is not None or self._restart_wait or self._restart_alert:
+            return
+        if self.calling:
+            if self.window is not None and self.window.get_visible() and not self.locked:
+                self.window.toast(f"Restart {NAME} once the call ends")
+            else:
+                self.tell("media-lost", f"Restart {NAME} once the call ends", button=("Restart", "app.restart", None))
+            return
+        if any(window.sending for window in self.replies.values()) or any(a.replying for a in self.accounts):
+            self._restart_wait = GLib.timeout_add(500, self._restart_after_reply)  # Account answers in time
+            return
+        if not any(window.unsent() for window in self.replies.values()) and not any(
+                text.strip() for text in self.reply_drafts.values()):
+            self._restart_now()
+            return
+        if self._held_while_locked(self.restart, "restart") or not self.present_window():
+            return
+        alert = self._restart_alert = Adw.AlertDialog(heading=f"Restart {NAME}?",
+                                                      body="Replies you haven't sent will be lost.")
+        alert.add_response("cancel", "_Cancel")
+        alert.add_response("restart", "_Restart")
+        alert.set_response_appearance("restart", Adw.ResponseAppearance.DESTRUCTIVE)
+        alert.set_default_response("cancel")
+        alert.set_close_response("cancel")
+        alert.connect("response", lambda _alert, response: response == "restart" and self._restart_now())
+        # Also when the lock closes it unanswered: the next Restart asks again.
+        alert.connect("closed", lambda *_: setattr(self, "_restart_alert", None))
+        alert.present(self.window)
+
+    def _restart_after_reply(self) -> bool:
+        self._restart_wait = 0
+        self.restart()
+        return GLib.SOURCE_REMOVE
+
+    def _restart_now(self) -> None:
+        # Back as it was: hidden if it was, and a lab instance on its own page (--url), never
+        # WhatsApp's. The lock, if it's on, is on again (a start locks, and so does a locked quit).
+        hidden = not (self.window is not None and self.window.get_visible())
+        self.restart_args = (["--background"] if hidden else []) + (["--url", self.dev_url] if self.dev_url else [])
+        print("natter: restarting, for the microphone and camera", flush=True)
+        self.quit_natter()
 
     def _build(self, hidden: bool = False) -> bool:
         """The window first, then WhatsApp in it. If the window can't be made, Natter quits
@@ -821,9 +986,13 @@ class Natter(Adw.Application):
             self.calls.connect("in-call", self._on_in_call)
             self._calls_keep_running()
 
-    def present_window(self) -> bool:
+    def present_window(self, token: str = "") -> bool:
+        """The window in front. `token`: the activation token of the click that asked for it, which
+        lets it come forward on Wayland."""
         if self.window is None and not self._build():
             return False
+        if token:
+            self.window.set_startup_id(token)
         self.window.present()
         return True
 
@@ -852,6 +1021,15 @@ class Natter(Adw.Application):
         self.settings["locked"] = True  # still locked after quitting and starting again
         if self.window:
             self.window.show_lock(True)
+        for window in list(self.replies.values()):
+            if window.close_for_lock():
+                # Its words wait in memory, and the window comes back with them after the unlock:
+                # by then its notification may have gone, and with it the way back to them.
+                target = window.target
+                self._wait_for_unlock(f"reply:{target.account}/{target.chat}",
+                                      lambda target=target: self.open_reply(target))
+            if window.told and window.told_named:
+                self.reply_failed(window, window.told)  # its notice again, now naming nobody
         self.notifier.conceal()  # those already shown stop saying who wrote and what
         self._refresh_tray()
 
@@ -899,19 +1077,27 @@ class Natter(Adw.Application):
                 self._refresh_tray()
             done(ok, message)
             if ok:
-                waiting, self._after_unlock = self._after_unlock, None
-                if waiting:
-                    waiting()
+                waiting, self._after_unlock = self._after_unlock, []
+                for _key, run in waiting:
+                    run()
         self.check_passcode(passcode, checked)
 
-    def _held_while_locked(self, run: Callable[[], None]) -> bool:
-        """While locked, what would show a chat waits for the unlock (the latest such): True if
-        `run` waits. The window comes forward, showing the passcode."""
+    def _held_while_locked(self, run: Callable[[], None], key: str = "show", token: str = "") -> bool:
+        """While locked, what would show a chat or a file waits for the unlock: True if `run`
+        waits. A later one with the same `key` takes the earlier one's place (most just show the
+        window somewhere, and the latest wins); different ones run in turn, oldest first, so a
+        chat and a file opened while locked both open. The window comes forward, showing the
+        passcode, with `token` (the click's, from a notification) if there is one: it's the
+        passcode that has to come forward now, and `run` comes from Natter's own window then."""
         if not self.locked:
             return False
-        self._after_unlock = run
-        self.present_window()
+        self._wait_for_unlock(key, run)
+        self.present_window(token)
         return True
+
+    def _wait_for_unlock(self, key: str, run: Callable[[], None]) -> None:
+        waiting = [(k, r) for k, r in self._after_unlock if k != key] + [(key, run)]
+        self._after_unlock = waiting[-UNLOCK_QUEUE:]
 
     def note_activity(self) -> None:
         """Someone used the window (for locking after being idle)."""
@@ -945,8 +1131,8 @@ class Natter(Adw.Application):
     def _apply_page_sound(self) -> None:
         """WhatsApp plays its message tones in the page itself: while notifications are paused,
         and nobody's using Natter's window or calling, the page is muted. In use, it isn't, so a
-        voice note still plays."""
-        active = bool(self.window and self.window.is_active())
+        voice note still plays. Locked, it isn't in use, even when it's the active window."""
+        active = bool(self.window and self.window.is_active() and not self.locked)
         muted = self.settings.notifications_paused() and not self.calling and not active
         for account in self.accounts:
             if account.view.get_is_muted() != muted:
@@ -1253,14 +1439,16 @@ class Natter(Adw.Application):
                   f"Some of {NAME}'s extras may pause until an update ({', '.join(missing)}).")
 
     def tell(self, key: str, title: str, body: str = "", button: Optional[tuple[str, str, GLib.Variant]] = None,
-             account: Optional[Account] = None) -> None:
+             account: Optional[Account] = None, default: Optional[tuple[str, GLib.Variant]] = None) -> None:
         """A desktop notification from Natter itself, not from a chat. Clicking it opens the
-        window, on `account` when it's about one."""
+        window, on `account` when it's about one, or does `default` (an action and its target)."""
         notification = Gio.Notification.new(title)
         if body:
             notification.set_body(body)
         notification.set_icon(app_icon())
-        if account is not None:
+        if default is not None:
+            notification.set_default_action_and_target(*default)
+        elif account is not None:
             notification.set_default_action_and_target("app.show-account", GLib.Variant("s", account.id))
         else:
             notification.set_default_action("app.show")
@@ -1269,26 +1457,164 @@ class Natter(Adw.Application):
         self.send_notification(key, notification)
 
     def _on_notify_message(self, account: Account, page_id: int, title: str, body: str, tag: str, icon: str) -> None:
-        if self.window and self.window.is_active() and self.window.account is account and account.active_chat == title:
-            return  # it's the chat on screen
+        chat = tag or title
+        window = self.replies.get((account.id, chat))
+        if window is not None:
+            # A reply window follows its chat. While it's the window in use, that's the chat on screen,
+            # unless it's sending or has sent, when it closes by itself and the message with it.
+            window.add_message(page_id, title, body)
+            if window.is_active() and not self.locked and not window.sending and window.outcome != "sent":
+                return
+        if (not self.locked and self.window and self.window.is_active() and self.window.account is account
+                and account.active_chat == title):
+            return  # it's the chat on screen (behind the lock, nobody sees it)
         several = len(self.accounts) > 1
-        self.notifier.show(account.id, account.name if several else None, page_id, title, body, tag or title, icon)
+        self.notifier.show(account.id, account.name if several else None, page_id, title, body, chat, icon)
 
     def _open_from_notification(self, account_id: str, title: str, page_id: int, token: str) -> None:
-        if self._held_while_locked(lambda: self._open_from_notification(account_id, title, page_id, token)):
+        # The token brings the passcode forward; after the unlock it's spent, and Natter's own.
+        if self._held_while_locked(lambda: self._open_from_notification(account_id, title, page_id, ""),
+                                   token=token):
             return
         account = self.account_by_id(account_id)
         if account is None:
             return
-        if token:
-            self.window.set_startup_id(token)
-        self.present_window()
+        self.present_window(token)
         self.window.show_account(account)
         account.click_notification(page_id, title)
 
+    # ---- Replying from notifications (reply.py) --------------------------------------------
+
+    def on_reply(self, target: Optional[ReplyTarget], token: str = "", text: Optional[str] = None,
+                 refused: bool = False) -> None:
+        """Reply on a chat's notification (Notifier): its reply window, or with `text` (typed in
+        KDE's reply field) the reply sent. Nothing is sent while locked, nor `refused` text (from a
+        field that had answered already, or gone): it waits in the reply window for Send. While
+        locked, the reply window waits for the passcode, as a click on a notification does."""
+        if target is None:
+            if text and text.strip():
+                # From a notification Natter no longer knows: who it was to can't be told.
+                self.tell("reply-lost", "Your reply wasn't sent", "The notification you replied to had already gone.")
+            return
+        if text is not None and not text.strip():
+            text = None
+        if text is None and not self.settings["notify_reply"]:
+            # Reply was turned off in Preferences after the notification came: it opens the chat.
+            self._open_from_notification(target.account, target.title, target.page_id, token)
+            return
+        if text is not None and not (self.locked or refused or (target.account, target.chat) in self.replies
+                                     or not self.settings["notify_reply"]):
+            self._send_inline(target, text)
+            return
+        if text is not None:
+            self._keep_reply(target, text)
+        # After the passcode, along with whatever else waits for it (a chat, a file).
+        if self._held_while_locked(lambda: self.open_reply(target), f"reply:{target.account}/{target.chat}", token):
+            return
+        self.open_reply(target, token)
+
+    def _keep_reply(self, target: ReplyTarget, text: str) -> None:
+        """Words for a chat that aren't to be sent as they came: into its reply window, or kept
+        for the next one (in memory only)."""
+        key = (target.account, target.chat)
+        window = self.replies.get(key)
+        if window is not None:
+            window.put_text(text)
+        else:
+            draft = self.reply_drafts.get(key, "")
+            self.reply_drafts[key] = f"{draft.rstrip()}\n{text}" if draft.strip() else text
+
+    def _send_inline(self, target: ReplyTarget, text: str) -> None:
+        """Send what was typed in KDE's reply field, with no window. If it isn't sent, the reply
+        window shows why, with the words: to send again, or to read if WhatsApp may have them."""
+        def answered(result: str) -> None:
+            if result in ("sent", "removed"):
+                return
+            window = self._reply_window(target)
+            window.inline_failed(text, result)
+            if window.sending:
+                return  # a reply from the window is under way: this shows once that has answered
+            if self.locked:
+                self.reply_failed(window, result)
+            else:
+                window.present_again()
+
+        self.send_reply(target, text, answered)
+
+    def _reply_window(self, target: ReplyTarget) -> ReplyWindow:
+        """The chat's reply window, made if it has none (not shown yet)."""
+        key = (target.account, target.chat)
+        window = self.replies.get(key)
+        if window is None:
+            # The window keeps what was typed from here on, and the draft again when it closes.
+            window = self.replies[key] = ReplyWindow(self, target, self.reply_drafts.pop(key, ""))
+        else:
+            window.retarget(target)
+        return window
+
+    def open_reply(self, target: ReplyTarget, token: str = "") -> None:
+        """The chat's reply window, in front. Never Natter's own window: replying is done without it."""
+        if self.account_by_id(target.account) is None:
+            return
+        window = self._reply_window(target)
+        window.untell()
+        window.present_again(token)
+
+    def show_reply(self, ref: str) -> None:
+        """A reply window that failed out of sight (app.show-reply, its notice's Show Reply)."""
+        window = next((w for w in self.replies.values() if w.ref == ref), None)
+        if window is None:
+            return  # sent, closed or gone with its account since, or from before Natter last started
+        if self._held_while_locked(lambda: self.show_reply(ref), f"reply:{window.target.account}/{window.target.chat}"):
+            return
+        window.untell()
+        window.present_again()
+
+    def send_reply(self, target: ReplyTarget, text: str, done: Callable[[str], None]) -> None:
+        """Send `text` to the chat, through WhatsApp's page (Account.send_reply), and `done(result)`
+        with its answer (reply.OUTCOMES). Never started while locked. Logged by the answer alone
+        (the page's by Account): never who to, or what."""
+        # The message it answers, now: a reply window moves its target on to newer messages.
+        page_id = target.page_id
+
+        def answered(result) -> None:
+            result = result if isinstance(result, str) and result else "unknown"
+            if result == "sent":
+                # Its notification goes, unless a newer message has replaced it meanwhile. Words
+                # kept for the chat stay: they aren't these (a reply window clears its own).
+                self.notifier.withdraw_page(target.account, page_id)
+            done(result)
+
+        def refused(result: str) -> None:
+            print(f"natter: reply: {result}", flush=True)
+            answered(result)
+
+        account = self.account_by_id(target.account)
+        if self.locked:
+            refused("locked")
+        elif account is None or account.removed:
+            refused("removed")
+        elif reply_units(text) > REPLY_LIMIT:
+            refused("too-long")
+        else:
+            account.send_reply(page_id, target.chat, text, answered)
+
+    def reply_failed(self, window: ReplyWindow, result: str) -> None:
+        """A reply that failed out of sight (its window closed meanwhile, or Natter locked): a
+        notification that brings it back. It names the chat only where notifications may."""
+        named = self.settings["notify_sender"] and not self.settings["privacy_blur"] and not self.locked
+        title, body = reply_notice(result, window.target.title, named)
+        window.told = result
+        window.told_named = named  # told again without the name should the lock come on, and only then (lock)
+        # A click on it shows the reply too: that's what it's about, not Natter's own window.
+        show = ("app.show-reply", GLib.Variant("s", window.ref))
+        self.tell(f"reply-{window.ref}", title, body, ("Show Reply", *show), default=show)
+
     def on_focus_changed(self, active: bool) -> None:
+        """The window came forward or went back, or the lock came on or off (Window.show_lock).
+        Its notifications go once its chats can be seen: not at the lock."""
         self._apply_page_sound()
-        if active:
+        if active and not self.locked:
             account = self.window.account
             if account:
                 self.notifier.withdraw(account.id)
@@ -1297,7 +1623,7 @@ class Natter(Adw.Application):
             account.set_class("natter-away", away)
 
     def on_page_changed(self) -> None:
-        if self.window and self.window.is_active() and self.window.account:
+        if self.window and self.window.is_active() and self.window.account and not self.locked:
             self.notifier.withdraw(self.window.account.id)
 
     def _on_download(self, _account: Account, path: str, ok: bool, reason: str) -> None:
@@ -1305,6 +1631,14 @@ class Natter(Adw.Application):
         if ok:
             self.downloaded.add(path)
             open_it = ("Open", "app.open-file", GLib.Variant("s", path))
+        if self.locked:
+            # A notification, as the window's toasts are under the lock, but without the file's
+            # name or folder; its Open waits for the passcode (_open_file).
+            if ok:
+                self.tell(f"download-{path}", "Download finished", button=open_it)
+            else:
+                self.tell(f"download-{path}", "A download couldn't be saved")
+            return
         if self.window and self.window.get_visible():
             if ok:
                 self.window.toast(f"Saved {name}", *open_it)
@@ -1316,8 +1650,9 @@ class Natter(Adw.Application):
             self.tell(f"download-{path}", f"Couldn't save {name}", reason)
 
     def _open_file(self, path: str) -> None:
-        if path in self.downloaded:
-            open_uri(Gio.File.new_for_path(path).get_uri(), self.window)
+        if path not in self.downloaded or self._held_while_locked(lambda: self._open_file(path), f"file:{path}"):
+            return
+        open_uri(Gio.File.new_for_path(path).get_uri(), self.window)
 
     def _on_network(self, monitor: Gio.NetworkMonitor, available: bool) -> None:
         if available:
@@ -1367,10 +1702,11 @@ class Natter(Adw.Application):
 
     def _show_banner(self) -> None:
         """The window's banner, the one place for states that last (banner_for): notifications
-        paused, else media that can't play, until Preferences, where the details are, is opened."""
+        paused, else a restart to make, else media that can't play, until Preferences, where the
+        details are, is opened."""
         if self.window is None:
             return
-        shown = banner_for(self.settings["dnd_until"], self._media_banner, time.time())
+        shown = banner_for(self.settings["dnd_until"], self._media_banner, time.time(), restart=self.media_lost)
         if shown is None:
             self.window.hide_banner()
             return
@@ -1601,7 +1937,8 @@ class Natter(Adw.Application):
     def _reclaim(self) -> bool:
         # Past the limit, what's there is WhatsApp's own and live (WebKit can't collect it):
         # pushing it to swap only hides it, and filled 9.7 GB of swap one day. A fresh page frees it.
-        if not self._fresh_pages_for_memory():
+        # Not while a reply is being sent: the page it's typing in would be pushed out under it.
+        if not self._fresh_pages_for_memory() and not any(account.replying for account in self.accounts):
             self.reclaimer.start()
         self._reclaim_timer = GLib.timeout_add_seconds(RECLAIM_AGAIN, self._reclaim)
         return GLib.SOURCE_REMOVE
@@ -2010,7 +2347,7 @@ class Natter(Adw.Application):
         elif key == "lock_hash":
             self._attempts.succeeded()  # a new or no passcode: wrong tries at the old one don't count
             if not value:
-                self._after_unlock = None
+                self._after_unlock = []
                 self.settings["locked"] = False
             if not value and self.locked:
                 self.locked = False  # the lock was removed
@@ -2030,6 +2367,13 @@ class Natter(Adw.Application):
             if action is not None:
                 action.set_state(GLib.Variant("b", bool(self.settings[key])))
             self._apply_media(key)
+        if key in ("privacy_blur", "blur_when_away", "notify_sender", "notify_preview"):
+            for window in list(self.replies.values()):
+                window.apply_privacy()
+        elif key == "notify_reply":
+            # Show Reply Button: the notifications already up lose Reply, or get it back. Reply
+            # windows already open stay, with what's typed in them: each send is still asked for.
+            self.notifier.refresh()
         if key == "privacy_blur":
             self.lookup_action("privacy-blur").set_state(GLib.Variant("b", value))
             for account in self.accounts:
@@ -2092,6 +2436,9 @@ class Natter(Adw.Application):
         if len(self.accounts) < 2:
             return
         self.notifier.withdraw(account.id)
+        for key in [key for key in self.replies if key[0] == account.id]:
+            self.replies[key].forget()
+        self.reply_drafts = {key: text for key, text in self.reply_drafts.items() if key[0] != account.id}
         if account.id in self._memory_told:
             self._memory_told.discard(account.id)
             self.withdraw_notification(f"memory-{account.id}")
@@ -2180,6 +2527,14 @@ class Natter(Adw.Application):
         for account in self.accounts:
             account.chats.save()
         self.notifier.withdraw()
+        # Only true of this instance, and one started next could neither take it away nor act on
+        # its Restart: GLib leaves it up when Natter ends.
+        self.withdraw_notification("media-lost")
+        # So do the notices of replies that failed out of sight: their words end with this Natter,
+        # and their Show Reply would find nothing.
+        for window in list(self.replies.values()):
+            if window.told:
+                window.untell()
         if self.tray:
             self.tray.close()
             self.tray = None
@@ -2205,7 +2560,11 @@ class Natter(Adw.Application):
 
 
 def main(argv: list[str]) -> int:
-    return Natter().run(argv)
+    app = Natter()
+    status = app.run(argv)
+    if app.restart_args is not None:
+        start_again(app.restart_args)
+    return status
 
 
 if __name__ == "__main__":

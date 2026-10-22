@@ -4,7 +4,12 @@
      header (WhatsApp's disabled call buttons included) and composer.
      Run a separate Natter against it (see README, "When WhatsApp changes"): --url only works
      with an app id of its own, e.g. NATTER_APP_ID=io.github.Officialbabs.Natter.Dev plus XDG_*_HOME.
-     Add ?link to start on the link screen (a QR code); linkPhone() then shows the chats. -->
+     Add ?link to start on the link screen (a QR code); linkPhone() then shows the chats.
+     For replies from notifications: each chat has an id (the notifications' tag), the open chat's
+     messages are keyed "<mine>_<chat id>_<id>", the Send button stands in for the voice note
+     button a timer tick after there are words, and the drawers' containers are always there,
+     empty unless one is open (a pasted file's preview is in the middle one), as in WhatsApp.
+     sentMessages and voicePresses say what was sent and pressed. -->
 <html>
 <head>
 <meta charset="utf-8">
@@ -36,7 +41,13 @@
   footer { padding: 10px; }
   footer [contenteditable] { padding: 10px; border-radius: 8px; background: #8882; outline: none; }
   #drop { display: none; position: absolute; inset: 0; background: #2ec27e55; align-items: center; justify-content: center; }
-  #preview { display: none; }
+  [data-testid^="drawer-"] { position: absolute; top: 0; z-index: 1; }
+  [data-testid="drawer-left"] { left: 0; width: 340px; } [data-testid="drawer-middle"] { left: 341px; right: 0; }
+  [data-testid="drawer-right"] { right: 0; }
+  #preview { padding: 16px; background: #f0f2f5; }
+  @media (prefers-color-scheme: dark) { #preview { background: #111b21; } }
+  footer { display: flex; gap: 8px; align-items: end; } footer [contenteditable] { flex: 1; }
+  footer button { border: 0; background: none; font-size: 18px; }
   .landing { margin: auto; text-align: center; }
   .landing canvas { width: 160px; height: 160px; image-rendering: pixelated; }
 </style>
@@ -44,6 +55,9 @@
 <body>
 <div id="app"></div>
 <template id="chats">
+  <div data-testid="drawer-left"><span></span></div>
+  <div data-testid="drawer-middle"><span></span></div>
+  <div data-testid="drawer-right"><span></span></div>
   <div id="side">
     <div id="search" contenteditable="true" role="textbox" title="Search"></div>
     <div role="tablist" aria-label="Chat filters">
@@ -55,13 +69,9 @@
   </div>
   <div id="main" style="position: relative">
     <header></header>
-    <div id="messages">
-      <div class="message-in">Did you eat?</div>
-      <div class="message-out">Yes mum</div>
-    </div>
-    <footer><div contenteditable="true" role="textbox" title="Type a message"></div></footer>
+    <div id="messages"></div>
+    <footer><div contenteditable="true" role="textbox" title="Type a message"></div><span id="send-slot"></span></footer>
     <div id="drop">Drop files here</div>
-    <div id="preview" role="dialog"><span id="preview-names"></span><div contenteditable="true" role="textbox" title="Add a caption"></div></div>
   </div>
 </template>
 <template id="link-screen">
@@ -77,8 +87,14 @@
     "\u202a+44 7700 900123\u202c", ...Array.from({ length: 32 }, (_, i) => `Old Friend ${i + 1}`)];
   const FILTERS = { unread: ["Work Team", "Ana Souza"], groups: ["Work Team", "Football Sunday", "Book Club"] };
   const NUMBERS = { "15550100": "Dad", "5511987654321": "Ana Souza" };
+  // WhatsApp's id for each chat: a number @c.us for a person, @g.us for a group.
+  const IDS = Object.fromEntries(CHATS.map((name, i) => [name, FILTERS.groups.includes(name)
+    ? `1203630412345678${10 + i}@g.us` : `4477009001${String(i).padStart(2, "0")}@c.us`]));
   const app = document.getElementById("app");
-  let filter = "";
+  let filter = "", openName = "", sent = 0;
+  const drafts = {};  // what was left in each chat's box, put back when it opens again
+  window.sentMessages = [];
+  window.voicePresses = 0;
 
   function render() {
     const query = document.getElementById("search").textContent.trim().toLowerCase();
@@ -104,13 +120,67 @@
       <button aria-label="Voice call" disabled><span data-icon="voice-call">📞</span></button>`;
   }
 
+  // The chat's messages, keyed as WhatsApp keys them.
+  function messages(name) {
+    const rows = name === "Mum" ? [["in", "Did you eat?"], ["out", "Yes mum"]] : [["in", "See you later"]];
+    document.getElementById("messages").replaceChildren(...rows.map(([way, text], i) => {
+      const row = document.createElement("div");
+      row.className = `message-${way}`;
+      row.setAttribute("data-id", `${way === "out"}_${IDS[name]}_3EB0MOCK${i}`);
+      row.textContent = text;
+      return row;
+    }));
+  }
+
   function open(name) {
-    setTimeout(() => header(name), 120);
+    if (openName) drafts[openName] = composer().textContent;
+    setTimeout(() => {
+      header(name);
+      messages(name);
+      openName = name;
+      composer().textContent = drafts[name] || "";
+      slot();
+    }, 120);
+    return new Promise((resolve) => setTimeout(resolve, 130));
+  }
+
+  const composer = () => document.querySelector("footer [contenteditable]");
+
+  // Send while there are words, the voice note button otherwise: a timer tick after they change.
+  function slot() {
+    const words = composer().textContent.trim();
+    document.getElementById("send-slot").innerHTML = words
+      ? '<button aria-label="Send"><span data-icon="wds-ic-send-filled"><svg width="20" height="20"><title>ic-send-filled</title><text y="16">➤</text></svg></span></button>'
+      : '<button aria-label="Voice message"><span data-icon="ic-mic-outlined"><svg width="20" height="20"><title>ic-mic-outlined</title><text y="16">🎤</text></svg></span></button>';
+    document.querySelector("#send-slot button").addEventListener("click", () => {
+      if (!words) {
+        window.voicePresses++;
+        return;
+      }
+      window.sentMessages.push({ chat: IDS[openName], text: composer().innerText.trim() });
+      const row = document.createElement("div");
+      row.className = "message-out";
+      row.setAttribute("data-id", `true_${IDS[openName]}_3EB0SENT${++sent}`);
+      row.textContent = composer().innerText.trim();
+      document.getElementById("messages").appendChild(row);
+      composer().textContent = "";
+      setTimeout(slot, 0);
+    });
+  }
+
+  function showPreview(names) {
+    document.querySelector('[data-testid="drawer-middle"] > span').innerHTML =
+      '<div id="preview" role="dialog"><span id="preview-names"></span><div contenteditable="true" role="textbox" title="Add a caption"></div></div>';
+    document.getElementById("preview-names").textContent = names;
   }
 
   function showChats() {
     app.replaceChildren(document.getElementById("chats").content.cloneNode(true));
     header("Mum");
+    messages("Mum");
+    openName = "Mum";
+    slot();
+    composer().addEventListener("input", () => setTimeout(slot, 0));
     const search = document.getElementById("search");
     search.addEventListener("input", () => setTimeout(render, 150));
     document.querySelectorAll('[role="tab"]').forEach((chip) => chip.addEventListener("click", () => {
@@ -128,8 +198,7 @@
     drop.addEventListener("drop", (e) => {
       e.preventDefault();
       drop.style.display = "none";
-      document.getElementById("preview").style.display = "block";
-      document.getElementById("preview-names").textContent = [...e.dataTransfer.files].map((f) => `${f.name} (${f.size} bytes)`).join(", ");
+      showPreview([...e.dataTransfer.files].map((f) => `${f.name} (${f.size} bytes)`).join(", "));
       window.droppedFiles = [...e.dataTransfer.files].map((f) => [f.name, f.size, f.type]);
     });
 
@@ -138,8 +207,7 @@
       const files = [...(e.clipboardData ? e.clipboardData.files : [])];
       if (!files.length) return;
       e.preventDefault();
-      document.getElementById("preview").style.display = "block";
-      document.getElementById("preview-names").textContent = files.map((f) => f.name).join(", ");
+      showPreview(files.map((f) => f.name).join(", "));
       window.pastedFiles = files.map((f) => [f.name, f.size, f.type]);
     });
   }
@@ -173,9 +241,15 @@
     const paint = picture.getContext("2d");
     paint.fillStyle = "#e66100";
     paint.fillRect(0, 0, 64, 64);
-    const n = new Notification(from, { body: text, tag: from.toLowerCase().replace(/\W/g, "") + "@c.us",
-      icon: picture.toDataURL("image/png") });
-    n.onclick = () => { window.focus(); open(from); window.clickedNotification = from; };
+    const n = new Notification(from, { body: text, tag: IDS[from], icon: picture.toDataURL("image/png") });
+    // As WhatsApp's own handler: the left drawer closes, the chat opens by its id, then its box has focus.
+    n.onclick = () => {
+      window.focus();
+      document.querySelector('[data-testid="drawer-left"] > span').replaceChildren();
+      open(from).then(() => composer().focus());
+      window.clickedNotification = from;
+      n.close();
+    };
     return n.id ?? true;
   };
 

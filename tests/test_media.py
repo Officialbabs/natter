@@ -665,6 +665,7 @@ class Page:
         self.refused_since_load = dict.fromkeys(media.KINDS, False)
         self._backstop = dict.fromkeys(media.KINDS, True)
         self._fresh_after_call, self._held_media = set(), []
+        self._in_page = 0  # no reply in the page (Account.send_reply)
 
     def __getattr__(self, name):
         return types.MethodType(getattr(Account, name), self)
@@ -1073,10 +1074,19 @@ class Action:
 
 class Window:
     def __init__(self, visible=True):
-        self.toasts, self.visible = [], visible
+        self.toasts, self.visible, self.banner, self.said = [], visible, None, []
 
     def toast(self, title, *rest, **_kwargs):
         self.toasts.append(title)
+
+    def say(self, text):
+        self.said.append(text)
+
+    def set_banner(self, title, button="", action="", target=None):
+        self.banner = (title, button, action)
+
+    def hide_banner(self):
+        self.banner = None
 
     def get_visible(self):
         return self.visible
@@ -1111,6 +1121,7 @@ class App:
         self._media_watchers, self._media_watch_next, self._asking_camera = {}, 0, False
         self._camera_waiting, self._camera_gate_before = [], None
         self._camera_gate_was, self._quitting, self.told = None, False, []
+        self._media_banner, self.locked = False, False
         self.settings.connect(lambda key, value: Natter._on_setting(self, key, value))
 
     def __getattr__(self, name):
@@ -1297,10 +1308,22 @@ class AppTest(unittest.TestCase):
         self.assertTrue(app.media_lost)
         self.assertEqual(accounts[0].done, [("lost",)])
         self.assertEqual(heard, [1])
-        self.assertEqual(len(app.window.toasts), 1)
-        self.assertIn(NAME, app.window.toasts[0])
+        # Until the restart, the banner, whose Restart does it: read out as it comes up, not toasted too.
+        restart = f"Restart {NAME} to use the microphone and camera"
+        self.assertEqual(app.window.banner, (restart, "Restart", "app.restart"))
+        self.assertEqual((app.window.toasts, app.window.said), ([], [restart]))
         app._on_anchor_gone(None, SimpleNamespace(value_nick="crashed"))
         self.assertEqual(accounts[0].done, [("lost",)])  # once
+
+    def test_the_anchor_gone_with_notifications_paused(self):
+        # The banner says notifications are paused: a toast says it, with the Restart.
+        app = App(self, [FakeAccount("Personal")])
+        with mock.patch.object(Natter, "_on_setting"):  # paused before: only the banner it leaves matters
+            app.settings["dnd_until"] = -1
+        with mock.patch.object(natter_app, "in_sandbox", return_value=False):
+            app._on_anchor_gone(None, SimpleNamespace(value_nick="crashed"))
+        self.assertEqual(app.window.toasts, [f"Restart {NAME} to use the microphone and camera"])
+        self.assertEqual(app.window.banner[0], "Notifications paused")
 
     def test_the_anchor_gone_in_the_flatpak_or_quitting(self):
         accounts = [FakeAccount("Personal")]

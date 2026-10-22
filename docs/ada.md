@@ -68,6 +68,23 @@ Two things for lifecycled, from a WhatsApp page that grew to 12 GB (20 October 2
   `MemorySwapMax` on Ada's, and says in its log when Ada's is `stop`. Its own guard
   (`natter/memguard.py`) ends a runaway page well before either.
 
+## Replying from notifications
+
+A message's notification has a Reply action (`reply`, next to `default` and `mute`). Ada's
+notification server shows it as a button, and Natter Den opens a small reply window for that chat,
+without bringing its main window forward. Two additions to Ada would make it better, with no
+change to Natter Den:
+
+- **An `ActivationToken` signal before `ActionInvoked`**, as the notification spec has it since
+  1.2. Natter Den gives the token to the reply window (or, while it's locked, to the passcode), so
+  on Wayland it comes forward with the focus, ready to type in. Without one, it depends on Ada
+  letting the window take the focus.
+- **KDE's inline reply**: advertise `inline-reply` in `GetCapabilities`, show the action keyed
+  `inline-reply` as a text field (with the hints `x-kde-reply-placeholder-text`,
+  `x-kde-reply-submit-button-text` and `x-kde-reply-submit-button-icon-name`), and send
+  `NotificationReplied(u id, s text)` to the app. Natter Den offers it only when the notification
+  shows who wrote, and accepts the text only from the server's own bus name, once per field.
+
 ## Light, Dark and Dune
 
 Ada's Settings → Appearance picks the apps' style (Light, Dark or Dune) and stores it in

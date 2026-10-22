@@ -312,6 +312,16 @@
     "header-name": ['[data-testid="conversation-info-header-chat-title"]', "span[title]",
                     'span[dir="auto"]'],                   // the chat's name, in the header
     "link-screen": ["#app canvas", "#app [data-ref]", "#app [data-link-code]"],  // the QR screen
+    // For replies (below); not judged by the canary, as most need a chat open to be seen.
+    "main": ["#main"],                                     // the open chat
+    "footer": ["footer"],                                  // its bottom bar, in #main
+    "composer": ['[contenteditable="true"][role="textbox"]', '[data-lexical-editor="true"]',
+                 '[contenteditable="true"]'],              // its message box, in the footer
+    "msg-key": ["[data-id]"],                              // its messages, in #main: "<mine>_<chat id>_<id>…"
+    // WhatsApp keeps its drawers' containers in the page all the time, with nothing in them
+    // unless one is open (drawerOpen).
+    "drawer-left": ['[data-testid="drawer-left"]'],        // over the chat list: profile, settings, a new group
+    "drawer-middle": ['[data-testid="drawer-middle"]'],    // over the chat: a picture or file waiting to be sent
   };
 
   function find(key, root = document) {
@@ -802,6 +812,363 @@
     });
   }
 
+  // ---- Replying from a notification ---------------------------------------------------------
+  // A reply goes the way the person's own hands would take it, once: WhatsApp's own handler for
+  // its notification opens that chat (unless it's open already), the words go into the chat's
+  // empty message box through the page's own editing commands, and WhatsApp's Send button is
+  // pressed once. Never the Enter key (what it does follows WhatsApp's "Enter is send" setting),
+  // never twice, never again after a failure, and nothing of WhatsApp's code or storage. Anything
+  // that doesn't look exactly right ends it before Send, with the reason: nothing is guessed.
+  // The answers (account.py REPLY_RESULTS):
+  //   "sent"           Send pressed, and WhatsApp took the words out of the box
+  //   "unsure"         Send pressed, not seen to go: it may have, so it's never tried again
+  //   "left-as-draft"  typed, not sent: the words may be in the chat's message box
+  //   "draft" (the chat has words of the person's own in its box, or a message being replied to),
+  //   "busy" (something's in the way), "cant-send" (the chat takes no messages from them),
+  //   "mismatch" (the chat that opened isn't that one), "gone" (no way to open it), "not-ready",
+  //   "calling", "too-long": nothing typed
+
+  const CHAT_ID = /^\d{5,24}(-\d{5,24})?@(c\.us|g\.us|lid)$/;  // people and groups (account.py CHAT_ID)
+  const REPLY_LIMIT = 4096;  // UTF-16 code units, as String.length counts them (account.py REPLY_LIMIT)
+  const CHAT_WAIT_MS = 10000;  // for the chat to open
+  const DRAFT_QUIET_MS = 250;  // a chat just opened puts its draft back in the box: until the box is still
+  const DRAFT_WAIT_MS = 1500;
+  const LINE_WAIT_MS = 2000;  // for each line to land in the box
+  const SEND_WAIT_MS = 5000;  // for WhatsApp's Send button, which turns up a timer tick after the words
+  const SENT_WAIT_MS = 10000;  // for the box to empty once Send is pressed
+  // WhatsApp's own swap of a text emoticon just before the caret for an emoji ("Replace text
+  // with emoji"); the thumbs up and down in the skin tone the person picked.
+  const EMOTICONS = [["(y)", "\u{1F44D}"], ["(Y)", "\u{1F44D}"], ["(n)", "\u{1F44E}"], ["(N)", "\u{1F44E}"],
+    [":-)", "\u{1F642}"], [":-(", "\u{1F641}"], [":-p", "\u{1F61B}"], [":-P", "\u{1F61B}"], [":-\\", "\u{1F615}"],
+    [":-D", "\u{1F600}"], [":-o", "\u{1F62E}"], [";-)", "\u{1F609}"], [":-*", "\u{1F618}"], [":-|", "\u{1F610}"],
+    [":'(", "\u{1F622}"], ["^_^", "\u{1F601}"], ["<3", "\u2764"], [">_<", "\u{1F606}"]];
+  const SKIN_TONE = /^[\u{1F3FB}-\u{1F3FF}]?$/u;
+  const BLOCKS = /^(P|DIV|LI|H[1-6]|BLOCKQUOTE|PRE)$/;
+
+  // The box's words as the person sees them: a line per paragraph and per line break, emoji
+  // pictures as the characters they stand for. A block that ends in a line break gets one more
+  // <br> from the editor, for the caret; that one isn't a line.
+  function boxText(element) {
+    let out = "";
+    let first = true;
+    for (const node of element.childNodes) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        out += node.textContent;
+      } else if (node.nodeType !== Node.ELEMENT_NODE) {
+        continue;
+      } else if (node.tagName === "BR") {
+        out += "\n";
+      } else if (node.tagName === "IMG") {
+        out += node.getAttribute("alt") || node.getAttribute("data-plain-text") || "";
+      } else if (BLOCKS.test(node.tagName)) {
+        let inner = boxText(node);
+        if (node.lastChild && node.lastChild.nodeName === "BR") inner = inner.slice(0, -1);
+        out += (first ? "" : "\n") + inner;
+      } else {
+        out += boxText(node);
+      }
+      first = false;
+    }
+    return out;
+  }
+
+  // Words compared as they read: the same characters (NFC), the same lines, spaces and invisible
+  // marks aside. U+FE0F (which emoji pictures may or may not carry) aside too.
+  function canonical(text) {
+    return text.normalize("NFC").replace(INVISIBLE, "").replace(/\uFE0F/g, "").replace(/\u00A0/g, " ")
+      .split("\n").map((line) => line.replace(/[ \t]+/g, " ").trim()).join("\n").replace(/^\n+|\n+$/g, "");
+  }
+
+  // Whether `landed` (canonical) is what typing `wanted` (canonical) gives: exactly, but for
+  // WhatsApp's emoticon swap, which only ever happens at the caret, the end of each line typed.
+  function sameText(landed, wanted) {
+    if (landed === wanted) return true;
+    const got = landed.split("\n");
+    const want = wanted.split("\n");
+    return got.length === want.length && want.every((line, i) => line === got[i] || EMOTICONS.some(([text, emoji]) => {
+      if (!line.endsWith(text)) return false;
+      const head = line.slice(0, -text.length);
+      return got[i].startsWith(head + emoji) && SKIN_TONE.test(got[i].slice(head.length + emoji.length));
+    }));
+  }
+
+  function boxEmpty(box) {
+    return !canonical(boxText(box)) && !box.querySelector("img, [data-lexical-decorator]");
+  }
+
+  function drawerOpen(key) {
+    const drawer = find(key);
+    return Boolean(drawer && [...drawer.children].some((child) => child.childElementCount > 0));
+  }
+
+  // The chats the open chat's messages belong to, by their keys: "<mine>_<chat id>_<id>…".
+  function chatIds(main) {
+    const ids = new Set();
+    main.querySelectorAll(WHERE["msg-key"].join(", ")).forEach((row) => {
+      const parts = (row.getAttribute("data-id") || "").split("_");
+      if (parts.length >= 3 && (parts[0] === "true" || parts[0] === "false")) ids.add(parts[1]);
+    });
+    return ids;
+  }
+
+  // Whether the open chat `main` is `chat`, by its messages' keys. A group's are all the group's:
+  // anything else there means another chat, say a person's holding a message quoted from the group
+  // ("Reply privately"), should a quote carry a key of its own. A person's chat may hold their
+  // keys under two of their ids (WhatsApp moving people to new ids), so there theirs is enough.
+  function isChat(main, chat) {
+    const ids = chatIds(main);
+    return ids.has(chat) && (!chat.endsWith("@g.us") || ids.size === 1);
+  }
+
+  // The keys of the person's own messages in `main`, for seeing one more turn up.
+  function ownKeys(main, chat) {
+    return new Set([...main.querySelectorAll(WHERE["msg-key"].join(", "))].map((row) => row.getAttribute("data-id"))
+      .filter((key) => key && key.startsWith(`true_${chat}_`)));
+  }
+
+  function composerIn(main) {
+    const footer = find("footer", main);
+    return footer && find("composer", footer);
+  }
+
+  // The names of the icons in `element`, which WhatsApp doesn't translate (its labels it does).
+  function iconNames(element) {
+    return [...element.querySelectorAll("svg title, [data-icon]")]
+      .map((icon) => icon.getAttribute("data-icon") || icon.textContent || "").join(" ").toLowerCase();
+  }
+
+  const CONTROLS = 'button, [role="button"]';
+  const VOICE_CONTROLS = /ptt|mic|voice|record|audio|pause|stop|delete|trash|play/;  // a voice message's own
+  const ROW_END = /ptt|mic|voice|record|audio|send/;  // the button at the end of the message box's row
+
+  // Whether the footer of the open chat `main`, with no message box in it, holds a voice message
+  // being recorded or waiting to be sent (its controls, its player), or with `strict` controls of
+  // any kind. Words alone (a group only admins write in, one you've left) hold nothing of yours.
+  function footerInUse(main, strict) {
+    const footer = find("footer", main);
+    if (!footer || composerIn(main)) return false;
+    if (footer.querySelector("audio")) return true;
+    return [...footer.querySelectorAll(CONTROLS)].some((control) => strict || VOICE_CONTROLS.test(iconNames(control)));
+  }
+
+  // Whether `element` is on show, more than a pixel high, with words or a picture in it. Words
+  // only in HTML: an icon's (SVG) are names, not what anyone reads.
+  function showing(element) {
+    const seen = (node) => node.getClientRects().length > 0 && node.getBoundingClientRect().height > 1;
+    return seen(element) && (Boolean(element instanceof HTMLElement && element.innerText.trim())
+      || [...element.querySelectorAll("img, video, canvas")].some(seen));
+  }
+
+  // Whether the footer of `main` shows anything besides the row of its (empty) message box: the
+  // box, and the buttons beside it as far as the voice message button. A message being replied to
+  // shows there, and Send would send these words as a reply to it. WhatsApp names none of it, so
+  // it's read from the layout: anything there with words or a picture counts.
+  function besideTheBox(main, box) {
+    const footer = find("footer", main);
+    if (!footer || !footer.contains(box)) return false;
+    const controls = [...footer.querySelectorAll(CONTROLS)].filter((control) => !box.contains(control));
+    const end = controls.find((control) => ROW_END.test(iconNames(control))) || controls[controls.length - 1];
+    // The box and what holds it, up to the footer: the row is the first of them that holds `end`
+    // too (none: the footer itself is the row), and only what's beside the row and above it counts.
+    const up = [];
+    for (let node = box; node !== footer; node = node.parentElement) up.push(node);
+    const row = end ? up.findIndex((node) => node.contains(end)) : -1;
+    return row >= 0 && up.slice(row).some((inner) =>
+      [...inner.parentElement.children].some((other) => other !== inner && showing(other)));
+  }
+
+  // WhatsApp's Send button, by the name of its icon (its label is translated). It only exists
+  // while there are words in the box; until then its place holds the voice note button, which
+  // this never takes for it. More than one, or a scheduling one, is not a button to guess at.
+  function sendButton(main) {
+    const footer = find("footer", main);
+    if (!footer) return null;
+    const found = [...footer.querySelectorAll(CONTROLS)].filter((button) => {
+      const names = iconNames(button);
+      return /(^|[\s_-])send([\s_-]|$)/.test(names) && !/mic|ptt|voice|record|audio|schedul|later|clock/.test(names);
+    });
+    if (found.length !== 1) return null;
+    const button = found[0];
+    return button.disabled || button.getAttribute("aria-disabled") === "true" ? null : button;
+  }
+
+  // test()'s value as soon as it's truthy, looked at whenever the page changes, or null after
+  // `ms`. Changes are seen at once in a hidden page; timers there wait for WebKit's hidden-page
+  // throttling, which Natter turns off during a reply (account.py).
+  function until(test, ms) {
+    return new Promise((resolve) => {
+      const now = test();
+      if (now || ms <= 0) {
+        resolve(now || null);
+        return;
+      }
+      let over = false;
+      const finish = (value) => {
+        if (over) return;
+        over = true;
+        observer.disconnect();
+        clearTimeout(timer);
+        resolve(value || null);
+      };
+      const observer = new MutationObserver(() => { const value = test(); if (value) finish(value); });
+      observer.observe(find("app") || document.body,
+                       { childList: true, subtree: true, characterData: true, attributes: true });
+      const timer = setTimeout(() => finish(test()), ms);
+    });
+  }
+
+  // Once nothing in `root` has changed for `ms`, or after `most`.
+  function quiet(root, ms, most) {
+    return new Promise((resolve) => {
+      let timer = 0;
+      const finish = () => {
+        observer.disconnect();
+        clearTimeout(timer);
+        clearTimeout(end);
+        resolve();
+      };
+      const observer = new MutationObserver(() => { clearTimeout(timer); timer = setTimeout(finish, ms); });
+      observer.observe(root, { childList: true, subtree: true, characterData: true });
+      timer = setTimeout(finish, ms);
+      const end = setTimeout(finish, most);
+    });
+  }
+
+  // One turn of the page's event loop, which a hidden page doesn't hold back as it does timers.
+  // An edit's own update (the editor applies it a microtask later) has landed by then.
+  function settle() {
+    return new Promise((resolve) => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => {
+        channel.port1.close();
+        resolve();
+      };
+      channel.port2.postMessage(null);
+    });
+  }
+
+  // The chat id and words of each reply queued or under way: the same reply asked for twice
+  // while the first is still going is the same act, sent once.
+  const replying = new Set();
+  let replies = Promise.resolve();
+
+  // One at a time, in the order asked. `request`: {pageId, chatId, text, budgetMs, visible}.
+  // Its budget runs from now, waiting included: Send is never pressed after it. The answer is
+  // one of those above; why (for Natter's log, never with names or words) goes on request.why.
+  function reply(request) {
+    const { pageId, chatId, text, budgetMs, visible } = request && typeof request === "object" ? request : {};
+    const budget = Number.isFinite(budgetMs) ? Math.min(Math.max(budgetMs, 0), 60000) : 0;
+    const deadline = performance.now() + budget;
+    const tell = ([answer, why]) => {
+      try { request.why = why || ""; } catch (_) { /* a frozen request: no reason told */ }
+      return answer;
+    };
+    const key = JSON.stringify([chatId, text]);
+    if (replying.has(key)) return Promise.resolve(tell(["busy", "repeat"]));
+    replying.add(key);
+    const progress = { stage: "" };
+    const run = () => replyOnce(pageId, chatId, text, deadline, Boolean(visible), progress)
+      // A mistake of Natter's own: said for what may be in WhatsApp by then.
+      .catch(() => [{ "": "busy", typed: "left-as-draft", pressed: "unsure" }[progress.stage], "exception"])
+      .then((answer) => {
+        replying.delete(key);
+        return tell(answer);
+      });
+    replies = replies.then(run, run);
+    return replies;
+  }
+
+  async function replyOnce(pageId, chat, text, deadline, visible, progress) {
+    const left = () => Math.max(0, deadline - performance.now());
+    if (typeof text !== "string" || !text.trim()) return ["too-long", "blank"];
+    const words = text.replace(/\r\n?/g, "\n").trim();
+    if (words.length > REPLY_LIMIT) return ["too-long", ""];
+    if (typeof chat !== "string" || !CHAT_ID.test(chat)) return ["gone", "chat-id"];
+    if (calling()) return ["calling", ""];
+    // A microphone on outside a call is a voice message being recorded, in the open chat: another
+    // chat would end it, and that chat has no message box meanwhile. Seen whether the page is or not.
+    if (liveStreams()) return ["busy", "recording"];
+    if (!find("pane")) return ["not-ready", ""];
+    // A picture or file waiting to be sent: another chat would drop it, and Send would send it.
+    if (drawerOpen("drawer-middle")) return ["busy", "preview"];
+    if (!left()) return ["busy", "queue"];
+    const there = () => {
+      const main = find("main");
+      return main && isChat(main, chat) ? main : null;
+    };
+    let main = there();
+    if (!main) {
+      const notification = shown.get(pageId);
+      if (!notification) return ["gone", "notification"];
+      if (notification.tag !== chat) return ["mismatch", "tag"];
+      // WhatsApp's click closes what's open over the chat list and leaves the open chat, whether
+      // anyone sees the page or not (it keeps both while Natter's window is hidden): a profile
+      // being edited or a group being made, a voice message waiting to be sent. In sight, any
+      // controls in place of the open chat's message box, as someone may be using them.
+      if (drawerOpen("drawer-left")) return ["busy", "drawer"];
+      const open = find("main");
+      if (open && footerInUse(open, visible)) return ["busy", "open-chat"];
+      clickNotification(pageId);  // WhatsApp's own handler: it opens the chat by its id
+      main = await until(there, Math.min(CHAT_WAIT_MS, left()));
+      if (!main) {
+        const open = find("main");
+        if (!open) return [left() ? "gone" : "not-ready", "click"];
+        return ["mismatch", chatIds(open).size ? "other-chat" : "no-ids"];
+      }
+      await quiet(main, DRAFT_QUIET_MS, Math.min(DRAFT_WAIT_MS, left()));
+      if (there() !== main) return ["mismatch", "moved"];
+    }
+    const box = composerIn(main);
+    // No message box: a voice message of theirs in its place, or a chat that takes none from them.
+    if (!box) return footerInUse(main, false) ? ["busy", "no-composer"] : ["cant-send", ""];
+    if (!boxEmpty(box)) return ["draft", ""];  // the person's own words are never touched
+    // Looked at once, before typing: words with a link in them bring a preview up there too.
+    if (besideTheBox(main, box)) return ["draft", "quote"];
+    box.focus();
+    const range = document.createRange();
+    range.selectNodeContents(box);
+    range.collapse(false);
+    const selection = getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    await settle();
+    // Only ever into this box: the editing commands act wherever the caret is.
+    const inBox = () => box.isConnected && document.activeElement === box && selection.rangeCount > 0
+      && box.contains(selection.getRangeAt(0).endContainer);
+    const lines = words.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      if (!inBox() || !left()) return [progress.stage ? "left-as-draft" : "busy", !left() ? "late" : "focus"];
+      progress.stage = "typed";
+      if (i) document.execCommand("insertLineBreak");
+      if (lines[i]) document.execCommand("insertText", false, lines[i]);
+      // Each edit lands before the next: the editor reads the caret from the page for each one.
+      await settle();
+      const wanted = canonical(lines.slice(0, i + 1).join("\n"));
+      if (!(await until(() => sameText(canonical(boxText(box)), wanted), Math.min(LINE_WAIT_MS, left())))) {
+        return ["left-as-draft", "text"];
+      }
+    }
+    const wanted = canonical(words);
+    const button = await until(() => sendButton(main), Math.min(SEND_WAIT_MS, left()));
+    if (!left()) return ["left-as-draft", "late"];
+    if (!button) return ["left-as-draft", "no-button"];
+    // Still this chat, this box, these words, this button, nothing waiting to be sent with them.
+    if (there() !== main || composerIn(main) !== box || !sameText(canonical(boxText(box)), wanted)
+        || sendButton(main) !== button || drawerOpen("drawer-middle")) {
+      return ["left-as-draft", "moved"];
+    }
+    const before = ownKeys(main, chat);
+    progress.stage = "pressed";
+    button.click();  // the one press
+    const sent = await until(() => {
+      if (!main.isConnected) return false;
+      if ([...ownKeys(main, chat)].some((key) => !before.has(key))) return true;
+      const now = composerIn(main);
+      return Boolean(now && boxEmpty(now));
+    }, SENT_WAIT_MS);
+    return sent ? ["sent", ""] : ["unsure", ""];
+  }
+
   // ---- Classes Natter's style sheet hangs off -----------------------------------------------
 
   // WhatsApp sets <html>'s classes too and may replace them all, so Natter's are put back.
@@ -868,7 +1235,7 @@
 
   window.__natter = {
     clickNotification, openChat, openLink, attach, pick, receive, discard, setClass, activeChat, scan, audio, startCall,
-    canary,
+    canary, reply,
   };
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", watch, { once: true });

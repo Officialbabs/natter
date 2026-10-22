@@ -324,6 +324,7 @@ class ReviewFixesTest(unittest.TestCase):
         calls = []
         fake = type("App", (), {})()
         fake.window = type("Window", (), {"is_active": lambda _w: False})()
+        fake.replies = {}  # no reply window open (reply.py follows the setting too)
         fake.on_focus_changed = lambda active: calls.append(active)
         fake._refresh_tray = lambda: calls.append("tray")
         Natter._on_setting(fake, "blur_when_away", True)

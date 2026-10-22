@@ -95,6 +95,9 @@ DEFAULTS: dict[str, Any] = {
     "notifications": True,
     "notify_sender": True,
     "notify_preview": True,
+    # Reply on message notifications (reply.py): off turns it off everywhere, should WhatsApp's
+    # page change under it.
+    "notify_reply": True,
     "quiet_hours": False,
     "quiet_start": "22:00",
     "quiet_end": "07:00",

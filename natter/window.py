@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gtk, Pango
+gi.require_version("WebKit", "6.0")
+from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gtk, Pango, WebKit
 
 from . import DEFAULT_APP_ID, NAME
-from . import clipboard, themes
+from . import clipboard, lock as applock, themes
 from .account import Account
 from .prefs import shown_folder
 
@@ -29,6 +31,9 @@ CSS = """
 /* The Reload button's arrow turns while WhatsApp loads again (GTK skips it with animations off). */
 @keyframes natter-turn { from { -gtk-icon-transform: rotate(0turn); } to { -gtk-icon-transform: rotate(1turn); } }
 button.natter-reloading image { animation: natter-turn 1s linear infinite; }
+/* The lock's page, laid over WhatsApp's (Window.show_lock), which may be running under it: opaque
+   even with a theme whose window colour lets some through. */
+.natter-cover { background-color: black; background-image: image(@window_bg_color); }
 """
 
 ACCOUNT_ICON = "avatar-default-symbolic"
@@ -38,6 +43,14 @@ NARROW = "max-width: 550sp"
 # At most one toast about WhatsApp being refused the microphone, or the camera, this many seconds
 # apart: it may ask several times in a row (each device it tries, each press of its button).
 REFUSED_GAP = 10.0
+# The window's actions that act on the page or would show a chat: off while locked, so their keys
+# do nothing at the lock, rather than reload the page behind it or wait to open a chat at the unlock.
+LOCKED_ACTIONS = ("go-to-chat", "reload", "zoom-in", "zoom-out", "zoom-reset", "account")
+# The app's actions whose keys do nothing at the lock either: Preferences could take the lock off,
+# and privacy blur is for whoever unlocks to choose. Their menu items are under the lock anyway.
+LOCKED_KEYS = ("app.preferences", "app.privacy-blur")
+UNLOCK_FADE = 200  # ms the lock takes to fade off the page; it comes on at once
+HIDE_AFTER_LOCK = 100  # ms at most that closing waits for the lock to be drawn before hiding
 
 
 def rgba(value: str) -> Gdk.RGBA:
@@ -196,10 +209,18 @@ def switcher_places(accounts: int, narrow: bool) -> tuple[bool, bool]:
 class AccountPage(Gtk.Overlay):
     """An account's page, with a notice over it when WhatsApp can't be reached or keeps stopping."""
 
-    def __init__(self, account: Account, settings) -> None:
+    def __init__(self, account: Account, settings, changed: Callable[[], None] = lambda: None) -> None:
         super().__init__(child=account.view)
         self.account = account
         self.settings = settings
+        # Whether the page runs under the lock's cover (Window._behind_lock), and `changed()` when
+        # something that decides it has: a new page, its first chats listed.
+        self.warm = applock.WarmUp()
+        self.changed = changed
+        self._page_handlers = [
+            (account.view, account.view.connect("load-changed", self._on_load_changed)),
+            (account.content, account.content.connect("script-message-received::natter", self._on_page_message)),
+        ]
         # The page takes the colour of WhatsApp's start-up screen, in the theme and style, until
         # WhatsApp paints it: WebKit's own is white, a flash in the dark style.
         self._style_changed = Adw.StyleManager.get_default().connect("notify::dark", lambda *_: self.paint())
@@ -236,6 +257,29 @@ class AccountPage(Gtk.Overlay):
     def forget(self) -> None:
         """The account is gone: its page stops following the style."""
         Adw.StyleManager.get_default().disconnect(self._style_changed)
+        for target, handler in self._page_handlers:
+            target.disconnect(handler)
+        self._page_handlers = []
+
+    def _on_load_changed(self, _view, event) -> None:
+        if event == WebKit.LoadEvent.COMMITTED:
+            # The chat open until now (the new page hasn't said otherwise yet) may open again in it.
+            self.warm.loaded(bool(self.account.active_chat))
+            self.changed()
+
+    def _on_page_message(self, _content, value) -> None:
+        """The bridge's first list of chats in this page: it has drawn its chat list. Read more
+        loosely than Account reads the bridge's messages, on purpose: all one can do here is end
+        the page's run under the cover sooner, which is the safe way to be wrong."""
+        if self.warm.listed:
+            return
+        try:
+            message = json.loads(value.to_json(0) or "null")
+        except (TypeError, ValueError, GLib.Error):
+            return
+        if isinstance(message, dict) and message.get("type") == "chats" and message.get("rows"):
+            self.warm.chats_listed()
+            self.changed()
 
     def _show_state(self) -> None:
         account = self.account
@@ -288,7 +332,7 @@ class Window(Adw.ApplicationWindow):
         self.stack = Adw.ViewStack(vexpand=True)
         self.stack.connect("notify::visible-child",
                            lambda *_: (app.on_page_changed(), self._show_call(), self._show_subtitle(),
-                                       self._show_reloading()))
+                                       self._show_reloading(), self._behind_lock()))
         self.switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
         self.switcher_bar = Adw.ViewSwitcherBar(stack=self.stack)
         self.title = Adw.WindowTitle(title=NAME)
@@ -334,11 +378,20 @@ class Window(Adw.ApplicationWindow):
         # WhatsApp's page never scrolls under the bars, so they'd never get their edge from it.
         view.set_top_bar_style(Adw.ToolbarStyle.RAISED_BORDER)
         view.set_bottom_bar_style(Adw.ToolbarStyle.RAISED_BORDER)
-        # The app lock (lock.py): WhatsApp stays loaded behind it, out of sight and out of reach.
-        self.locks = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
-        self.locks.add_named(view, "content")
-        self.locks.add_named(self._lock_page(), "locked")
+        # The app lock (lock.py): its page is laid over WhatsApp's, opaque, rather than taking its
+        # place, so WhatsApp can go on starting under it while the passcode is asked (_behind_lock).
+        # Either way the page is out of sight and out of reach.
+        self.content = view
+        self.cover = self._lock_page()
+        self.cover.add_css_class("natter-cover")
+        self.cover.set_visible(False)
+        self.locks = Gtk.Overlay(child=view)
+        self.locks.add_overlay(self.cover)
+        self.locks.set_measure_overlay(self.cover, True)  # the lock's own minimum size counts too
         self.set_content(self.locks)
+        self._fade: Optional[Adw.Animation] = None
+        self._warm_timer = 0
+        self._running_behind = False
         activity = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
         activity.connect("key-pressed", lambda *_: (app.note_activity(), False)[1])
         self.add_controller(activity)
@@ -355,6 +408,7 @@ class Window(Adw.ApplicationWindow):
         self._drops()
         self.connect("close-request", self._on_close)
         self.connect("notify::is-active", lambda *_: app.on_focus_changed(self.is_active()))
+        self.connect("notify::visible", lambda *_: self._behind_lock())
 
         snapshot = os.environ.get("NATTER_SNAPSHOT")
         if snapshot:
@@ -396,9 +450,7 @@ class Window(Adw.ApplicationWindow):
                 if dialog is None:
                     break
                 dialog.force_close()
-        # Insensitive, the page behind the lock takes no focus, keys or paste.
-        self.locks.get_child_by_name("content").set_sensitive(not locked)
-        self.locks.set_visible_child_name("locked" if locked else "content")
+        self._cover(locked)
         self.passcode.set_text("")
         # Emptying a field that's empty already says nothing ("changed" doesn't come), so a wrong
         # try's red outline would still be there the next time the window locks.
@@ -410,6 +462,81 @@ class Window(Adw.ApplicationWindow):
             self.passcode.grab_focus()
         elif self.account:
             self.account.view.grab_focus()
+
+    def _cover(self, locked: bool) -> None:
+        """Lay the lock over the page, or take it off. Under the lock the page is out of reach,
+        whether or not it runs there: insensitive (no focus, keys or paste), out of the pointer's
+        way, and hidden from screen readers. The window's keys that would act on it do nothing."""
+        if self._fade is not None:
+            self._fade.reset()  # locked again while it was fading off: whole again, at once
+            self._fade = None
+        content = self.content
+        content.set_sensitive(not locked)
+        content.set_can_target(not locked)
+        for name in LOCKED_ACTIONS:
+            self.lookup_action(name).set_enabled(not locked)
+        if locked:
+            # At once, not faded in: a fade would show the chat going.
+            self.cover.set_opacity(1)
+            self.cover.set_can_target(True)
+            self.cover.set_visible(True)
+        else:
+            content.set_visible(True)
+            content.update_state([Gtk.AccessibleState.HIDDEN], [False])  # after showing it: see _behind_lock
+            self.cover.set_can_target(False)
+            # Adwaita skips the fade, straight to "done", with animations off or the window hidden.
+            fade = Adw.TimedAnimation.new(self.cover, 1, 0, UNLOCK_FADE,
+                                          Adw.PropertyAnimationTarget.new(self.cover, "opacity"))
+            fade.connect("done", self._faded)
+            self._fade = fade
+            fade.play()
+        self._behind_lock()
+        # Locked, the window isn't in use even when it's the active one: the page's tones follow Do
+        # Not Disturb, and notifications stay until they can be seen (the app's on_focus_changed).
+        self.app.on_focus_changed(self.is_active() and not locked)
+
+    def _faded(self, fade: Adw.Animation) -> None:
+        if fade is self._fade:
+            self._fade = None
+            self.cover.set_visible(False)
+            self.cover.set_opacity(1)
+
+    def _behind_lock(self) -> None:
+        """While locked, the account on screen runs its page under the cover until it has been
+        drawn once since it loaded (lock.WarmUp), so WhatsApp has finished starting by the unlock.
+        Otherwise the page behind the lock is out of sight to WebKit too, which runs it as a
+        background tab: the least it costs, with nobody there."""
+        if self._warm_timer:
+            GLib.source_remove(self._warm_timer)
+            self._warm_timer = 0
+        locked, shown, up = self.app.locked, self.stack.get_visible_child(), self.get_visible()
+        run, due = False, []
+        for stack_page in self.pages.values():
+            page = stack_page.get_child()
+            account = page.account
+            stopped = bool(account.crashing or account.failed or account.removed)
+            if page.warm.want(locked, up and page is shown, account.ready, account.needs_link,
+                              bool(account.active_chat), stopped):
+                run = True
+            if page.warm.due() is not None:
+                due.append(page.warm.due())
+        if locked:
+            self.content.set_visible(run)
+            # Hidden from screen readers either way, set after the visibility: GTK marks a widget it
+            # shows as shown to them too.
+            self.content.update_state([Gtk.AccessibleState.HIDDEN], [True])
+        if run != self._running_behind:
+            self._running_behind = run
+            if GLib.getenv("NATTER_DEBUG"):
+                print(f"natter: the page {'runs' if run else 'stops running'} under the lock", flush=True)
+        if due:
+            # A little after it's due, so the clock has passed it when it's asked again.
+            self._warm_timer = GLib.timeout_add(int(min(due) * 1000) + 50, self._warm_due)
+
+    def _warm_due(self) -> bool:
+        self._warm_timer = 0
+        self._behind_lock()
+        return GLib.SOURCE_REMOVE
 
     def _passcode_changed(self) -> None:
         self.passcode.remove_css_class("error")
@@ -475,11 +602,13 @@ class Window(Adw.ApplicationWindow):
     # ---- Accounts --------------------------------------------------------------------------
 
     def add_account(self, account: Account) -> None:
-        page = self.stack.add_titled_with_icon(AccountPage(account, self.app.settings), account.id, account.name,
-                                               ACCOUNT_ICON)
+        page = self.stack.add_titled_with_icon(AccountPage(account, self.app.settings, self._behind_lock),
+                                               account.id, account.name, ACCOUNT_ICON)
         self.pages[account.id] = page
         for signal in ("state-changed", "chats-changed"):
             account.connect(signal, lambda a: a is self.account and self._show_call())
+        # Up, linking, a chat opened, stopped: whether its page runs under the lock.
+        account.connect("state-changed", lambda *_: self._behind_lock())
         account.connect("media-refused", self._media_refused)
         self._show_switcher()
 
@@ -579,8 +708,13 @@ class Window(Adw.ApplicationWindow):
         # Natter's own keys are caught before the page sees them, so WhatsApp can't swallow them.
         keys = Gtk.ShortcutController(propagation_phase=Gtk.PropagationPhase.CAPTURE)
         for accel, action, target in window_keys():
-            shortcut = Gtk.Shortcut(trigger=Gtk.ShortcutTrigger.parse_string(accel),
-                                    action=Gtk.NamedAction.new(action))
+            if action in LOCKED_KEYS:
+                # Taken at the lock too, so the app's own accelerator for it doesn't act instead.
+                named = Gtk.CallbackAction.new(  # activate_action: PyGObject's name for activate_action_variant
+                    lambda *_, action=action: self.app.locked or self.activate_action(action, None))
+            else:
+                named = Gtk.NamedAction.new(action)
+            shortcut = Gtk.Shortcut(trigger=Gtk.ShortcutTrigger.parse_string(accel), action=named)
             if target is not None:
                 shortcut.set_arguments(target)
             keys.add_shortcut(shortcut)
@@ -654,7 +788,11 @@ class Window(Adw.ApplicationWindow):
     def toast(self, title: str, button: Optional[str] = None, action: Optional[str] = None,
               target: Optional[GLib.Variant] = None, timeout: int = 4) -> None:
         """A toast where it can be seen: over Preferences while that's open (the window's own
-        are under it, and a sheet on a narrow window covers them whole), else the window's."""
+        are under it, and a sheet on a narrow window covers them whole), else the window's.
+        None while locked: under the lock it would go unseen, but a screen reader would still read
+        it out, and some name a chat."""
+        if self.app.locked:
+            return
         toast = Adw.Toast(title=title, timeout=timeout, use_markup=False)
         if button and action:
             toast.set_button_label(button)
@@ -666,6 +804,12 @@ class Window(Adw.ApplicationWindow):
             dialog.add_toast(toast)
         else:
             self.toasts.add_toast(toast)
+
+    def say(self, text: str) -> None:
+        """Read out by a screen reader, for what shows without being read (a banner coming up).
+        Never while locked, for the same reason as toast."""
+        if not self.app.locked:
+            self.announce(text, Gtk.AccessibleAnnouncementPriority.MEDIUM)
 
     def set_banner(self, title: str, button: str = "", action: str = "",
                    target: Optional[GLib.Variant] = None) -> None:
@@ -699,12 +843,46 @@ class Window(Adw.ApplicationWindow):
             return True
         self.remember_size()
         self.app.settle_first_run()  # a new Natter started at login decides now whether closing quits
-        if self.app.settings["run_in_background"]:
-            self.set_visible(False)
-            self.app.window_closed()
+        app = self.app
+        if app.settings["run_in_background"]:
+            if app.settings["lock_on_hide"] and app.lock_enabled and not app.locked:
+                # Locked first, and hidden once the lock has been drawn: the desktop keeps a closed
+                # window's last frame for its previews, which is then the lock, not a chat. (The
+                # app also locks as the window hides, for windows hidden some other way.)
+                app.lock()
+                self._hide_after_frame()
+            else:
+                self.set_visible(False)
+            app.window_closed()
         else:
-            self.app.quit_natter()
+            app.quit_natter()
         return True
+
+    def _hide_after_frame(self) -> None:
+        """Hide the window after its next frame is drawn, or after HIDE_AFTER_LOCK ms if none comes
+        (the desktop may not ask for frames from a window it isn't showing)."""
+        clock = self.get_frame_clock()
+        state = {"handler": 0, "timer": 0}
+
+        def hide(*_args) -> bool:
+            if state["handler"]:
+                clock.disconnect(state["handler"])
+            if state["timer"]:
+                GLib.source_remove(state["timer"])
+            state["handler"] = state["timer"] = 0
+            self.set_visible(False)
+            return GLib.SOURCE_REMOVE
+
+        def timed_out() -> bool:
+            state["timer"] = 0
+            return hide()
+
+        if clock is None:
+            self.set_visible(False)
+            return
+        state["handler"] = clock.connect("after-paint", hide)
+        state["timer"] = GLib.timeout_add(HIDE_AFTER_LOCK, timed_out)
+        self.queue_draw()
 
     # ---- For checking how it looks ---------------------------------------------------------
 

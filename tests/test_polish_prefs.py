@@ -156,6 +156,36 @@ class FollowTest(unittest.TestCase):
         self.assertEqual(unwatched, [3])
 
 
+class NotificationsPageTest(unittest.TestCase):
+    """Preferences → Notifications: Reply's switch, under Show Notifications like its neighbours."""
+
+    def setUp(self):
+        patches = mock.patch.multiple(prefs, **STAND_INS)
+        patches.start()
+        self.addCleanup(patches.stop)
+
+    def test_show_reply_button(self):
+        host = Host(Settings())
+        page = host._notifications()
+        group = page.added()[0]
+        rows = group.added()
+        self.assertEqual([row.props["title"] for row in rows],
+                         ["Show Notifications", "Show Who It's From", "Show Message Text", "Show Reply Button"])
+        shown, reply = rows[0], rows[3]
+        self.assertEqual(reply.props["subtitle"], f"Answer a message without opening {NAME}")
+        self.assertIs(host._rows["notify_reply"], reply)
+        self.assertIn(("active", reply, "sensitive"), [call[:3] for call in shown.called("bind_property")])
+        self.assertIn("Reply answers it in a small window", group.props["description"])
+
+    def test_the_lock_says_what_reply_does(self):
+        host = Host(Settings())
+        host._lock_switched = lambda *args: None
+        host.app.check_passcode = lambda *args: None
+        group = host._lock_groups()[0]
+        switch, = [row for row in group.added() if row.props.get("title") == "Lock With a Passcode"]
+        self.assertIn("Reply asks for the passcode first", switch.props["subtitle"])
+
+
 # ---- The Theme picker ------------------------------------------------------------------------
 
 
