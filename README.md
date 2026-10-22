@@ -56,9 +56,12 @@ WhatsApp said "Camera not found". Natter Den lets WebKit find the camera itself 
 notes on each device (read-only in WebKit's sandbox), and as that way doesn't ask the desktop,
 Natter Den keeps the desktop's answer for the camera itself: its "no", its camera switch for all
 apps, and, with nothing stored yet, it has the desktop ask before WhatsApp gets the camera. (In
-the Flatpak it's the portal's answer, as before.) One known WebKit bug remains: with GStreamer
-1.28 or newer, the camera's picture can freeze on its first frame
-([WebKit bug 324582](https://bugs.webkit.org/show_bug.cgi?id=324582)). A fix is coming.
+the Flatpak it's the portal's answer, as before.) With GStreamer 1.28 or newer, WebKit's camera
+picture also freezes on its first frame
+([WebKit bug 324582](https://bugs.webkit.org/show_bug.cgi?id=324582)): `install.sh` builds a small
+GStreamer plugin that prevents it, if a C compiler, `pkg-config` and GStreamer's headers are there
+(on Ubuntu and Debian: `sudo apt install build-essential pkg-config libgstreamer1.0-dev`).
+`NATTER_CAMFIX=0` turns it off.
 
 ## On your desktop
 
@@ -94,9 +97,12 @@ menu aren't available (the tray shows the count). Desktop search works the same.
 ### Flatpak
 
 The Flatpak brings its own GTK, libadwaita, WebKitGTK and codecs, so it runs on any
-distribution, old ones included. To build and install it from a checkout:
+distribution, old ones included. It needs `flatpak` and `flatpak-builder` (on Ubuntu and Debian:
+`sudo apt install flatpak flatpak-builder`) and the Flathub remote. To build and install it from a
+checkout:
 
 ```sh
+flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 flatpak install flathub org.gnome.Sdk//50 org.gnome.Platform//50
 flatpak-builder --user --install --force-clean build-flatpak packaging/io.github.Officialbabs.Natter.yml
 flatpak run io.github.Officialbabs.Natter

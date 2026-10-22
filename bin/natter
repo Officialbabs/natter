@@ -8,6 +8,11 @@ PyGObject on the first line, and the folder holding the natter package in NATTER
 import os
 import sys
 
+# Older Pythons stop at the first `from __future__ import annotations`: say what to do instead.
+if sys.version_info < (3, 9):
+    sys.exit("Natter Den needs Python 3.9 or newer, and this is Python %d.%d: install the Natter Den Flatpak "
+             "instead (see README.md)." % sys.version_info[:2])
+
 NATTER_DIR = ""  # empty: the checkout this script is in
 DEFAULT_APP_ID = "io.github.Officialbabs.Natter"
 

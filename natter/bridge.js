@@ -260,6 +260,39 @@
              rtc: window.__natterRtc ? window.__natterRtc.counts() : null };
   }
 
+  // ---- Videos aren't pictures ---------------------------------------------------------------
+  // Once an attachment is ready, WhatsApp loads its full preview into an Image to pick a
+  // background colour, and for a video (sent as a video or as a document) that's a blob: URL of
+  // the whole file. WebKitGTK decodes a video given to an <img> as an animated image: every frame
+  // at once, all kept (over 8 GB for a 96 s screen recording), on the page's main thread. So an
+  // <img> never gets a blob of a video: it gets an empty data URL, which fails to load the way any
+  // undecodable picture does. <video> elements still get the blob.
+  {
+    const VIDEO_URLS_KEPT = 256;  // URLs WhatsApp never revokes don't pile up
+    const videoUrls = new Set();
+    const createObjectURL = URL.createObjectURL;
+    const revokeObjectURL = URL.revokeObjectURL;
+    URL.createObjectURL = function (object) {
+      const url = createObjectURL.call(this, object);
+      if (object instanceof Blob && /^video\//i.test(object.type)) {
+        videoUrls.add(url);
+        if (videoUrls.size > VIDEO_URLS_KEPT) videoUrls.delete(videoUrls.values().next().value);
+      }
+      return url;
+    };
+    URL.revokeObjectURL = function (url) {
+      videoUrls.delete(String(url));
+      return revokeObjectURL.call(this, url);
+    };
+    const src = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
+    if (src && src.set) {
+      Object.defineProperty(HTMLImageElement.prototype, "src", {
+        ...src,
+        set(value) { src.set.call(this, videoUrls.has(String(value)) ? "data:," : value); },
+      });
+    }
+  }
+
   // ---- Where things are in WhatsApp's page ----------------------------------------------------
   // Every WhatsApp selector Natter leans on, in one table, likeliest candidate first. A redesign
   // breaks these before anything else; canary() checks them against the live page once the chat

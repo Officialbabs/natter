@@ -141,7 +141,10 @@ fi
 
 # The Python to run Natter with: the system's own first, since that's the one distributions
 # give PyGObject to, then the first python3 on PATH. The check is Natter's own start-up check.
-CHECK='import sys; sys.path.insert(0, sys.argv[1]); from natter.__main__ import check; sys.exit(check())'
+CHECK='import sys
+if sys.version_info < (3, 9):
+    sys.exit("Natter Den needs Python 3.9 or newer, and this is Python %d.%d: install the Natter Den Flatpak instead (see README.md)." % sys.version_info[:2])
+sys.path.insert(0, sys.argv[1]); from natter.__main__ import check; sys.exit(check())'
 PYTHON=""
 for candidate in /usr/bin/python3 "$(command -v python3 || true)"; do
     if [ -n "$candidate" ] && [ -x "$candidate" ] && "$candidate" -c "$CHECK" "$HERE" >/dev/null 2>&1; then
