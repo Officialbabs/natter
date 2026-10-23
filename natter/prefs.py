@@ -21,6 +21,9 @@ SYNC = GObject.BindingFlags.SYNC_CREATE
 APPEARANCES = [("system", "Follow System"), ("light", "Light"), ("dark", "Dark")]
 # Privacy → Microphone and Camera: each switch's setting and title, in the order they're listed.
 DEVICES = (("microphone", "Microphone"), ("camera", "Camera"))
+# Under Microphone: other apps' players pause while a voice message is recorded (mediapause.py).
+PAUSE_OTHER_AUDIO = ("Pause Other Audio While Recording",
+                     "Music and videos in other apps pause while you record a voice message, then play again")
 # Desktops that start what's in ~/.config/autostart themselves, as XDG_CURRENT_DESKTOP names them.
 AUTOSTART_DESKTOPS = {"ada", "budgie", "budgie-desktop", "cinnamon", "x-cinnamon", "cosmic", "dde", "deepin",
                       "enlightenment", "gnome", "kde", "lxde", "lxqt", "mate", "pantheon", "ukui", "unity", "xfce"}
@@ -644,6 +647,8 @@ class Preferences(Adw.PreferencesDialog):
         for key, title in DEVICES:
             self.device_rows[key] = self._switch(key, title)
             group.add(self.device_rows[key])
+            if key == "microphone":
+                group.add(self._switch("pause_other_audio", *PAUSE_OTHER_AUDIO))
         # Only to catch the eye: the line under the title says it in words, so screen readers skip
         # it. It's put in and taken out rather than hidden: a hidden prefix still moves the title.
         self.camera_warning = Gtk.Image(icon_name="dialog-warning-symbolic",

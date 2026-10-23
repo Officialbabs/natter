@@ -151,6 +151,7 @@ class Page:
         self.refused_since_load = dict.fromkeys(media.KINDS, False)
         self._fresh_after_call, self._held_media = set(), []
         self._chats_later = []
+        self.recording = False
         self.runs, self.emitted = [], []
         # Up, with `chat` open in it.
         self.up(chat)

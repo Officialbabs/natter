@@ -539,7 +539,7 @@ class AppearanceTest(unittest.TestCase):
         fake = fake_app(self)
         closed = []
         fake.ada_style = SimpleNamespace(close=lambda: closed.append(True))
-        for name in ("notifier", "reclaimer", "call_sound", "audio_follower"):
+        for name in ("notifier", "reclaimer", "call_sound", "audio_follower", "voice_pause"):
             setattr(fake, name, Recorder())
         fake.tray = fake.calls = fake.window = fake.desktop_media = fake.memory_guard = None
         fake.quit = lambda: None

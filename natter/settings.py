@@ -134,6 +134,7 @@ DEFAULTS: dict[str, Any] = {
     # one for the whole app, so these are too.
     "microphone": True,
     "camera": True,
+    "pause_other_audio": True,  # other apps' players pause while a voice message is recorded (mediapause.py)
     "calls_ring": True,  # keep the linked call window running, so calls ring
     "calls_linked": False,  # internal: the call window has been linked once
     "sw_cleared": False,  # whether WhatsApp's old service-worker data has been cleared, once

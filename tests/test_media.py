@@ -667,6 +667,7 @@ class Page:
         self._backstop = dict.fromkeys(media.KINDS, True)
         self._fresh_after_call, self._held_media = set(), []
         self._in_page = 0  # no reply in the page (Account.send_reply)
+        self.recording = False
 
     def __getattr__(self, name):
         return types.MethodType(getattr(Account, name), self)
@@ -1106,6 +1107,9 @@ class FakeAccount:
 
     def lose_media(self):
         self.done.append(("lost",))
+
+    def set_recording(self, on):
+        pass
 
 
 class App:

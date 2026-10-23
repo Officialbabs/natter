@@ -91,6 +91,7 @@ class App:
         self.reclaimer = types.SimpleNamespace(available=True, stops=0)
         self.reclaimer.stop = lambda: setattr(self.reclaimer, "stops", self.reclaimer.stops + 1)
         self.call_sound, self.written = Log(), []
+        self.voice_pause = types.SimpleNamespace(call_started=lambda: None, call_over=lambda: None)
         self.loop_meter = LoopMeter()
         self._reclaim_timer, self._hidden_at, self._call_ended_at, self._call_packets = 0, None, None, 0
         self._call_held, self._after_call, self._memory_waiting = {}, {}, None

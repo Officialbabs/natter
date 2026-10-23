@@ -30,6 +30,8 @@ Natter Den:
   desktop search. WhatsApp only keeps the visible rows in the page, so older chats show up once
   you've scrolled past them.
 - **The unread count:** from the page's title.
+- **A voice message being recorded:** whether a microphone track WhatsApp got is live outside a
+  call (below).
 
 To open a chat by name, the bridge clicks its row, or types the name into WhatsApp's search box and
 clicks the result.
@@ -129,9 +131,29 @@ it then works there is untried.
 | Start hidden at login | XDG autostart, or the Background portal in the Flatpak |
 | Window forward from a notification | an activation token from the notification server (on Wayland) |
 | One process group, memory back while hidden | a systemd user session; for memory, zram or zswap too |
+| Other audio paused while recording | players that speak MPRIS (`org.mpris.MediaPlayer2`) on the session bus |
 
 On Ada, adding `io.github.Officialbabs.Natter` to `AllowBackground` in
 `~/.config/os-ai/lifecycle.ini` keeps Natter Den receiving messages while its window is closed.
+
+### Pausing other audio
+
+While you record a voice message, other apps' players pause, and play again after. The bridge says
+"recording" once a microphone track from `getUserMedia` has been live for 300 ms outside a call, and
+"not recording" as soon as the last one ends. Natter Den (`natter/mediapause.py`) then asks each
+`org.mpris.MediaPlayer2.*` name on the session bus whether it's playing and can pause, and pauses
+those that are, skipping players of its own (by name, and by owner process). 400 ms after the
+recording ends, it plays again only those it paused that are still paused: one you played, stopped
+or closed meanwhile is left alone, and nothing plays again after 15 minutes. A call, ringing or
+connected, holds them until it's over; then they play again. A page that reloads or
+crashes mid-recording, or Natter Den quitting, ends the recording. Each D-Bus call is asynchronous,
+with a 500 ms timeout. The log gets one line per recording with the counts, never the players'
+names. *Pause Other Audio While Recording* in Preferences → Privacy turns it off (what it paused
+already still plays again); the Flatpak has `--talk-name=org.mpris.MediaPlayer2.*` for it.
+
+A call placed from WhatsApp's own call button can look like a voice message for a moment: if its
+microphone comes on more than 300 ms before the call's first data channel is made, other audio
+pauses a moment early, and plays again when the call ends.
 
 ## Replies from notifications
 

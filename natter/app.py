@@ -34,6 +34,7 @@ from .gstfix import debug_line as camera_fix_line
 from .links import chat_link, page_link
 from .loan import out_of_sight
 from .launcher import Badge, chat_key, exec_quote, set_menu_chats
+from .mediapause import Bus as PlayerBus, VoicePause
 from .memguard import (KILL_MEMORY, OOM_SCORE_ADJ, MiB, MemoryGuard, in_flatpak, kill as kill_web_process,
                        mem_total, page_ceiling, page_limit, page_limits, page_sizes, web_processes)
 from .notify import Notifier, ReplyTarget
@@ -702,6 +703,10 @@ class Natter(Adw.Application):
         self.loop_meter = LoopMeter()  # how late the main loop runs during a call (_measure_call)
         # The page's sound follows the computer's output (Bluetooth headphones connected later).
         self.audio_follower = AudioFollower(on_change=self._devices_changed)
+        # Other apps' players pause while a voice message is recorded, and play again after.
+        self.voice_pause = VoicePause(PlayerBus(self.get_dbus_connection),
+                                      enabled=lambda: bool(self.settings["pause_other_audio"]),
+                                      calling=lambda: self.calling or bool(self.calls and self.calls.in_call))
         self._window_services = False
         clipboard.tidy()
         self.settings.connect(self._on_setting)
@@ -1469,8 +1474,11 @@ class Natter(Adw.Application):
 
     def _on_in_call(self, _calls: CallWindow, active: bool) -> None:
         if active:
+            self.voice_pause.call_started()
             self._pending_call = None
             self.withdraw_notification("call")
+        else:
+            self.voice_pause.call_over()
 
     def show_call_window(self) -> None:
         # The call window is a whole WhatsApp of its own: not while Natter is locked.
@@ -1590,6 +1598,10 @@ class Natter(Adw.Application):
                     and not self.calls.running and "calls-start" not in self._told):
                 self._told.add("calls-start")
                 GLib.timeout_add_seconds(CALLS_START_DELAY, lambda: self.calls.keep_running and self.calls.start() and False)
+
+    def voice_note(self, account: Account, on: bool) -> None:
+        """A voice message started or stopped being recorded in `account`'s page (Account.set_recording)."""
+        self.voice_pause.recording(account.id, on)
 
     def page_changed(self, missing: list[str]) -> None:
         """The bridge's canary found WhatsApp's layout changed under it: say so, once a session.
@@ -2134,6 +2146,7 @@ class Natter(Adw.Application):
             began = self._call_held.pop(account, None)
             if began is not None:
                 self._after_call[account] = (began, self._call_ended_at)
+            self.voice_pause.call_over()  # a call that only rang: what a voice message paused plays again
         self._apply_page_sound()
         if self.calling:
             if self._reclaim_timer:
@@ -2146,6 +2159,12 @@ class Natter(Adw.Application):
             if self.window and not self.window.get_visible():
                 self._on_window_visible(False)
         self._measure_call(self.calling)
+
+    def page_connected(self, on: bool) -> None:
+        """A page's call connected (a ringing one answered), or is over (rtc.py in_call)."""
+        if on:
+            self.voice_pause.call_started()  # what a voice message paused waits for the call to end
+        self._apply_page_sound()
 
     def _call_packets_now(self) -> int:
         return sum(account.rtc.packets for account in self.accounts if account.rtc is not None)
@@ -2658,6 +2677,9 @@ class Natter(Adw.Application):
             if action is not None:
                 action.set_state(GLib.Variant("b", bool(self.settings[key])))
             self._apply_media(key)
+        if key == "microphone" and not value:
+            for account in self.accounts:
+                account.set_recording(False)  # the page's microphone ends: so does the voice message
         if key in ("privacy_blur", "blur_when_away", "notify_sender", "notify_preview"):
             for window in list(self.replies.values()):
                 window.apply_privacy()
@@ -2845,6 +2867,7 @@ class Natter(Adw.Application):
                 self.memory_guard.stop()  # the pages end now: nothing for it to watch
             for account in self.accounts:
                 account.chats.save()
+            self.voice_pause.quit()  # what a voice message paused plays again, as the main loop still runs
             self.notifier.withdraw()
             # Only true of this instance, and one started next could neither take it away nor act on
             # its Restart: GLib leaves it up when Natter ends.
@@ -2878,8 +2901,17 @@ class Natter(Adw.Application):
             # Account.end_page), then the anchor, with the main loop running while they end (the
             # window stays as it was meanwhile), then the quit.
             self._pages_ended = True
+
+            def then() -> None:
+                # The players still owing answers get mediapause.QUIT_WAIT_MS more at most.
+                try:
+                    self.voice_pause.when_idle(self.quit)
+                except Exception:
+                    traceback.print_exc()
+                    self.quit()
+
             try:
-                end_pages(self.accounts, getattr(self, "_sandbox_anchor", None), self.quit)
+                end_pages(self.accounts, getattr(self, "_sandbox_anchor", None), then)
             except Exception:
                 traceback.print_exc()
                 self.quit()  # whatever ending the pages ran into: still out
@@ -2892,6 +2924,11 @@ class Natter(Adw.Application):
         try:
             if not getattr(self, "_pages_ended", False):
                 self._pages_ended = True
+                if getattr(self, "voice_pause", None) is not None:
+                    try:
+                        self.voice_pause.quit_and_wait()  # what a voice message paused plays again
+                    except Exception:
+                        traceback.print_exc()
                 end_pages(self.accounts, getattr(self, "_sandbox_anchor", None))
         finally:
             Adw.Application.do_shutdown(self)

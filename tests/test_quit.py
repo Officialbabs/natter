@@ -281,7 +281,9 @@ def quitting_app(events, accounts=(), anchor=None, guard=True):
         accounts=list(accounts), replies={}, tray=Log("tray", events), window=None, ada_style=None,
         desktop_media=None, calls=None, memory_guard=Log("guard", events) if guard else None,
         notifier=Log("notifier", events), reclaimer=Log("reclaimer", events), call_sound=Log("call_sound", events),
-        audio_follower=Log("audio_follower", events), withdraw_notification=lambda key: events.append("withdraw"),
+        audio_follower=Log("audio_follower", events),
+        voice_pause=Log("voice_pause", events, when_idle=lambda then: then()),
+        withdraw_notification=lambda key: events.append("withdraw"),
         quit=lambda: events.append("quit"))
     if anchor is not None:
         app._sandbox_anchor = anchor
@@ -312,6 +314,8 @@ class QuitNatterTest(unittest.TestCase):
             self.assertEqual(events[-2:], ["page.end_page", "anchor.terminate_web_process"])
             self.assertLess(events.index("page.chats.save"), events.index("page.end_page"))
             self.assertLess(events.index("tray.close"), events.index("page.end_page"))
+            # What a voice message paused plays again while the main loop still runs.
+            self.assertLess(events.index("voice_pause.quit"), events.index("page.end_page"))
             self.assertNotIn("quit", events)  # their processes still run
             pages.running.clear()
             run_loop(lambda: "quit" in events)

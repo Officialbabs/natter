@@ -50,6 +50,7 @@ class Page:
         self.crashing = self.memory_stopped = self.reloading = False
         self.fresh_at, self._reload_timer = 0.0, 0
         self._crashes, self._memory_ends, self._pending = [], [], {}
+        self.recording = False
         self.emitted = []
 
     def __getattr__(self, name):

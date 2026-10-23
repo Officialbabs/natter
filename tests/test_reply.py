@@ -1644,7 +1644,7 @@ class RestartTest(unittest.TestCase):
         quiet = SimpleNamespace(told=None, untell=lambda: self.fail("nothing to take away"))
         app = SimpleNamespace(accounts=[], tray=None, window=None, memory_guard=None, ada_style=None,
                               desktop_media=None, calls=None, notifier=Fake(), reclaimer=Fake(), call_sound=Fake(),
-                              audio_follower=Fake(), withdraw_notification=withdrawn.append,
+                              audio_follower=Fake(), voice_pause=Fake(when_idle=lambda then: then()), withdraw_notification=withdrawn.append,
                               quit=lambda: quit_.append(1), replies={("main", PERSON): told, ("main", GROUP): quiet})
         Natter.quit_natter(app)
         # A failed reply's notice too: its words end with this Natter, and Show Reply would find nothing.

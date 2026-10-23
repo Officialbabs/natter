@@ -282,6 +282,8 @@ def parse_message(message) -> Optional[dict]:
         return {"type": kind, "value": value} if value in ("needs-link", "chats") else None
     if kind == "call":
         return {"type": kind, "video": message["video"]} if isinstance(message.get("video"), bool) else None
+    if kind == "recording":
+        return {"type": kind, "on": message["on"]} if isinstance(message.get("on"), bool) else None
     if kind == "canary":
         # The bridge's selector check: which WHERE entries matched WhatsApp's live page.
         found, missing = message.get("found"), message.get("missing")
@@ -558,6 +560,9 @@ class Account(GObject.Object):
         # said something (a message, a call ringing), gets no fresh page for memory (app.py).
         self.loaded_at = time.monotonic()
         self.notified_at: Optional[float] = None
+        # A voice message is being recorded in the page (the "recording" message): other apps'
+        # sound pauses meanwhile (app.py voice_note). Over once the page goes, whatever it said.
+        self.recording = False
         self._reload_timer = 0
         self._page_timer = 0  # looks at a page that's loading or just loaded (_watch_page)
         self._progress = (-1.0, 0.0)  # the loading page's progress, and since when (_page_stalled)
@@ -639,7 +644,7 @@ class Account(GObject.Object):
         self.audio_sizes = audiosizes.Watch(self)
         if app.calls_in_page:
             # The page's sound follows in_call too (app.py _apply_page_sound): a ringing call answered.
-            self.rtc = rtc.Host(self._on_page_call, lambda _on: self.app._apply_page_sound())
+            self.rtc = rtc.Host(self._on_page_call, lambda on: self.app.page_connected(on))
             content.register_script_message_handler_with_reply("natterRtcCall", None)
             self._connect(content, "script-message-with-reply-received::natterRtcCall", self._on_rtc_call)
 
@@ -1362,6 +1367,7 @@ class Account(GObject.Object):
         self._drop_pending()
         self._fallback.clear()
         self.ready = False
+        self.set_recording(False)
         self.view.terminate_web_process()
 
         def cleared(manager, result) -> None:
@@ -1547,9 +1553,18 @@ class Account(GObject.Object):
                 self.emit("state-changed")
         elif kind == "call":
             self.emit("call-requested", message["video"])
+        elif kind == "recording":
+            self.set_recording(message["on"])
         elif kind == "look":
             self.look = {key: message[key] for key in ("tokens", "dark", "dark_class", "media")}
             self.app.page_look_changed(self, fresh=True)
+
+    def set_recording(self, on: bool) -> None:
+        """A voice message is being recorded, or no longer (the page said, its page went, or the
+        microphone was switched off): the app hears of each change (mediapause.py)."""
+        if on != self.recording:
+            self.recording = on
+            self.app.voice_note(self, on)
 
     def _set_ready(self, ready: bool) -> None:
         self.ready = ready
@@ -1816,6 +1831,7 @@ class Account(GObject.Object):
         # download or a blocked navigation, leaves the old page, still ready, where it was.)
         if event == WebKit.LoadEvent.COMMITTED:
             self.ready = False
+            self.set_recording(False)  # the old page's microphone went with it
             self.loaded_at = time.monotonic()
             changed = self.failed is not None or self.needs_link
             self.failed = None  # a page arrived after all (an automatic reload, a link): not offline
@@ -1898,6 +1914,7 @@ class Account(GObject.Object):
 
     def _on_crash(self, _view, reason) -> None:
         self.ready = False
+        self.set_recording(False)
         self._watch_page(0, None)  # the crash path below reloads it
         self._end_link()
         if self.rtc:

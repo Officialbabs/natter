@@ -224,7 +224,7 @@ class PageTest(Privacy):
 
     def test_two_switches(self):
         host, page = self.open()
-        microphone, camera = page.added()[1].added()
+        microphone, _pause, camera = page.added()[1].added()  # Pause Other Audio under Microphone (test_mediapause)
         self.assertEqual([(row.kind, row.props["title"]) for row in (microphone, camera)],
                          [("Adw.SwitchRow", "Microphone"), ("Adw.SwitchRow", "Camera")])
         self.assertEqual(host.device_rows, {"microphone": microphone, "camera": camera})

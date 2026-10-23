@@ -36,6 +36,8 @@ finish-args:
   # but Flathub doesn't allow owning those names, so inside the sandbox Natter registers its
   # item with the watcher under its unique bus name, which hosts accept too.
   - --talk-name=org.kde.StatusNotifierWatcher
+  # Pausing other apps' players while you record a voice message, and playing them again after.
+  - --talk-name=org.mpris.MediaPlayer2.*
   # Not here: com.canonical.Unity, for the unread badge on the dock icon. In the Flatpak the
   # tray shows the count instead.
   # Start at login and running in the background go through the Background portal, the

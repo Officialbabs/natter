@@ -76,6 +76,8 @@ The Flatpak is experimental: it hasn't been tested yet, calls in it included.
   Ctrl+L locks it now. While it's locked, or with privacy blur on, notifications don't say who
   wrote or what.
 - Microphone and camera switches in Preferences → Privacy, the main menu and Ctrl+K.
+- Music and videos in other apps pause while you record a voice message, and play again after
+  ([how](docs/how-it-works.md#pausing-other-audio)).
 - Several accounts, each with its own session; Ctrl+1 to Ctrl+9 switch between them.
 - A tray icon whose menu shows or hides the window, turns privacy blur on or off, pauses
   notifications, locks (with a passcode set) and quits. Closing the window keeps Natter Den

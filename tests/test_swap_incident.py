@@ -338,6 +338,7 @@ class World:
         app._reclaim_timer, app._hidden_at, app._call_ended_at = 0, None, None
         app._call_held, app._after_call, app._memory_waiting = {}, {}, None
         app.call_sound = types.SimpleNamespace(start=lambda: None, stop=lambda: None)
+        app.voice_pause = types.SimpleNamespace(call_started=lambda: None, call_over=lambda: None)
         for name in ("_refresh_tray", "_write_menu_chats", "_check_media", "_apply_page_sound"):
             setattr(app, name, lambda: None)
         app._measure_call = lambda on: None

@@ -566,6 +566,82 @@
     }
   }, true);
 
+  // ---- A voice message being recorded -------------------------------------------------------
+  // A microphone on outside a call is a voice message being recorded (replies wait for it too).
+  // Natter pauses other apps' sound meanwhile (mediapause.py), so the page says when one starts
+  // and when it ends: on once a microphone track has been live RECORDING_MS (one opened only for
+  // a moment says nothing), off as soon as the last one ends or the microphone is switched off
+  // (WebKit ends its tracks), and within a second of a call starting. Each change once. Only the
+  // tracks getUserMedia hands the page are looked at, and only whether they're live: nothing of
+  // what they carry.
+  {
+    const RECORDING_MS = 300;
+    const RECORDING_LOOK_MS = 1000;  // while on: a call that starts, a track that ends unheard
+    const microphones = new Set();  // audio tracks from getUserMedia, until they end
+    let recording = false;
+    let onTimer = 0;
+    let lookTimer = 0;
+
+    // A call is on once its channels are open (calling). Not a peer connection alone: WhatsApp
+    // makes those for its own checks (rtc.py NOT_CALLS). Before a call's channels open, Natter
+    // knows it's ringing (rtc.py ring) and pauses nothing then.
+    const recordingNow = () => {
+      microphones.forEach((track) => { if (track.readyState !== "live") microphones.delete(track); });
+      return microphones.size > 0 && !calling();
+    };
+
+    function tell(on) {
+      if (on === recording) return;
+      recording = on;
+      if (lookTimer) clearInterval(lookTimer);
+      lookTimer = on ? setInterval(look, RECORDING_LOOK_MS) : 0;
+      post({ type: "recording", on });
+    }
+
+    function look() {
+      if (!recordingNow()) {
+        if (onTimer) clearTimeout(onTimer);
+        onTimer = 0;
+        tell(false);
+      } else if (!recording && !onTimer) {
+        onTimer = setTimeout(() => {
+          onTimer = 0;
+          if (recordingNow()) tell(true);
+        }, RECORDING_MS);
+      }
+    }
+
+    function heard(stream) {
+      const tracks = stream && typeof stream.getAudioTracks === "function" ? stream.getAudioTracks() : [];
+      for (const track of tracks) {
+        if (microphones.has(track)) continue;
+        microphones.add(track);
+        track.addEventListener("ended", look);
+      }
+      if (tracks.length) look();
+    }
+
+    const devices = window.navigator && window.navigator.mediaDevices;
+    if (devices && typeof devices.getUserMedia === "function") {
+      const open = devices.getUserMedia;
+      devices.getUserMedia = function getUserMedia(...args) {
+        return open.apply(this, args).then((stream) => {
+          try { heard(stream); } catch (_) { /* the stream is WhatsApp's all the same */ }
+          return stream;
+        });
+      };
+    }
+    const Track = window.MediaStreamTrack;
+    if (Track && typeof Track.prototype.stop === "function") {
+      const stop = Track.prototype.stop;
+      Track.prototype.stop = function (...args) {
+        const result = stop.apply(this, args);
+        if (microphones.has(this)) look();
+        return result;
+      };
+    }
+  }
+
   // ---- Watching the page --------------------------------------------------------------------
   // Until the chat list is up (loading, the link screen) the page is small and all of #app is
   // watched. Then only the list and the open chat's header are, plus, shallowly, #app and the
