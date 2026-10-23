@@ -54,7 +54,7 @@ def fake_app(test, locked=True):
     fake.tell = lambda key, title, body="", button=None, account=None: fake.told.append((key, title, body, button))
     fake.notifier = Notifier()
     fake.accounts = []
-    fake.calling = False
+    fake.calling = fake.in_call = False
     fake.downloaded = set()
     fake.replies = {}  # no reply windows open (notify-ui's, where it has them)
     fake._held_while_locked = lambda run, key="show", token="": Natter._held_while_locked(fake, run, key, token)

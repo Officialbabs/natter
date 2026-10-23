@@ -33,6 +33,14 @@ only:
 What it puts in swap is never a reason to reload WhatsApp. *Use Less Memory in the Background* in
 Preferences → General turns it off (it's shown only where giving memory back is possible).
 
+For all of this, a call is on from its first sign (WhatsApp making a call's data channel, Natter
+Den's call button, or a ringing call's notification) until 30 s after its last channel closes, so
+the moment a Wi-Fi roam closes them all doesn't count as the end (`rtc.py`, `GRACE`). Every packet
+of a call goes through Natter Den's main loop, so meanwhile it does no more there than it must:
+the guard's thread reads the pages' sizes, chats seen are saved once the call is over, and the
+dock's recent chats, the Reclaimer and the audio-set check wait. When a call ends the log says how
+late the main loop ran: `natter: call: main loop late max N ms, over 50 ms K times, …`.
+
 ## Fresh pages
 
 A fresh page (a new web process, back on the chat that was open) reloads WhatsApp, and messages
@@ -63,8 +71,9 @@ memory, between 2.5 and 6 GB and never more than half. A page past it that grows
 64 MB/s, or 1.5 GB past it whatever it does (less on small computers), is ended and reloaded,
 back on the chat that was open, with a toast if you're using the window. Ended again within ten
 minutes, it stays down until you press *Try Again*, and a notification says so if you're not
-looking at the window. During a call, and for a minute after, the page may hold 1.5 GB more before
-growth counts, and half a gigabyte more again whatever it does.
+looking at the window. During a call, and for a minute after it ends (30 s after its last channel
+closes), the page may hold 1.5 GB more before growth counts, and half a gigabyte more again
+whatever it does.
 
 The last backstop is the kernel's. In a unit whose `OOMPolicy` is `continue`, such as the scope
 Natter Den makes for itself, it sets `MemoryMax` (one page's limit, plus 1.5 GB for each account and

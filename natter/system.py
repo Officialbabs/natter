@@ -654,6 +654,53 @@ class CallSound:
             self._pipeline = None
 
 
+class LoopMeter:
+    """How late Natter's main loop runs during a call: a TICK ms timer, and how late each tick
+    comes. Every packet of the call goes through the main loop (rtc.py), so a stall there is a
+    gap in the call's sound; at the call's end one line tells how it went (line)."""
+
+    TICK = 20  # ms
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic, later: Optional[Callable] = None,
+                 cancel: Optional[Callable[[int], object]] = None) -> None:
+        self._clock = clock
+        self._later = later or GLib.timeout_add
+        self._cancel = cancel or GLib.source_remove
+        self._timer = 0
+        self._due = 0.0
+        self.latest, self.over_50, self.over_100 = 0.0, 0, 0  # ms, and how many ticks were that late
+
+    @property
+    def running(self) -> bool:
+        return bool(self._timer)
+
+    def start(self) -> None:
+        if self._timer:
+            return
+        self.latest, self.over_50, self.over_100 = 0.0, 0, 0
+        self._due = self._clock() + self.TICK / 1000
+        self._timer = self._later(self.TICK, self._tick)
+
+    def _tick(self) -> bool:
+        now = self._clock()
+        late = max(0.0, (now - self._due) * 1000)
+        self.latest = max(self.latest, late)
+        self.over_50 += late > 50
+        self.over_100 += late > 100
+        self._due = now + self.TICK / 1000  # GLib plans the next from now too
+        return GLib.SOURCE_CONTINUE
+
+    def stop(self) -> None:
+        if self._timer:
+            self._cancel(self._timer)
+            self._timer = 0
+
+    def line(self, packets: int) -> str:
+        """The call's line for the log: only counts, no names or ids."""
+        return (f"natter: call: main loop late max {self.latest:.0f} ms, over 50 ms {self.over_50} times, "
+                f"over 100 ms {self.over_100} times, packets {packets}")
+
+
 class AudioFollower:
     """Keeps the page's sound on the computer's current output.
 

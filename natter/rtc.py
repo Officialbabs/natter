@@ -52,6 +52,13 @@ MAX_MESSAGE = 262144  # what the page is told when the far side doesn't say (RFC
 FLUSH_MS = 2  # batches go to the page at most this often (the first after a pause, at once)
 # WhatsApp's own checks open these channels for a moment: they aren't calls.
 NOT_CALLS = ("sctp-prewarm", "__transfer_probe__")
+# A call is on (Host.calling) from the first sign of it until GRACE seconds after its last channel
+# closed: a reconnect (a Wi-Fi roam) closes them all for a moment, and what's held off during a
+# call (timer throttling, the Reclaimer, app.py) mustn't come back for that. The first sign is a
+# call's channel being made, Natter's call button, or a ringing call's notification (ring); one
+# that no channel opens after counts for RING seconds at most.
+GRACE = 30
+RING = 90
 DEBUG = bool(GLib.getenv("NATTER_DEBUG")) if Gst is not None else False
 
 
@@ -279,6 +286,7 @@ class Channel:
 
     def _on_data(self, _channel, data) -> None:
         self.received += 1
+        self.host.packets += 1  # from GStreamer's thread: a count for the log, a slip here or there is fine
         payload = data.get_data() if data is not None else b""
         self.host.emit({"ch": self.key, "type": "message", "bytes": payload or b""})
 
@@ -295,6 +303,7 @@ class Channel:
 
     def send(self, data: Optional[bytes] = None, text: Optional[str] = None) -> None:
         self.sent += 1
+        self.host.packets += 1
         try:
             if text is not None:
                 if hasattr(self.channel, "send_string_full"):
@@ -714,11 +723,20 @@ class Host:
     The page keeps a "pull" waiting (`pull`), answered with the next batch of events, in order.
     """
 
-    def __init__(self, on_call: Optional[Callable[[bool], None]] = None) -> None:
+    def __init__(self, on_call: Optional[Callable[[bool], None]] = None,
+                 on_connected: Optional[Callable[[bool], None]] = None) -> None:
         if not Gst.is_initialized():
             Gst.init(None)
-        self._on_call = on_call  # on_call(True) when a call's channel opens, on_call(False) when the last closes
-        self._calling: set[int] = set()
+        self._on_call = on_call  # on_call(True) when a call starts (calling), on_call(False) when it's over
+        self._calling: set[int] = set()  # open call channels
+        self._ringing: set[int] = set()  # call channels the page made that haven't opened yet
+        self._hold = 0  # GLib timer: the call counts as on until it fires (GRACE, RING)
+        self._hold_until = 0.0
+        self._hold_kind = ""  # "grace" after a call's channels closed, "ring" before any opened
+        self._told = False  # what on_call was last told
+        self._on_connected = on_connected  # on_connected(in_call) when that changes (a ringing call answered)
+        self._told_in = False  # what on_connected was last told
+        self.packets = 0  # call packets sent and received, all along (for app.py's line at a call's end)
         self._connections: dict[int, Connection] = {}
         self._channels: dict[int, Channel] = {}
         self._remote_keys = itertools.count(1 << 30)  # channels the far side opened, apart from the page's own
@@ -771,24 +789,83 @@ class Host:
 
     @property
     def calling(self) -> bool:
+        """A call is on: a channel of one is open, it's ringing (ring), or its channels closed
+        less than GRACE ago."""
+        return bool(self._calling) or bool(self._hold)
+
+    @property
+    def connected(self) -> bool:
+        """A call's channel is open now, grace or ringing aside."""
         return bool(self._calling)
 
-    def _count(self, channel: "Channel", is_open: bool) -> bool:
-        """Keep count of open call channels (main loop).
+    @property
+    def in_call(self) -> bool:
+        """A call has connected and isn't over: a channel is open, or it's in its grace. Not
+        while it only rings (app.py's do not disturb keeps a ringing page muted)."""
+        return bool(self._calling) or self._hold_kind == "grace"
 
-        on_call is told from the main loop afterwards, never from in here: what it starts (a
-        fresh page, when the call ended with the window hidden) closes this Host, and this runs
-        while the Host is closing a connection or releasing a channel (_close, close)."""
+    def ring(self, seconds: float = 0) -> None:
+        """A call is ringing or being placed: on from now, for RING seconds (or `seconds`) unless
+        a channel opens meanwhile. During GRACE it stays a grace: a reconnect's new channel that
+        never opens doesn't end the call any sooner."""
+        if self._calling:
+            return
+        self._hold_for(seconds or RING, "grace" if self._hold_kind == "grace" else "ring")
+        self._changed()
+
+    def _hold_for(self, seconds: float, kind: str) -> None:
+        until = time.monotonic() + seconds
+        if self._hold and self._hold_until >= until:
+            self._hold_kind = kind
+            return
+        if self._hold:
+            GLib.source_remove(self._hold)
+        self._hold_until, self._hold_kind = until, kind
+        self._hold = GLib.timeout_add(max(1, int(seconds * 1000)), self._hold_over)
+
+    def _drop_hold(self) -> None:
+        if self._hold:
+            GLib.source_remove(self._hold)
+        self._hold, self._hold_kind = 0, ""
+
+    def _hold_over(self) -> bool:
+        self._hold, self._hold_kind = 0, ""
+        self._ringing.clear()  # made, never opened, never closed: not a call any more
+        self._changed()
+        return GLib.SOURCE_REMOVE
+
+    def _changed(self) -> None:
+        """Tell on_call when `calling` changed, and on_connected when `in_call` did. From the main
+        loop afterwards, never from in here: what it starts (a fresh page, when the call ended
+        with the window hidden) closes this Host, and this runs while the Host is closing a
+        connection or releasing a channel."""
+        if self.calling != self._told:
+            self._told = self.calling
+            _log("call " + ("started" if self._told else "ended"))
+            if self._on_call:
+                GLib.idle_add(self._tell_call, self._told)
+        if self.in_call != self._told_in:
+            self._told_in = self.in_call
+            if self._on_connected:
+                GLib.idle_add(lambda on=self._told_in: self._on_connected(on) and False)
+
+    def _count(self, channel: "Channel", is_open: bool) -> bool:
+        """Keep count of open call channels (main loop). The last one closing starts the grace."""
         before = bool(self._calling)
         label = channel.channel.get_property("label") or ""
+        ringing = channel.key in self._ringing
+        self._ringing.discard(channel.key)
         if is_open and label not in NOT_CALLS and channel.key in self._channels:
             self._calling.add(channel.key)
         else:
             self._calling.discard(channel.key)
-        if bool(self._calling) != before:
-            _log("call " + ("started" if self._calling else "ended"))
-            if self._on_call:
-                GLib.idle_add(self._tell_call, bool(self._calling))
+        if self._calling:
+            self._drop_hold()
+        elif before:
+            self._hold_for(GRACE, "grace")
+        elif ringing and not self._ringing and self._hold_kind == "ring":
+            self._drop_hold()  # the call's channels went without opening: declined, or not answered
+        self._changed()
         return GLib.SOURCE_REMOVE
 
     def _tell_call(self, calling: bool) -> bool:
@@ -850,6 +927,9 @@ class Host:
                     self.emit({"ch": key, "type": "close"})
                 else:
                     self._channels[key] = Channel(self, key, gst_channel, connection.key)
+                    if str(message.get("label") or "") not in NOT_CALLS and not self._calling:
+                        self._ringing.add(key)  # the first sign of a call, before anything connects
+                        self.ring()
         elif op == "close-channel":
             channel = self._channels.get(message.get("ch"))
             if channel:
@@ -953,13 +1033,16 @@ class Host:
             connection.close()
 
     def close(self) -> None:
-        """Close everything (the page went away)."""
+        """Close everything (the page went away): a call in it is over, grace and all."""
         channels = list(self._channels.values())
         self._channels.clear()
         for channel in channels:
             channel.release()
         for key in list(self._connections):
             self._close(key)
+        self._ringing.clear()
+        self._drop_hold()
+        self._changed()
         self._certificates.clear()
         if self._waiting is not None:
             self._answer("")

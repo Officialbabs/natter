@@ -125,9 +125,10 @@ class Page:
         self._pending, self._replies, self._reply, self._in_page = {}, deque(), None, 0
         self._held_actions, self._fresh_held = [], False
         self._link, self._fallback, self._picked, self._fresh_after_call = None, {}, None, set()
+        self._chats_later = []
         self.runs, self.loaded, self.emitted = [], [], []
 
-    calling = property(lambda self: self.in_call)
+    calling = call_connected = property(lambda self: self.in_call)
 
     def __getattr__(self, name):
         return types.MethodType(getattr(Account, name), self)

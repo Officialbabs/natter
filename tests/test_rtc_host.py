@@ -10,6 +10,7 @@ import json
 import time
 import unittest
 import warnings
+from unittest import mock
 
 from natter import rtc
 
@@ -149,6 +150,7 @@ class HostTest(unittest.TestCase):
         self.call(caller, answerer)
         self.assertTrue(self.spin(lambda: events == [True]))
         connection = caller.host._connections[1]
+        self.enterContext(mock.patch.object(rtc, "GRACE", 0.2))  # over once its grace is
         caller.host.post({"op": "close", "pc": 1})  # raised KeyError before
         self.assertTrue(self.spin(lambda: events == [True, False]))
         state = connection.pipeline.get_state(0)[1]
@@ -196,10 +198,146 @@ class CountTest(unittest.TestCase):
             context.iteration(False)
         self.assertEqual(told, [True])
         del host._channels[7]
-        host._count(channel, False)
+        with mock.patch.object(rtc, "GRACE", 0.05):
+            host._count(channel, False)
         while told == [True] and time.monotonic() < deadline + 5:
             context.iteration(False)
         self.assertEqual(told, [True, False])
+
+
+def fake_channel(host, key, label="call"):
+    channel = type("Channel", (), {})()
+    channel.key = key
+    channel.channel = type("Gst", (), {"get_property": lambda _self, _name: label})()
+    channel.release = lambda: host._count(channel, False)
+    host._channels[key] = channel
+    return channel
+
+
+@unittest.skipUnless(rtc.Gst is not None and usable(), "needs GStreamer's WebRTC parts and libnice")
+class GraceTest(unittest.TestCase):
+    """A call stays on for rtc.GRACE after its last channel closes: a Wi-Fi roam closes them all
+    for a moment while WhatsApp reconnects, and nothing held off for the call may come back then."""
+
+    def setUp(self):
+        self.enterContext(warnings.catch_warnings())
+        warnings.simplefilter("ignore", DeprecationWarning)
+        self.enterContext(mock.patch.object(rtc, "GRACE", 0.3))
+        self.told = []
+        self.host = rtc.Host(self.told.append)
+        self.addCleanup(self.host.close)
+
+    def spin(self, seconds):
+        context, deadline = GLib.MainContext.default(), time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if not context.iteration(False):
+                time.sleep(0.005)
+
+    def test_on_through_the_grace_then_over(self):
+        channel = fake_channel(self.host, 7)
+        self.host._count(channel, True)
+        self.spin(0.05)
+        self.host._count(channel, False)  # the roam: its last channel closed
+        self.assertTrue(self.host.calling)
+        self.assertFalse(self.host.connected)
+        self.spin(0.15)
+        self.assertEqual(self.told, [True])  # still on
+        self.spin(0.4)
+        self.assertEqual(self.told, [True, False])  # the grace is over: the call too
+        self.assertFalse(self.host.calling)
+
+    def test_a_channel_back_within_the_grace_changes_nothing(self):
+        first, second = fake_channel(self.host, 7), fake_channel(self.host, 8)
+        self.host._count(first, True)
+        self.host._count(first, False)
+        self.spin(0.1)
+        self.host._count(second, True)  # reconnected
+        self.spin(0.6)  # past when the grace would have ended
+        self.assertEqual(self.told, [True])
+        self.assertTrue(self.host.calling)
+        self.assertEqual(self.host._hold, 0)
+
+    def test_the_page_going_away_ends_it_at_once(self):
+        channel = fake_channel(self.host, 7)
+        self.host._count(channel, True)
+        self.spin(0.05)
+        self.host._count(channel, False)
+        self.host._channels.clear()
+        self.host.close()  # a reload, WebKit's network process gone: no grace for a call in it
+        self.assertFalse(self.host.calling)
+        self.spin(0.05)
+        self.assertEqual(self.told, [True, False])
+
+    def test_a_check_channel_isnt_a_call(self):
+        channel = fake_channel(self.host, 7, "sctp-prewarm")
+        self.host._count(channel, True)
+        self.host._count(channel, False)
+        self.assertFalse(self.host.calling)
+        self.spin(0.05)
+        self.assertEqual(self.told, [])
+
+
+@unittest.skipUnless(rtc.Gst is not None and usable(), "needs GStreamer's WebRTC parts and libnice")
+class RingTest(unittest.TestCase):
+    """The call counts as on from its first sign, before anything connects: the Reclaimer and
+    timer throttling stop then (app.py, account.py), not seconds later when a channel opens."""
+
+    def setUp(self):
+        self.enterContext(warnings.catch_warnings())
+        warnings.simplefilter("ignore", DeprecationWarning)
+        self.told = []
+        self.host = rtc.Host(self.told.append)
+        self.addCleanup(self.host.close)
+
+    def spin(self, seconds=0.05):
+        context, deadline = GLib.MainContext.default(), time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if not context.iteration(False):
+                time.sleep(0.005)
+
+    def channel(self, label="call", key=1):
+        if 1 not in self.host._connections:
+            self.host.post({"op": "create", "pc": 1, "config": {"iceServers": []}})
+            no_upnp(self.host._connections[1].webrtc)
+        self.host.post({"op": "channel", "pc": 1, "ch": key, "label": label, "ordered": False})
+
+    def test_a_peer_connection_alone_isnt_a_call(self):
+        # WhatsApp makes them for its own checks too (rtc.NOT_CALLS).
+        self.host.post({"op": "create", "pc": 1, "config": {"iceServers": []}})
+        no_upnp(self.host._connections[1].webrtc)
+        self.channel("sctp-prewarm")
+        self.assertFalse(self.host.calling)
+
+    def test_on_once_a_calls_channel_is_made(self):
+        self.channel()
+        self.assertTrue(self.host.calling)  # nothing has connected yet
+        self.assertFalse(self.host.connected)
+        self.spin()
+        self.assertEqual(self.told, [True])
+
+    def test_declined_ends_it(self):
+        self.channel()
+        self.spin()
+        self.host.post({"op": "close", "pc": 1})  # its channels went without opening
+        self.assertFalse(self.host.calling)
+        self.spin()
+        self.assertEqual(self.told, [True, False])
+
+    def test_a_ring_that_nothing_follows_is_over_after_its_time(self):
+        self.host.ring(0.1)  # Natter's call button, or a ringing call's notification
+        self.assertTrue(self.host.calling)
+        self.spin(0.3)
+        self.assertEqual(self.told, [True, False])
+
+    def test_a_ring_during_the_grace_stays_a_grace(self):
+        channel = fake_channel(self.host, 7)
+        self.host._count(channel, True)
+        with mock.patch.object(rtc, "GRACE", 0.1):
+            self.host._count(channel, False)
+        self.host.ring(0.3)
+        self.assertEqual(self.host._hold_kind, "grace")
+        self.spin(0.2)
+        self.assertTrue(self.host.calling)  # the longer of the two
 
 
 if __name__ == "__main__":

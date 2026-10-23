@@ -75,6 +75,11 @@ With GStreamer 1.28 and newer, WebKit's camera picture freezes on its first fram
 ([WebKit bug 324582](https://bugs.webkit.org/show_bug.cgi?id=324582)). `natter/camfix/nattercamfix.c`,
 a GStreamer tracer that `install.sh` or meson builds when a C compiler, `pkg-config` and
 GStreamer's headers are there, puts back the `videorate` settings WebKit used to set.
+The same tracer clears the gap marks WebKit before 2.54.2 puts on Web Audio's silent blocks
+([WebKit bug 326494](https://bugs.webkit.org/show_bug.cgi?id=326494)): their data is silence anyway,
+but pulsesink skips them and clicks when a call's sound comes back. It touches only what WebKit's
+Web Audio source pushes, and has nothing to do on a WebKit that no longer marks them. It comes
+with the camera fix, so only with GStreamer 1.28 and newer.
 `natter/gstfix.py` turns it on for WebKit's processes only; `NATTER_CAMFIX=0` turns it off. It
 does nothing in the Flatpak, whose runtime brings its own GStreamer.
 

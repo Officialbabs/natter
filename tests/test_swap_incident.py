@@ -340,6 +340,7 @@ class World:
         app.call_sound = types.SimpleNamespace(start=lambda: None, stop=lambda: None)
         for name in ("_refresh_tray", "_write_menu_chats", "_check_media", "_apply_page_sound"):
             setattr(app, name, lambda: None)
+        app._measure_call = lambda on: None
         self.timers = Timers()
         self.patches = [mock.patch.object(app_module.time, "monotonic", self.clock),
                         mock.patch.object(app_module, "GLib", self.timers),
@@ -673,7 +674,7 @@ class HideAndThawTest(unittest.TestCase):
 
         calls = []
         fake = type("App", (), {})()
-        fake._reclaim_timer, fake._hidden_at = 0, None
+        fake._reclaim_timer, fake._hidden_at, fake.calling = 0, None, False
         fake._refresh_tray = lambda: None
         fake._write_menu_chats = lambda: None
         fake._fresh_pages_for_memory = lambda: calls.append("fresh") or False

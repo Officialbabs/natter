@@ -663,6 +663,7 @@ class Page:
         self._allowed_at = dict.fromkeys(media.KINDS)
         self._ended_at = dict.fromkeys(media.KINDS)
         self.refused_since_load = dict.fromkeys(media.KINDS, False)
+        self._chats_later = []
         self._backstop = dict.fromkeys(media.KINDS, True)
         self._fresh_after_call, self._held_media = set(), []
         self._in_page = 0  # no reply in the page (Account.send_reply)

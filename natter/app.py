@@ -40,9 +40,9 @@ from .notify import Notifier, ReplyTarget
 from .reply import LIMIT as REPLY_LIMIT, ReplyWindow, notice as reply_notice, units as reply_units
 from .search import SearchProvider
 from .settings import AUTOSTART, CACHE, CONFIG, DATA, Chat, ChatIndex, Settings, private_folder
-from .system import (AudioFollower, CallSound, Reclaimer, footprint, give_system_bus, in_own_scope, in_sandbox,
-                     limit_own_scope, media_report, memory_events, memory_tight, move_to_own_scope, network_processes,
-                     open_uri, own_swap, pages_end_alone, request_background)
+from .system import (AudioFollower, CallSound, LoopMeter, Reclaimer, footprint, give_system_bus, in_own_scope,
+                     in_sandbox, limit_own_scope, media_report, memory_events, memory_tight, move_to_own_scope,
+                     network_processes, open_uri, own_swap, pages_end_alone, request_background)
 from .tray import MenuItem, Tray, tray_host_available
 
 HERE = Path(__file__).resolve().parent
@@ -143,13 +143,11 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>First release. So far it has been run on Ada 26.04 and on CachyOS with KDE Plasma.</p>"
+RELEASE_NOTES = ("<p>Fixes for replying from notifications and for call sound.</p>"
                  "<ul>"
-                 "<li>One notification per chat, quiet hours and Do not disturb</li>"
-                 "<li>Ctrl+K to go to a chat or message a phone number</li>"
-                 "<li>A privacy blur and an app lock</li>"
-                 "<li>Several accounts, each with its own session</li>"
-                 "<li>Experimental: replying from a notification, calls, and a Flatpak</li>"
+                 "<li>Replying from a notification works with WhatsApp's current page, also with the window closed (still experimental)</li>"
+                 "<li>Fewer clicks in call sound after a silence, with WebKitGTK before 2.54.2 and GStreamer 1.28</li>"
+                 "<li>A call keeps going through short reconnections, with less background work while it runs</li>"
                  "</ul>")
 
 
@@ -210,9 +208,16 @@ def kill_threshold(limit_mb: int, total: int) -> float:
     return max(MEMORY_KILL, (hard + KILL_ROOM * MiB) / (limit_mb * MiB))
 
 
-def pages_held() -> int:
-    """Bytes all of Natter's pages hold together, resident or swapped (memguard.page_sizes)."""
-    return sum(page_sizes().values())
+def held_by_page(guard: Optional[MemoryGuard] = None) -> dict[int, int]:
+    """What each of Natter's pages holds (memguard.page_sizes): as the guard's thread last read it
+    when it has lately, so the main loop doesn't read every page's status itself."""
+    recent = guard.recent_sizes() if isinstance(guard, MemoryGuard) else None
+    return page_sizes() if recent is None else recent
+
+
+def pages_held(guard: Optional[MemoryGuard] = None) -> int:
+    """Bytes all of Natter's pages hold together, resident or swapped (held_by_page)."""
+    return sum(held_by_page(guard).values())
 
 
 def stall_line(stalled: float, held: int, swapped: int, before: dict[str, int], after: dict[str, int]) -> str:
@@ -576,6 +581,7 @@ class Natter(Adw.Application):
         self._call_ended_at: Optional[float] = None
         self._call_held: dict = {}
         self._after_call: dict = {}
+        self._call_packets = 0  # the pages' call packets (rtc.Host.packets) when the call began
         self._memory_waiting: Optional[tuple] = None  # what the last "not yet" said (_memory_wait)
         # The app lock (lock.py): while locked, the window shows only the passcode, and what
         # would show a chat waits for the unlock.
@@ -694,6 +700,7 @@ class Natter(Adw.Application):
         self.badge = Badge(bus)
         self.reclaimer = Reclaimer(on_done=self._reclaimed)
         self.call_sound = CallSound()
+        self.loop_meter = LoopMeter()  # how late the main loop runs during a call (_measure_call)
         # The page's sound follows the computer's output (Bluetooth headphones connected later).
         self.audio_follower = AudioFollower(on_change=self._devices_changed)
         self._window_services = False
@@ -1258,7 +1265,7 @@ class Natter(Adw.Application):
 
     def _check_idle(self) -> bool:
         minutes = self.settings["lock_idle_minutes"]
-        if minutes and self.lock_enabled and not self.locked and not self.calling \
+        if minutes and self.lock_enabled and not self.locked and not self.in_call \
                 and awake_time() - self._last_activity > minutes * 60:
             self.lock()
         return GLib.SOURCE_CONTINUE
@@ -1284,9 +1291,10 @@ class Natter(Adw.Application):
     def _apply_page_sound(self) -> None:
         """WhatsApp plays its message tones in the page itself: while notifications are paused,
         and nobody's using Natter's window or calling, the page is muted. In use, it isn't, so a
-        voice note still plays. Locked, it isn't in use, even when it's the active window."""
+        voice note still plays. Locked, it isn't in use, even when it's the active window. A call
+        that only rings isn't on here: its ringtone stays muted too."""
         active = bool(self.window and self.window.is_active() and not self.locked)
-        muted = self.settings.notifications_paused() and not self.calling and not active
+        muted = self.settings.notifications_paused() and not self.in_call and not active
         for account in self.accounts:
             if account.view.get_is_muted() != muted:
                 account.view.set_is_muted(muted)
@@ -1417,8 +1425,10 @@ class Natter(Adw.Application):
         if self.calls_in_page:
             # WhatsApp calls from its own page: press its call button in the open chat.
             def done(reason) -> None:
-                if reason and self.window:
-                    self.window.toast(CALL_FAILURES_IN_PAGE.get(reason, "The call didn't start"))
+                if reason == "":
+                    account.ringing()  # on from now: the Reclaimer stops before the call connects
+                elif self.window:  # None: the page wasn't WhatsApp's, or the call into it failed
+                    self.window.toast(CALL_FAILURES_IN_PAGE.get(reason or "", "The call didn't start"))
             account.when_ready(lambda: account.run("return window.__natter.startCall(video)", {"video": video}, done))
             return
         if self.calls is None or account is not self.accounts[0]:
@@ -2090,17 +2100,27 @@ class Natter(Adw.Application):
             self.reclaimer.stop()
             self._check_media()
             return
+        if self.calling:
+            return  # the dock's entry and the Reclaimer wait: this runs again when the call ends (_on_page_call)
         self._write_menu_chats()
         # No fresh page now: closing the window isn't a reason to reload WhatsApp, and messages
         # that come during a reload come without notifications. _check_memory looks every minute
         # (and _thawed after a freeze) once the window has been hidden HIDDEN_BEFORE_FRESH.
-        if self.settings["light_background"] and self.reclaimer.available and not self.calling:
+        if self.settings["light_background"] and self.reclaimer.available:
             self._reclaim_timer = GLib.timeout_add_seconds(HIDDEN_BEFORE_RECLAIM, self._reclaim)
 
     @property
     def calling(self) -> bool:
-        """A call is on in one of the accounts' pages."""
+        """A call is on in one of the accounts' pages: from when it rings or is placed until
+        rtc.GRACE after its channels last closed, so a reconnect doesn't end it for a moment.
+        Everything held off during a call asks this."""
         return any(account.calling for account in self.accounts)
+
+    @property
+    def in_call(self) -> bool:
+        """A call has connected in one of the pages and isn't over (rtc.py in_call): not one that
+        only rings. Do not disturb and the idle lock ask this."""
+        return any(account.in_call for account in self.accounts)
 
     def _on_page_call(self, account: Account, active: bool) -> None:
         # During a call nothing squeezes the page: no reclaim, and a sound stream the desktop
@@ -2109,7 +2129,7 @@ class Natter(Adw.Application):
         if active:
             if account not in self._call_held:  # from before its first call since the page loaded
                 earlier = self._after_call.pop(account, None)
-                self._call_held[account] = earlier[0] if earlier else pages_held()
+                self._call_held[account] = earlier[0] if earlier else pages_held(self.memory_guard)
         else:
             self._call_ended_at = time.monotonic()
             began = self._call_held.pop(account, None)
@@ -2126,6 +2146,19 @@ class Natter(Adw.Application):
             self.call_sound.stop()
             if self.window and not self.window.get_visible():
                 self._on_window_visible(False)
+        self._measure_call(self.calling)
+
+    def _call_packets_now(self) -> int:
+        return sum(account.rtc.packets for account in self.accounts if account.rtc is not None)
+
+    def _measure_call(self, on: bool) -> None:
+        """While a call is on, how late the main loop runs (LoopMeter); one line when it ends."""
+        if on and not self.loop_meter.running:
+            self._call_packets = self._call_packets_now()
+            self.loop_meter.start()
+        elif not on and self.loop_meter.running:
+            self.loop_meter.stop()
+            print(self.loop_meter.line(max(0, self._call_packets_now() - self._call_packets)), flush=True)
 
     def _reclaim(self) -> bool:
         # Past the limit, what's there is WhatsApp's own and live (WebKit can't collect it):
@@ -2159,7 +2192,9 @@ class Natter(Adw.Application):
             if self.window is not None:
                 self._hidden_at = None  # shown: the next hide counts from then, whatever told it
             return False
-        now, pages = time.monotonic(), page_sizes()
+        if self.calling:
+            return False  # nothing to decide (_memory_wait), and the pages aren't read meanwhile
+        now, pages = time.monotonic(), held_by_page(self.memory_guard)
         biggest, total = max(pages.values(), default=0), sum(pages.values())
         wanted = []  # (account, (what kind of reason, its words)), in the order they'd go
         reason = self._memory_reason(biggest)

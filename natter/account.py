@@ -39,6 +39,9 @@ CHUNK = 4 * 1024 * 1024  # bytes per call when handing a file to the page
 # for a moment, and the call's packets go through the same page.
 CALL_CHUNK = 256 * 1024
 CALL_GAP_MS = 15
+# What a ringing call's notification says (WhatsApp's English words, as bridge.js GENERIC has them):
+# one counts as a call from then (rtc.py ring), in case WhatsApp makes its channels only on answering.
+RINGING = re.compile(r"\W*incoming\s+(voice\s+|video\s+)?call[\s.!…]*", re.IGNORECASE)
 PICK_TAG = "application/x-natter-files"  # the accept= of the bridge's own file input (bridge.js pick)
 LARGEST = 256 * 1024 * 1024  # the most the piece-by-piece fallback sends (attach has no limit of its own)
 READY_WAIT = 20  # seconds a call into the page waits for WhatsApp's chat list before giving up
@@ -519,6 +522,9 @@ class Account(GObject.Object):
         self.dev_url = url
         self.home = url or WHATSAPP_URL
         self.chats = ChatIndex(DATA / "accounts" / self.id / "chats.json")
+        # Chats seen during a call: each change is a write to disk on the main loop, which every
+        # packet of the call goes through (rtc.py). They're saved once the call is over (_seen_chats).
+        self._chats_later: list[tuple[list, float]] = []
         self._pending: dict[int, tuple[Callable[[], None], Optional[Callable[[], None]]]] = {}  # by timeout id
         self._fallback: dict[int, WebKit.Notification] = {}
         self._handlers: list[tuple[GObject.Object, int]] = []
@@ -613,7 +619,8 @@ class Account(GObject.Object):
         # The sizes of the bridge's audio sets (bridge.js audio()), for the log and About.
         self.audio_sizes = audiosizes.Watch(self)
         if app.calls_in_page:
-            self.rtc = rtc.Host(self._on_page_call)
+            # The page's sound follows in_call too (app.py _apply_page_sound): a ringing call answered.
+            self.rtc = rtc.Host(self._on_page_call, lambda _on: self.app._apply_page_sound())
             content.register_script_message_handler_with_reply("natterRtcCall", None)
             self._connect(content, "script-message-with-reply-received::natterRtcCall", self._on_rtc_call)
 
@@ -851,7 +858,7 @@ class Account(GObject.Object):
         """Why no reply may begin now, at the moment the page would be touched; None if one may."""
         if self.app.locked:
             return "locked"
-        if self.calling:
+        if self.call_connected:
             return "calling"
         return None
 
@@ -1412,9 +1419,46 @@ class Account(GObject.Object):
         """A call is on in this account's page."""
         return self.rtc is not None and self.rtc.calling
 
+    @property
+    def call_connected(self) -> bool:
+        """A call's channel is open in this account's page now: not ringing, nor in rtc.py's grace.
+        A reply waits only for this, as the bridge does (bridge.js calling): after a call ends it
+        needn't wait out the grace."""
+        return self.rtc is not None and self.rtc.connected
+
+    @property
+    def in_call(self) -> bool:
+        """A call has connected in this account's page and isn't over (rtc.py in_call): not ringing."""
+        return self.rtc is not None and self.rtc.in_call
+
+    def ringing(self) -> None:
+        """A call is being placed from Natter (app.py start_call): it counts as on from now (rtc.py ring)."""
+        if self.rtc is not None:
+            self.rtc.ring()
+
+    def _seen_chats(self, rows: list) -> bool:
+        """Chats seen in the page (ChatIndex.add), or kept for after the call. True if the order changed."""
+        if self.calling:
+            self._chats_later.append((rows, time.time()))
+            return False
+        return self.chats.add(rows)
+
+    def _chats_after_call(self) -> None:
+        """What _seen_chats kept during the call, saved in one go, each chat as recent as it was seen."""
+        later, self._chats_later = self._chats_later, []
+        seen: dict[str, float] = {}
+        for rows, when in later:
+            for name, position in rows:
+                seen[name] = max(seen.get(name, 0.0), when - 60.0 * max(position, 0))
+        newest = max(seen.values(), default=0.0)
+        if seen and self.chats.add([(name, (newest - stamp) / 60.0) for name, stamp in seen.items()], newest):
+            self.emit("chats-changed")
+
     def _on_page_call(self, active: bool) -> None:
         self._apply_throttle()
         self.emit("in-call", active)
+        if not active and self._chats_later:
+            self._chats_after_call()
         if not active and self._fresh_after_call:
             # A device switched off during the call: WebKit would still hand it out without asking.
             kinds, self._fresh_after_call = self._fresh_after_call, set()
@@ -1440,11 +1484,13 @@ class Account(GObject.Object):
             self.notified_at = time.monotonic()
             self.emit("notify-message", message["id"], message["title"], message["body"], message["tag"],
                       message["icon"])
-            self.chats.touch(message["title"])
+            self._seen_chats([(message["title"], 0)])
+            if self.rtc is not None and RINGING.fullmatch(message["body"]):
+                self.rtc.ring()  # a call rings: on before its channels are made, if they wait for the answer
         elif kind == "unnotify":
             self.emit("unnotify", message["id"])
         elif kind == "chats":
-            if self.chats.add(message["rows"]):
+            if self._seen_chats(message["rows"]):
                 self.emit("chats-changed")
         elif kind == "canary":
             if message["missing"]:
@@ -1461,7 +1507,7 @@ class Account(GObject.Object):
             if self._link is not None and self.active_chat != self._link:
                 self._end_link()  # the link opened its chat in the page
                 self._set_ready(True)
-            if self.active_chat and self.chats.touch(self.active_chat):
+            if self.active_chat and self._seen_chats([(self.active_chat, 0)]):
                 self.emit("chats-changed")
             if changed:
                 self.emit("state-changed")  # the window shows the call button only with a chat open

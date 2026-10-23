@@ -70,8 +70,9 @@ refresh_caches() {
 
 # The camera fix: WebKit's camera freezes on its first frame with GStreamer 1.28 and newer, and
 # natter/camfix/nattercamfix.c, a GStreamer tracer, prevents it (natter/gstfix.py turns it on only
-# where it's needed). Built when there's a C compiler, pkg-config and GStreamer's headers; Natter
-# runs without it. $1: the Python that runs Natter, which tells whether GStreamer needs it.
+# where it's needed). It also stops Web Audio clicking after silence in calls. Built when there's
+# a C compiler, pkg-config and GStreamer's headers; Natter runs without it. $1: the Python that
+# runs Natter, which tells whether GStreamer needs it.
 build_camfix() {
     python="$1"
     # The compiler, as make takes $CC: a command that may carry arguments ("ccache gcc", "gcc -m64").

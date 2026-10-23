@@ -27,6 +27,7 @@ LIMITS = {"contexts": 8, "rested": 8, "calls": 4, "elements": 32, "sources": 32,
 GROWING = ("contexts", "rested", "calls", "elements", "sources", "streams")
 FIRST = 10  # seconds after the chat list is up, as the canary's (bridge.js scan)
 CHECK = 600  # seconds between checks after that
+AFTER_CALL = 60  # seconds before a check that came during a call is tried again
 STREAK = 6  # checks in a row a size grew (an hour) before that's told; doubles each time it is
 SIZE_MAX = 10**7  # a count past this isn't one
 
@@ -92,13 +93,14 @@ class Rule:
 
 class Watch:
     """One account's checks: FIRST seconds after each new page's chat list is up (ready()), then
-    every CHECK seconds while the account lasts, skipped while its page isn't up. Each page starts
-    with a Rule of its own, as its bridge starts with empty sets."""
+    every CHECK seconds while the account lasts, skipped while its page isn't up, and put off
+    while a call is on. Each page starts with a Rule of its own, as its bridge starts with empty
+    sets."""
 
     def __init__(self, account, later: Optional[Callable[[int, Callable[[], bool]], int]] = None,
                  cancel: Optional[Callable[[int], object]] = None,
                  write: Optional[Callable[[str], None]] = None) -> None:
-        self.account = account  # its name, loaded_at, ready, removed and run() are what's used
+        self.account = account  # its name, loaded_at, ready, removed, calling and run() are what's used
         self._later = later or GLib.timeout_add_seconds
         self._cancel = cancel or GLib.source_remove
         self._write = write or (lambda line: print(line, flush=True))
@@ -133,6 +135,9 @@ class Watch:
     def _check(self) -> bool:
         self._timer = 0
         if self.account.removed:
+            return GLib.SOURCE_REMOVE
+        if self.account.calling:
+            self._plan(AFTER_CALL)  # not during a call: the page and Natter's main loop carry its sound
             return GLib.SOURCE_REMOVE
         self._plan(CHECK)
         if self.account.ready:

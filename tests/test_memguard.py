@@ -369,6 +369,22 @@ class GuardTest(GuardBase):
         self.assertFalse(self.guard.recent_kill(now=3))
 
 
+class RecentSizesTest(GuardBase):
+    """What the pages held at the guard's last look, for Natter's main loop (app.py held_by_page),
+    which then needn't read every page's status itself."""
+
+    def test_from_the_last_look_while_its_recent(self):
+        self.assertIsNone(self.guard.recent_sizes(now=0))  # no look yet
+        self.guard.check(now=10)
+        self.assertEqual(self.guard.recent_sizes(now=11), {3002: 1200 * MiB, 4002: 20 * MiB})
+        self.assertIsNone(self.guard.recent_sizes(now=10 + 3 * self.guard.poll + 1))  # the guard stopped looking
+
+    def test_a_page_it_ended_isnt_in_them(self):
+        self.proc.set(3002, anon_mb=20 * 1024)
+        self.assertEqual(self.guard.check(now=0), [3002])
+        self.assertEqual(self.guard.recent_sizes(now=0), {4002: 20 * MiB})
+
+
 class GrowthTest(GuardBase):
     """What the guard logs while a page grows: its busiest threads, its largest regions."""
 
@@ -399,6 +415,22 @@ class GrowthTest(GuardBase):
         self.guard.check(now=8)
         self.assertEqual(self.out.getvalue().count("busiest threads"), 1)
         self.assertEqual(self.out.getvalue().count("largest regions"), 2)
+
+    def test_no_regions_read_during_a_call(self):
+        # smaps walks the page under its memory map's lock: not while the call's sound runs there.
+        smaps = self.proc.root / "3002" / "smaps"
+        smaps.write_text(SMAPS)
+        smaps.chmod(0)  # read, it would say "unreadable"
+        self.guard.check(now=0)
+        self.call = True
+        self.proc.set(3002, anon_mb=2100)
+        self.guard.check(now=2)
+        self.assertNotIn("largest regions", self.out.getvalue())
+        smaps.chmod(0o600)
+        self.call = False
+        self.guard.check(now=CALL_GRACE + 3)  # the call and the guard's own grace over: told now
+        self.assertIn("natter: memory: page 3002 holds 2100 MB", self.out.getvalue())
+        self.assertIn("largest regions: 703 MB", self.out.getvalue())
 
     def test_an_idle_page_loading_is_not_news(self):
         self.proc.set(3002, anon_mb=30)

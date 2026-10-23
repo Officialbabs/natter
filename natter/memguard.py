@@ -363,6 +363,7 @@ class MemoryGuard:
         self._ended: set[int] = set()  # pids sent SIGKILL that haven't gone yet (a big one takes a while)
         self._call_seen: Optional[float] = None  # when calling() last said yes
         self._kills: list[tuple[float, int]] = []  # (time, pid), not yet claimed
+        self._sizes: Optional[tuple[float, dict[int, int]]] = None  # (when, what each page held) at the last look
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -418,11 +419,12 @@ class MemoryGuard:
         for gone in set(self._pages) - pids:
             del self._pages[gone]
         self._ended &= pids
-        ended = []
+        ended, sizes = [], {}
         for pid in sorted(pids - self._ended):
             size = held(pid, self.proc)
             if size is None:
                 continue  # gone since the list was made
+            sizes[pid] = size
             page = self._pages.get(pid)
             if page is None:
                 page = self._pages[pid] = _Page(size)
@@ -443,10 +445,23 @@ class MemoryGuard:
                     self._idle_add(self._report, pid, size)
                 continue
             try:
-                self._diagnose(pid, page, size, rates, rate, now)
+                self._diagnose(pid, page, size, rates, rate, now, in_call)
             except Exception:  # what it says about one page mustn't keep it from the others
                 pass
+        with self._lock:
+            self._sizes = (now, {pid: size for pid, size in sizes.items() if pid not in ended})
         return ended
+
+    def recent_sizes(self, now: Optional[float] = None) -> Optional[dict[int, int]]:
+        """What each page held at the guard's last look (held, by pid), if that was within three
+        polls; else None. Natter's main loop asks this rather than reading every page's status
+        itself: during a call it has the call's packets to pass on (rtc.py)."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            last = self._sizes
+        if last is None or now - last[0] > 3 * self.poll:
+            return None
+        return dict(last[1])
 
     def _end(self, pid: int, now: float) -> bool:
         # Noted before the signal goes, so WebKit's report of the crash can't come before it.
@@ -464,7 +479,8 @@ class MemoryGuard:
         self.on_kill(pid, size)
         return False
 
-    def _diagnose(self, pid: int, page: _Page, size: int, rates: list[float], rate: int, now: float) -> None:
+    def _diagnose(self, pid: int, page: _Page, size: int, rates: list[float], rate: int, now: float,
+                  in_call: bool = False) -> None:
         # Which threads are busy, once a spell of growth: their CPU between two fast looks.
         if rates and rates[-1] > GROWTH_RATE:
             page.fast += 1
@@ -480,8 +496,10 @@ class MemoryGuard:
                       + (", ".join(f"{name} {share}%" for name, share in top) or "none"), flush=True)
             else:
                 page.threads = (now, times)
-        # The largest regions at every step: decoded frames or JavaScript's heap.
-        if size >= QUIET and size // STEP > page.step:
+        # The largest regions at every step: decoded frames or JavaScript's heap. Not in a call:
+        # reading smaps walks the whole page under its memory map's lock, which the call's sound
+        # thread may want. The step is told at the first look after the call.
+        if size >= QUIET and size // STEP > page.step and not in_call:
             page.step = size // STEP
             regions = anon_regions(_read(self.proc / str(pid) / "smaps"))
             print(f"natter: memory: page {pid} holds {size >> 20} MB, growing {rate} MB/s; largest regions: "

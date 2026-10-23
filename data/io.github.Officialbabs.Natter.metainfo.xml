@@ -81,6 +81,16 @@
   </content_rating>
 
   <releases>
+    <release version="0.1.1" date="2026-10-23">
+      <description>
+        <p>Fixes for replying from notifications and for call sound.</p>
+        <ul>
+          <li>Replying from a notification works with WhatsApp's current page, also with the window closed (still experimental)</li>
+          <li>Fewer clicks in call sound after a silence, with WebKitGTK before 2.54.2 and GStreamer 1.28</li>
+          <li>A call keeps going through short reconnections, with less background work while it runs</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-23">
       <description>
         <p>

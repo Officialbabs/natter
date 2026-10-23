@@ -1,6 +1,7 @@
 """The camera fix (gstfix.py, camfix/nattercamfix.c): the GStreamer environment Natter sets, where it
-does nothing, what programs Natter opens get back, and the tracer itself, built and loaded into a
-GStreamer of its own (a few plugins, a scratch registry: no device is opened)."""
+does nothing, what programs Natter opens get back, and the tracer itself (the camera's videorate and
+Web Audio's gap marks), built and loaded into a GStreamer of its own (a few plugins, a scratch
+registry: no device is opened)."""
 
 import inspect
 import json
@@ -517,6 +518,75 @@ print(json.dumps({"started": started, "env": os.environ.get("GST_TRACERS"),
 """
 
 
+# WebKit's Web Audio source as WebKit 2.52 makes it: a bin of type WebKitWebAudioSrc, made without
+# a factory, around an appsrc whose src pad it ghosts, added to its pipeline before it streams.
+# Prints the flags of each buffer as it leaves the appsrc and as it reaches the sink.
+AUDIO_PROBE = r"""
+import json
+import gi
+gi.require_version("Gst", "1.0")
+from gi.repository import GLib, GObject, Gst
+Gst.init(None)
+
+class WebAudioSrc(Gst.Bin):
+    __gtype_name__ = "WebKitWebAudioSrc"
+
+class OtherSrc(Gst.Bin):
+    __gtype_name__ = "NatterLabOtherAudioSrc"
+
+MARKS = Gst.BufferFlags.GAP | Gst.BufferFlags.DROPPABLE
+
+def flags(buffer):
+    return [name for name, flag in (("gap", Gst.BufferFlags.GAP), ("droppable", Gst.BufferFlags.DROPPABLE),
+                                    ("marker", Gst.BufferFlags.MARKER)) if buffer.has_flags(flag)]
+
+def run(kind):
+    pipeline = Gst.Pipeline.new(None)
+    src = kind()
+    appsrc = Gst.ElementFactory.make("appsrc")
+    appsrc.set_property("format", Gst.Format.TIME)
+    src.add(appsrc)
+    src.add_pad(Gst.GhostPad.new("src", appsrc.get_static_pad("src")))
+    sink = Gst.ElementFactory.make("fakesink")
+    sink.set_property("sync", False)
+    pipeline.add(src)
+    pipeline.add(sink)
+    assert src.link(sink)
+    seen = {"inside": [], "sink": []}
+    def watch(where):
+        def probe(pad, info):
+            if info.type & Gst.PadProbeType.BUFFER_LIST:
+                listed = info.get_buffer_list()
+                seen[where].extend(flags(listed.get(i)) for i in range(listed.length()))
+            else:
+                seen[where].append(flags(info.get_buffer()))
+            return Gst.PadProbeReturn.OK
+        return probe
+    for pad, where in ((appsrc.get_static_pad("src"), "inside"), (sink.get_static_pad("sink"), "sink")):
+        pad.add_probe(Gst.PadProbeType.BUFFER | Gst.PadProbeType.BUFFER_LIST, watch(where))
+    pipeline.set_state(Gst.State.PLAYING)
+    def buffer(n, marks):
+        made = Gst.Buffer.new_wrapped(bytes(512))
+        made.pts = n * Gst.SECOND // 100
+        made.set_flags(marks)
+        return made
+    appsrc.emit("push-buffer", buffer(0, MARKS))  # silence, as WebKit marks it
+    appsrc.emit("push-buffer", buffer(1, Gst.BufferFlags.MARKER))  # sound, another flag
+    appsrc.emit("push-buffer", buffer(2, Gst.BufferFlags.GAP))
+    listed = Gst.BufferList.new()
+    for n in (3, 4):
+        listed.insert(-1, buffer(n, MARKS))
+    appsrc.emit("push-buffer-list", listed)
+    appsrc.emit("end-of-stream")
+    message = pipeline.get_bus().timed_pop_filtered(10 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+    pipeline.set_state(Gst.State.NULL)
+    assert message is not None and message.type == Gst.MessageType.EOS, message
+    return seen
+
+print(json.dumps({"other_first": run(OtherSrc), "webkit": run(WebAudioSrc), "other_after": run(OtherSrc)}))
+"""
+
+
 def toolchain() -> bool:
     return bool(shutil.which(compiler()[0]) and shutil.which("pkg-config")) and subprocess.run(
         ["pkg-config", "--exists", "gstreamer-1.0"], capture_output=True).returncode == 0
@@ -579,11 +649,11 @@ class PluginTest(unittest.TestCase):
             env.update(GST_PLUGIN_PATH_1_0=str(cls.build), GST_TRACERS="nattercamfix", GST_DEBUG="nattercamfix:4")
         return env
 
-    def probe(self, env, *args):
+    def probe(self, env, *args, script=PROBE):
         if self.reachable.returncode != 0:
             last = (self.reachable.stderr.strip().splitlines() or ["?"])[-1]
             self.skipTest(f"no GStreamer for Python in the probes' environment ({last})")
-        result = subprocess.run([*CHILD, "-c", PROBE, *args], capture_output=True, text=True, timeout=120, env=env)
+        result = subprocess.run([*CHILD, "-c", script, *args], capture_output=True, text=True, timeout=120, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout.splitlines()[-1]), result.stderr
 
@@ -623,6 +693,21 @@ class PluginTest(unittest.TestCase):
         self.assertEqual(found["settings"], [False, False, 0])
         self.assertNotIn("NatterCamFix", found["tracers"])
         self.assertEqual(found["env"], "nattercamfix")
+
+    def test_clears_the_gap_marks_on_webkits_web_audio_and_nothing_else(self):
+        found, log = self.probe(self.gst_env(), script=AUDIO_PROBE)
+        marked = [["gap", "droppable"], ["marker"], ["gap"], ["gap", "droppable"], ["gap", "droppable"]]
+        webkit = found["webkit"]
+        self.assertEqual(webkit["inside"], marked)  # as WebKit pushes them, inside its bin
+        self.assertEqual(webkit["sink"], [[], ["marker"], [], [], []])  # the silence still arrives, unmarked
+        for other in ("other_first", "other_after"):  # any other source keeps its marks
+            self.assertEqual(found[other], {"inside": marked, "sink": marked})
+        self.assertEqual(log.count("found WebKit's Web Audio source"), 1, log)
+
+    def test_without_the_tracer_web_audio_keeps_its_gap_marks(self):
+        found, _log = self.probe(self.gst_env(tracer=False, registry="plain.bin"), script=AUDIO_PROBE)
+        self.assertEqual(found["webkit"]["sink"], found["webkit"]["inside"])
+        self.assertIn(["gap", "droppable"], found["webkit"]["sink"])
 
     def test_without_the_tracer_nothing_changes(self):
         found, _log = self.probe(self.gst_env(tracer=False, registry="plain.bin"))

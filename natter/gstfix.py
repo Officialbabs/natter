@@ -5,7 +5,10 @@ the gap from 0 with copies of the first frame: the page shows one still frame, f
 longer the computer has been on. WebKit gave that videorate the settings that prevent it until it stopped doing so on
 GStreamer 1.28 (WebKit bug 324582; the fix, PR 74373, isn't in any release yet). Natter puts them
 back with a small GStreamer tracer, natter/camfix/nattercamfix.c, which install.sh (or meson)
-builds when a C compiler and GStreamer's headers are there.
+builds when a C compiler and GStreamer's headers are there. The same tracer clears the gap marks
+WebKit (before 2.54.2) puts on Web Audio's silent blocks, which make pulsesink click when a call's
+sound starts again; it needs nothing more from here, so it's on only where the camera fix is
+(GStreamer 1.28 and newer).
 
 apply() turns the tracer on through GStreamer's environment: the plugin's folder first in
 GST_PLUGIN_PATH_1_0 (or GST_PLUGIN_PATH), "nattercamfix" in GST_TRACERS, and a registry of

@@ -18,7 +18,7 @@ from gi.repository import GLib, JavaScriptCore  # noqa: E402
 
 from natter import app as natter_app  # noqa: E402
 from natter.app import Natter, debug_info  # noqa: E402
-from natter.audiosizes import CHECK, FIRST, KEYS, LIMITS, SCRIPT, STREAK, Rule, Watch, debug_line, parse  # noqa: E402
+from natter.audiosizes import AFTER_CALL, CHECK, FIRST, KEYS, LIMITS, SCRIPT, STREAK, Rule, Watch, debug_line, parse  # noqa: E402
 
 BRIDGE = (Path(__file__).resolve().parent.parent / "natter" / "bridge.js").read_text()
 START = "  // ---- Idle audio"
@@ -243,6 +243,7 @@ class Page:
 
     def __init__(self):
         self.name, self.loaded_at, self.ready, self.removed = "Personal", 1.0, True, False
+        self.calling = False
         self.asked = []
 
     def run(self, body, args=None, done=None):
@@ -328,6 +329,20 @@ class WatchTest(unittest.TestCase):
         self.fire()
         self.assertEqual(self.page.asked, [])
         self.assertEqual(self.watch._timer and self.timers[self.watch._timer][0], CHECK)  # still checking
+
+    def test_put_off_during_a_call(self):
+        # The check runs JavaScript in the page and logs: not while the call's sound goes through both.
+        self.watch.ready()
+        self.page.calling = True
+        self.assertEqual(self.fire(), FIRST)
+        self.assertEqual(self.page.asked, [])
+        self.assertEqual(self.fire(), AFTER_CALL)  # tried again a minute on, still in the call
+        self.assertEqual(self.page.asked, [])
+        self.page.calling = False
+        self.assertEqual(self.fire(), AFTER_CALL)
+        self.page.answer(sizes())
+        self.assertIn("audio sets at ready", self.lines[0])
+        self.assertEqual(self.timers[self.watch._timer][0], CHECK)
 
     def test_no_bridge_no_line(self):
         self.watch.ready()

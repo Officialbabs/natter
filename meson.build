@@ -7,7 +7,7 @@
 # ./install.sh is the other way in: it runs Natter from a checkout, for one user.
 
 project('natter',
-  version: '0.1.0',  # keep in step with VERSION in natter/__init__.py and the metainfo's release
+  version: '0.1.1',  # keep in step with VERSION in natter/__init__.py and the metainfo's release
   license: 'GPL-3.0-or-later',
   meson_version: '>= 0.62',
 )
@@ -25,9 +25,9 @@ install_subdir('natter',
 )
 
 # The camera fix (natter/camfix/nattercamfix.c, used by natter/gstfix.py): a GStreamer tracer that
-# stops WebKit's camera freezing on its first frame with GStreamer 1.28 and newer. Optional: built
-# when there's a C compiler and GStreamer's development files; Natter runs without it. gstfix.py
-# finds it through the camfix-dir file installed next to it.
+# stops WebKit's camera freezing on its first frame with GStreamer 1.28 and newer, and its Web Audio
+# clicking after silence. Optional: built when there's a C compiler and GStreamer's development
+# files; Natter runs without it. gstfix.py finds it through the camfix-dir file installed next to it.
 camfix_dir = prefix / get_option('libdir') / meson.project_name() / 'gstreamer-1.0'
 gstreamer = dependency('', required: false)
 if add_languages('c', required: false, native: false)
