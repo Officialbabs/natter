@@ -7,8 +7,11 @@
      Add ?link to start on the link screen (a QR code); linkPhone() then shows the chats.
      For replies from notifications: each chat has an id (the notifications' tag), the open chat's
      messages are keyed "<mine>_<chat id>_<id>", the Send button stands in for the voice note
-     button a timer tick after there are words, and the drawers' containers are always there,
-     empty unless one is open (a pasted file's preview is in the middle one), as in WhatsApp.
+     button a timer tick after there are words, and the drawers are as WhatsApp's: always there and
+     never empty (each holds a drawer manager, a <div> with an empty <span>, while nothing's open).
+     What opens goes in that span (openDrawer): a pasted or dropped file's preview, shaped like
+     WhatsApp's media editor, in the middle one; an empty state there, as beside Status; Settings
+     or a new group over the chat list. A notification's click closes the left one, as WhatsApp's.
      sentMessages and voicePresses say what was sent and pressed. -->
 <html>
 <head>
@@ -44,8 +47,9 @@
   [data-testid^="drawer-"] { position: absolute; top: 0; z-index: 1; }
   [data-testid="drawer-left"] { left: 0; width: 340px; } [data-testid="drawer-middle"] { left: 341px; right: 0; }
   [data-testid="drawer-right"] { right: 0; }
-  #preview { padding: 16px; background: #f0f2f5; }
-  @media (prefers-color-scheme: dark) { #preview { background: #111b21; } }
+  #preview, .panel { padding: 16px; background: #f0f2f5; }
+  @media (prefers-color-scheme: dark) { #preview, .panel { background: #111b21; } }
+  #preview [contenteditable], .panel [contenteditable], .panel input { margin: 8px 0; padding: 8px; border-radius: 8px; background: #8882; }
   footer { display: flex; gap: 8px; align-items: end; } footer [contenteditable] { flex: 1; }
   footer button { border: 0; background: none; font-size: 18px; }
   .landing { margin: auto; text-align: center; }
@@ -55,8 +59,8 @@
 <body>
 <div id="app"></div>
 <template id="chats">
-  <div data-testid="drawer-left"><span></span></div>
-  <div data-testid="drawer-middle"><span></span></div>
+  <div data-testid="drawer-left"><div><span></span></div></div>
+  <div data-testid="drawer-middle"><div><span></span></div></div>
   <div data-testid="drawer-right"><span></span></div>
   <div id="side">
     <div id="search" contenteditable="true" role="textbox" title="Search"></div>
@@ -73,6 +77,29 @@
     <footer><div contenteditable="true" role="textbox" title="Type a message"></div><span id="send-slot"></span></footer>
     <div id="drop">Drop files here</div>
   </div>
+</template>
+<!-- What opens in a drawer (openDrawer). WhatsApp's media editor: the files' preview, a caption box,
+     "Add file", Send, and the editor's own hidden file input, which takes more files while it's open. -->
+<template id="media-editor">
+  <div id="preview" role="dialog" tabindex="-1">
+    <span id="preview-names"></span>
+    <div contenteditable="true" role="textbox" data-testid="media-caption-input-container" aria-label="Add a caption"><p><br></p></div>
+    <button data-testid="media-editor-add-more" aria-label="Add file">+</button>
+    <div role="button" tabindex="0" aria-label="Send"><span data-icon="wds-ic-send-filled">➤</span></div>
+    <input type="file" multiple style="display: none">
+  </div>
+</template>
+<!-- Beside Status, Calls or Settings, WhatsApp's middle drawer holds an empty state. -->
+<template id="empty-state">
+  <div data-testid="empty-state-drawer"><p data-testid="empty-state-title">Status</p>
+    <p data-testid="empty-state-paragraph">Share photos, videos and text that disappear after 24 hours</p></div>
+</template>
+<template id="settings">
+  <div class="panel" aria-label="Settings"><input type="text" aria-label="Search settings" placeholder="Search settings">
+    <p>Account · Privacy · Chats · Notifications</p></div>
+</template>
+<template id="new-group">
+  <div class="panel" aria-label="New group"><div contenteditable="true" role="textbox" aria-label="Group subject"><p><br></p></div></div>
 </template>
 <template id="link-screen">
   <div class="landing">
@@ -168,10 +195,29 @@
     });
   }
 
+  // Opens `template` in one of the drawers ("left", "middle", "right"), in its drawer manager's
+  // span, as WhatsApp's drawer manager does; with no template, closes what's there.
+  function openDrawer(key, template) {
+    const slot = document.querySelector(`[data-testid="drawer-${key}"] span`);
+    slot.replaceChildren(...(template ? [document.getElementById(template).content.cloneNode(true)] : []));
+  }
+  window.openDrawer = openDrawer;
+
+  // The preview of files waiting to be sent. More files come in through its own hidden input
+  // (window.addedFiles); its Send sends them (window.previewSends) and closes it.
   function showPreview(names) {
-    document.querySelector('[data-testid="drawer-middle"] > span').innerHTML =
-      '<div id="preview" role="dialog"><span id="preview-names"></span><div contenteditable="true" role="textbox" title="Add a caption"></div></div>';
+    openDrawer("middle", "media-editor");
     document.getElementById("preview-names").textContent = names;
+    const more = document.querySelector('#preview input[type="file"]');
+    document.querySelector('#preview [data-testid="media-editor-add-more"]').addEventListener("click", () => more.click());
+    more.addEventListener("change", () => {
+      window.addedFiles = [...more.files].map((f) => [f.name, f.size, f.type]);
+      document.getElementById("preview-names").textContent += ", " + [...more.files].map((f) => f.name).join(", ");
+    });
+    document.querySelector('#preview [aria-label="Send"]').addEventListener("click", () => {
+      window.previewSends = (window.previewSends || 0) + 1;
+      openDrawer("middle");
+    });
   }
 
   function showChats() {
@@ -245,7 +291,7 @@
     // As WhatsApp's own handler: the left drawer closes, the chat opens by its id, then its box has focus.
     n.onclick = () => {
       window.focus();
-      document.querySelector('[data-testid="drawer-left"] > span').replaceChildren();
+      openDrawer("left");
       open(from).then(() => composer().focus());
       window.clickedNotification = from;
       n.close();

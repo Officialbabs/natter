@@ -3,7 +3,8 @@ reply (bridge.js). One reply is one send through WhatsApp's own page, or none: n
 locked or in a call, one at a time, never retried, the words only ever as arguments, the log
 without names, ids or words, and nothing else acting on the page while it runs. The bridge's
 whole run was tried against real Lexical in WebKitGTK (a lab); here, what can be pinned without
-a page: its rules, and its text comparison run in JavaScriptCore."""
+a page: its rules, and its text comparison run in JavaScriptCore, and what it takes for open in
+WhatsApp's drawers run there on the mock page's own markup."""
 
 import contextlib
 import io
@@ -12,6 +13,7 @@ import re
 import types
 import unittest
 from collections import deque
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -29,6 +31,7 @@ from natter.account import (BRIDGE, CHAT_ID, PAGE_REPLY_RESULTS, REPLY_BUDGET_MS
 GOOD = "4917612345678@c.us"
 OTHER = "120363041234567890@g.us"
 SECTION = BRIDGE[BRIDGE.index("// ---- Replying from a notification"):BRIDGE.index("// ---- Classes Natter's style")]
+MOCK = Path(__file__).with_name("mock-whatsapp.html").read_text()
 
 
 class Clock:
@@ -501,7 +504,7 @@ class BridgeRulesTest(unittest.TestCase):
         # between that and what the person was in the middle of.
         start = SECTION.index("async function replyOnce")
         before_click = SECTION[start:SECTION.index("clickNotification(pageId);", start)]
-        self.assertIn('if (drawerOpen("drawer-left")) return ["busy", "drawer"];', before_click)
+        self.assertIn('if (drawerEdit()) return ["busy", "drawer"];', before_click)
         self.assertIn('if (liveStreams()) return ["busy", "recording"];', before_click)
         self.assertIn("footerInUse(open, visible)", before_click)  # any controls only in sight
         self.assertNotIn("if (visible)", before_click)
@@ -516,10 +519,17 @@ class BridgeRulesTest(unittest.TestCase):
     def test_a_chat_that_takes_no_messages_isnt_busy(self):
         self.assertIn('footerInUse(main, false) ? ["busy", "no-composer"] : ["cant-send", ""]', SECTION)
 
-    def test_the_drawers_count_only_with_something_in_them(self):
-        # WhatsApp keeps drawer-middle (and -left) in its page all the time, empty.
-        self.assertNotRegex(SECTION, r'if \(find\("drawer-(middle|left)"\)\)')
-        self.assertIn('drawerOpen("drawer-middle")', SECTION)
+    def test_the_drawers_are_looked_in_not_at(self):
+        # WhatsApp keeps drawer-middle and -left in its page all the time, never empty: that one is
+        # there, or has something in it, says nothing (it said "busy" to every reply, DrawerTest).
+        self.assertNotRegex(SECTION, r'if \(!?find\("drawer-(middle|left)"\)\)')
+        self.assertNotIn("drawerOpen", BRIDGE)
+        self.assertNotIn("childElementCount", SECTION)
+        start = SECTION.index("async function replyOnce")
+        before_click = SECTION[start:SECTION.index("clickNotification(pageId);", start)]
+        self.assertIn('if (previewOpen()) return ["busy", "preview"];', before_click)
+        before_press = SECTION[SECTION.index("clickNotification(pageId);"):SECTION.index("button.click()")]
+        self.assertIn("|| previewOpen()) {", before_press)  # looked at again just before Send
 
     def test_every_answer_is_one_natter_knows(self):
         answers = set(re.findall(r'\["([a-z-]+)", ', SECTION))
@@ -642,6 +652,297 @@ class TextCheckTest(unittest.TestCase):
         self.assertFalse(self.same("see you \U0001F642", "see you :-D"))
         self.assertFalse(self.same("see you", "see you :-D"))
         self.assertFalse(self.same("see you \U0001F600\U0001F600", "see you :-D"))
+
+
+# ---- What's open in WhatsApp's drawers --------------------------------------------------------
+
+class _Markup(HTMLParser):
+    """HTML as a tree of plain dicts: {"tag", "attrs", "children"} and {"text"}."""
+
+    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+
+    def __init__(self, html):
+        super().__init__(convert_charrefs=True)
+        self.root = {"tag": "#document", "attrs": {}, "children": []}
+        self.open = [self.root]
+        self.feed(html)
+        self.close()
+
+    def handle_starttag(self, tag, attrs):
+        node = {"tag": tag, "attrs": {name: value or "" for name, value in attrs}, "children": []}
+        self.open[-1]["children"].append(node)
+        if tag not in self.VOID:
+            self.open.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self.open[-1]["children"].append({"tag": tag, "attrs": {name: value or "" for name, value in attrs},
+                                          "children": []})
+
+    def handle_endtag(self, tag):
+        for depth in range(len(self.open) - 1, 0, -1):
+            if self.open[depth]["tag"] == tag:
+                del self.open[depth:]
+                return
+
+    def handle_data(self, data):
+        self.open[-1]["children"].append({"text": data})
+
+
+def mock_template(name):
+    """The markup of one of the mock page's <template>s, as a tree."""
+    match = re.search(r'<template id="%s">(.*?)</template>' % re.escape(name), MOCK, re.S)
+    assert match, name
+    return _Markup(match[1]).root
+
+
+# Just enough of a page for the bridge's own functions, in JavaScriptCore: elements and text from
+# a tree, their attributes, fields' values and editability, and querySelector for the selectors
+# the bridge uses (tags, #id, .class, [attr], [attr="v"], [attr^="v"], :not(…), descendant and
+# child, lists).
+FAKE_PAGE = r"""
+const Node = { ELEMENT_NODE: 1, TEXT_NODE: 3 };
+class FakeText {
+  constructor(text, parent) { this.nodeType = 3; this.nodeName = "#text"; this.textContent = text; this.parentElement = parent; }
+}
+class FakeElement {
+  constructor(tree, parent) {
+    this.nodeType = 1;
+    this.tagName = this.nodeName = tree.tag.toUpperCase();
+    this.attributes = { ...tree.attrs };
+    this.parentElement = parent;
+    this.childNodes = [];
+    if (this.tagName === "INPUT" || this.tagName === "TEXTAREA") {
+      this.value = tree.attrs.value ?? (this.tagName === "TEXTAREA" ? tree.children.map((c) => c.text || "").join("") : "");
+      this.disabled = "disabled" in tree.attrs;
+      this.readOnly = "readonly" in tree.attrs;
+    }
+    add(this, tree.children);
+  }
+  get children() { return this.childNodes.filter((node) => node.nodeType === 1); }
+  get childElementCount() { return this.children.length; }
+  get lastChild() { return this.childNodes[this.childNodes.length - 1] || null; }
+  get textContent() { return this.childNodes.map((node) => node.textContent).join(""); }
+  get isConnected() { return true; }
+  get isContentEditable() {
+    for (let element = this; element; element = element.parentElement) {
+      const value = element.getAttribute("contenteditable");
+      if (value !== null) return value !== "false";
+    }
+    return false;
+  }
+  getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; }
+  contains(other) {
+    for (let node = other; node; node = node.parentElement) if (node === this) return true;
+    return false;
+  }
+  remove() {
+    const siblings = this.parentElement.childNodes;
+    siblings.splice(siblings.indexOf(this), 1);
+  }
+  descendants() { return this.children.flatMap((child) => [child, ...child.descendants()]); }
+  querySelectorAll(selector) {
+    const list = topLevel(selector, /,/).filter((_, i) => i % 2 === 0).map(complex);
+    return this.descendants().filter((element) => list.some((steps) => matches(element, steps, steps.length - 1)));
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+}
+function add(parent, trees) {
+  trees.forEach((tree) => parent.childNodes.push("text" in tree ? new FakeText(tree.text, parent) : new FakeElement(tree, parent)));
+}
+// `text` cut at each `separator` character outside brackets and quotes: [part, separator, part, …].
+function topLevel(text, separator) {
+  const out = [];
+  let depth = 0, quote = "", part = "";
+  for (const ch of text) {
+    if (quote) { if (ch === quote) quote = ""; part += ch; continue; }
+    if (ch === '"') quote = ch;
+    else if (ch === "[" || ch === "(") depth++;
+    else if (ch === "]" || ch === ")") depth--;
+    else if (!depth && separator.test(ch)) { out.push(part, ch); part = ""; continue; }
+    part += ch;
+  }
+  out.push(part);
+  return out;
+}
+function compound(text) {
+  const tests = [];
+  let rest = text, m;
+  while (rest) {
+    if ((m = /^([a-zA-Z][\w-]*|\*)/.exec(rest))) {
+      const tag = m[1].toUpperCase();
+      if (tag !== "*") tests.push((e) => e.tagName === tag);
+    } else if ((m = /^#([\w-]+)/.exec(rest))) {
+      const id = m[1];
+      tests.push((e) => e.getAttribute("id") === id);
+    } else if ((m = /^\.([\w-]+)/.exec(rest))) {
+      const name = m[1];
+      tests.push((e) => (e.getAttribute("class") || "").split(/\s+/).includes(name));
+    } else if ((m = /^\[([\w-]+)(?:(\^?=)"([^"]*)")?\]/.exec(rest))) {
+      const [, name, op, value] = m;
+      tests.push((e) => {
+        const has = e.getAttribute(name);
+        return has !== null && (!op || (op === "=" ? has === value : has.startsWith(value)));
+      });
+    } else if ((m = /^:not\(([^()]*)\)/.exec(rest))) {
+      const inner = compound(m[1]);
+      tests.push((e) => !inner(e));
+    } else {
+      throw new Error("FAKE_PAGE can't read the selector " + text);
+    }
+    rest = rest.slice(m[0].length);
+  }
+  return (e) => tests.every((test) => test(e));
+}
+// A selector as steps, last one first matched: [{test, child}] (child: ">" before it).
+function complex(text) {
+  const steps = [];
+  let child = false;
+  topLevel(text.trim(), /[\s>]/).forEach((part, i) => {
+    if (i % 2) { child = child || part === ">"; return; }
+    if (!part) return;
+    steps.push({ test: compound(part), child });
+    child = false;
+  });
+  return steps;
+}
+function matches(element, steps, i) {
+  if (!element || element.nodeType !== 1 || !steps[i].test(element)) return false;
+  if (i === 0) return true;
+  if (steps[i].child) return matches(element.parentElement, steps, i - 1);
+  for (let up = element.parentElement; up; up = up.parentElement) if (matches(up, steps, i - 1)) return true;
+  return false;
+}
+let document = null;
+function load(tree) { document = new FakeElement(tree, null); }
+// As the mock's openDrawer: into the drawer manager's span.
+function openDrawer(key, tree) { add(document.querySelector(`[data-testid="drawer-${key}"] span`), tree.children); }
+"""
+
+
+class DrawerTest(unittest.TestCase):
+    """What's open in WhatsApp's drawers (previewOpen, drawerEdit), run as they are on the mock
+    page's own markup: its drawers as WhatsApp's are (WAWebMain.react: a container, a <div>, and
+    the drawer manager's <span>, there all the time) and what opens in them, its media editor
+    (WAWebMediaEditor.react: a hidden <input type=file multiple>, a caption box)."""
+
+    @classmethod
+    def setUpClass(cls):
+        where = BRIDGE[BRIDGE.index("  const WHERE = {"):BRIDGE.index("  // ---- The chat list")]
+        invisible = re.search(r"^  const INVISIBLE = .*$", BRIDGE, re.M)[0]
+        start = SECTION.index("  const EMOTICONS = ")
+        # And where a reply's words go and which Send it presses (composerIn, sendButton).
+        end = SECTION.index("  // Whether `element` is on show")
+        send = SECTION[SECTION.index("  // WhatsApp's Send button, by the name"):SECTION.index("  // test()'s value")]
+        cls.js = JavaScriptCore.Context()
+        cls.js.evaluate("\n".join((FAKE_PAGE, where, invisible, SECTION[start:end], send)), -1)
+        exception = cls.js.get_exception()
+        assert exception is None, exception and exception.get_message()
+
+    def run_js(self, script):
+        value = self.js.evaluate(script, -1)
+        exception = self.js.get_exception()
+        self.assertIsNone(exception, exception and exception.get_message())
+        return value
+
+    def page(self, **drawers):
+        """The mock's chat page with `drawer=template` open, e.g. page(middle="media-editor")."""
+        self.run_js(f"load({json.dumps(mock_template('chats'))})")
+        for key, template in drawers.items():
+            self.run_js(f"openDrawer({json.dumps(key)}, {json.dumps(mock_template(template))})")
+
+    def ask(self, expression):
+        return self.run_js(expression).to_boolean()
+
+    def test_whatsapps_drawers_are_never_empty(self):
+        # What every reply was refused for ("busy (preview)", 12 of 12): with nothing open, each
+        # drawer still holds its manager's <div> and <span>.
+        self.page()
+        for key in ("drawer-left", "drawer-middle"):
+            self.assertTrue(self.ask(f'[...find("{key}").children].some((child) => child.childElementCount > 0)'))
+        self.assertFalse(self.ask("previewOpen()"))
+        self.assertFalse(self.ask("drawerEdit()"))
+
+    def test_a_preview_is_open(self):
+        self.page(middle="media-editor")
+        self.assertTrue(self.ask("previewOpen()"))
+        self.assertFalse(self.ask("drawerEdit()"), "the left drawer's, not the middle's")
+
+    def test_a_preview_by_either_of_its_own(self):
+        self.page(middle="media-editor")
+        self.run_js('find("drawer-middle").querySelector(\'input[type="file"]\').remove()')
+        self.assertTrue(self.ask("previewOpen()"), "by its caption box")
+        self.page(middle="media-editor")
+        self.run_js('find("drawer-middle").querySelector(\'[data-testid="media-caption-input-container"]\').remove()')
+        self.assertTrue(self.ask("previewOpen()"), "by its file input")
+        self.run_js('find("drawer-middle").querySelector(\'input[type="file"]\').remove()')
+        self.assertFalse(self.ask("previewOpen()"), "neither: not seen, not open")
+
+    def test_what_else_opens_there_isnt_a_preview(self):
+        # Beside Status, Calls or Settings: an empty state in the middle drawer.
+        self.page(middle="empty-state")
+        self.assertFalse(self.ask("previewOpen()"))
+        # A media editor anywhere else isn't the chat's preview.
+        self.page(right="media-editor")
+        self.assertFalse(self.ask("previewOpen()"))
+
+    def test_a_drawer_over_the_chat_list_with_nothing_typed(self):
+        # Settings (or Status, the Calls tab) left open: WhatsApp's click just closes it.
+        self.page(left="settings")
+        self.assertFalse(self.ask("drawerEdit()"))
+        self.page(left="new-group")  # its name box, empty as Lexical leaves it (<p><br></p>)
+        self.assertFalse(self.ask("drawerEdit()"))
+
+    def test_words_typed_over_the_chat_list(self):
+        self.page(left="new-group")
+        self.run_js('const line = find("drawer-left").querySelector("[contenteditable] p");'
+                    'line.childNodes.unshift(new FakeText("Book club", line))')
+        self.assertTrue(self.ask("drawerEdit()"))
+        self.page(left="settings")
+        self.run_js('find("drawer-left").querySelector("input").value = "  privacy "')
+        self.assertTrue(self.ask("drawerEdit()"))
+
+    def test_fields_without_words_of_theirs(self):
+        for field in ('<input type="checkbox" value="on">', '<input type="text" value="x" readonly>',
+                      '<input type="text" value="x" disabled>', '<input type="file" multiple>',
+                      '<input type="hidden" value="x">', '<div contenteditable="false">Book club</div>',
+                      '<input type="search" value="   ">'):
+            self.page(left="settings")
+            self.run_js(f'add(find("drawer-left").querySelector(".panel"), {json.dumps(_Markup(field).root["children"])})')
+            self.assertFalse(self.ask("drawerEdit()"), field)
+        self.page(left="settings")
+        self.run_js(f'add(find("drawer-left").querySelector(".panel"), '
+                    f'{json.dumps(_Markup("<input value=x><textarea>notes</textarea>").root["children"])})')
+        self.assertTrue(self.ask("drawerEdit()"))
+
+    def test_a_reply_never_reaches_the_preview(self):
+        # Seen or not, a preview can't take a reply: the box typed into and the Send pressed are
+        # only ever the open chat's own, in #main's footer, and WhatsApp's drawers are beside #main
+        # (WAWebMain.react), not in it. The preview's caption box and its Send are never found.
+        send = re.search(r"""words\s*\? '(<button aria-label="Send">.*?</button>)'""", MOCK)[1]  # the mock's slot()
+        own = ('composerIn(find("main")).getAttribute("title") === "Type a message"',
+               'sendButton(find("main")) === document.querySelector("#send-slot button")',
+               '!find("main").contains(find("drawer-middle"))')
+        # The preview whole, by one of its own alone, and not seen at all.
+        for gone in ((), ('input[type="file"]',),
+                     ('input[type="file"]', '[data-testid="media-caption-input-container"]')):
+            self.page(middle="media-editor")
+            self.run_js(f'add(document.querySelector("#send-slot"), {json.dumps(_Markup(send).root["children"])})')
+            for selector in gone:
+                self.run_js(f'find("drawer-middle").querySelector({json.dumps(selector)}).remove()')
+            self.assertEqual(self.ask("previewOpen()"), len(gone) < 2, gone)
+            for check in own:
+                self.assertTrue(self.ask(check), (gone, check))
+        # The preview's Send would pass for one by its icon's name, were it ever looked for there.
+        self.assertIn("send", self.run_js(
+            'iconNames(find("drawer-middle").querySelector(\'[aria-label="Send"]\'))').to_string())
+
+    def test_the_fake_page_reads_selectors_as_a_page_does(self):
+        self.page(middle="media-editor")
+        for selector, count in (('[data-testid="drawer-middle"] span', 3), ('[data-testid="drawer-middle"] > div > span', 1),
+                                ('[data-testid^="drawer-"]', 3), ('input:not([type="text"])', 1), ("#preview, footer", 2),
+                                ('[data-testid="drawer-left"] > span', 0)):
+            self.assertEqual(self.run_js(f"document.querySelectorAll({json.dumps(selector)}).length").to_int32(),
+                             count, selector)
 
 
 if __name__ == "__main__":

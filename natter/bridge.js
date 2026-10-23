@@ -318,10 +318,14 @@
     "composer": ['[contenteditable="true"][role="textbox"]', '[data-lexical-editor="true"]',
                  '[contenteditable="true"]'],              // its message box, in the footer
     "msg-key": ["[data-id]"],                              // its messages, in #main: "<mine>_<chat id>_<id>…"
-    // WhatsApp keeps its drawers' containers in the page all the time, with nothing in them
-    // unless one is open (drawerOpen).
-    "drawer-left": ['[data-testid="drawer-left"]'],        // over the chat list: profile, settings, a new group
-    "drawer-middle": ['[data-testid="drawer-middle"]'],    // over the chat: a picture or file waiting to be sent
+    // WhatsApp's drawers. Their containers are in the page all the time and never empty: each
+    // holds WhatsApp's drawer manager, a <div> with an empty <span> in it while nothing is open.
+    // So what's open is told by what's inside (previewOpen, drawerEdit), never by the drawer.
+    "drawer-left": ['[data-testid="drawer-left"]'],        // over the chat list: Status, Settings, a new group…
+    "drawer-middle": ['[data-testid="drawer-middle"]'],    // over the chat: a preview, beside Status an empty state…
+    // In the middle drawer, WhatsApp's media editor, the preview of a picture or file waiting to be
+    // sent: its hidden "Add file" input (always there while it's open), its caption box.
+    "preview": ['input[type="file"][multiple]', '[data-testid="media-caption-input-container"]'],
   };
 
   function find(key, root = document) {
@@ -760,8 +764,8 @@
   // "Add file" input instead: the handler of its + button and of a drop on it, any kind of file.
   // WhatsApp's attach menu adds its inputs to <body> itself; the preview's sits inside it.
   function previewPicker() {
-    const drawer = document.querySelector('[data-testid="drawer-middle"]');
-    const inDrawer = drawer && drawer.querySelector('input[type="file"][multiple]');
+    const drawer = find("drawer-middle");
+    const inDrawer = drawer && drawer.querySelector(WHERE.preview[0]);
     if (inDrawer) return inDrawer;
     return [...document.querySelectorAll('#app input[type="file"][multiple]')]
       .find((input) => input.parentElement !== document.body) || null;
@@ -896,9 +900,32 @@
     return !canonical(boxText(box)) && !box.querySelector("img, [data-lexical-decorator]");
   }
 
-  function drawerOpen(key) {
-    const drawer = find(key);
-    return Boolean(drawer && [...drawer.children].some((child) => child.childElementCount > 0));
+  // WhatsApp's media editor, open in the middle drawer: a picture or file waiting to be sent. What
+  // else WhatsApp opens there (an empty state beside Status, Calls or Settings; business tools)
+  // doesn't count. Not seen is not open: a reply still only types into the chat's own empty box,
+  // checks the words landed there, and presses that box's own Send, never the preview's.
+  function previewOpen() {
+    const drawer = find("drawer-middle");
+    return Boolean(drawer && find("preview", drawer));
+  }
+
+  // Where someone types: boxes and text fields, not checkboxes, files or buttons.
+  const FIELDS = "textarea, [contenteditable], input:not([type]), "
+    + "text search email tel url number password".split(" ").map((type) => `input[type="${type}"]`).join(", ");
+
+  function hasWords(field) {
+    if (field.isContentEditable) return !boxEmpty(field);
+    return "value" in field && !field.disabled && !field.readOnly && String(field.value).trim() !== "";
+  }
+
+  // Whether the left drawer holds words typed and not yet saved: a new group's name, a contact's,
+  // a profile name being changed, a search. WhatsApp's click on a notification closes that drawer
+  // and they'd be lost. An empty field (Settings' search, the Calls tab's) is nothing to lose, and
+  // a profile shows its name as words, not in a field, until its pencil is pressed. Choices
+  // without words (people picked for a new group, nothing typed yet) aren't seen.
+  function drawerEdit() {
+    const drawer = find("drawer-left");
+    return Boolean(drawer) && [...drawer.querySelectorAll(FIELDS)].some(hasWords);
   }
 
   // The chats the open chat's messages belong to, by their keys: "<mine>_<chat id>_<id>…".
@@ -1090,7 +1117,7 @@
     if (liveStreams()) return ["busy", "recording"];
     if (!find("pane")) return ["not-ready", ""];
     // A picture or file waiting to be sent: another chat would drop it, and Send would send it.
-    if (drawerOpen("drawer-middle")) return ["busy", "preview"];
+    if (previewOpen()) return ["busy", "preview"];
     if (!left()) return ["busy", "queue"];
     const there = () => {
       const main = find("main");
@@ -1102,10 +1129,11 @@
       if (!notification) return ["gone", "notification"];
       if (notification.tag !== chat) return ["mismatch", "tag"];
       // WhatsApp's click closes what's open over the chat list and leaves the open chat, whether
-      // anyone sees the page or not (it keeps both while Natter's window is hidden): a profile
-      // being edited or a group being made, a voice message waiting to be sent. In sight, any
-      // controls in place of the open chat's message box, as someone may be using them.
-      if (drawerOpen("drawer-left")) return ["busy", "drawer"];
+      // anyone sees the page or not (it keeps both while Natter's window is hidden): words typed
+      // there (a group being made, a profile name being changed), a voice message waiting to be
+      // sent. In sight, any controls in place of the open chat's message box, as someone may be
+      // using them. Status, Settings or the Calls tab left open over the list just close.
+      if (drawerEdit()) return ["busy", "drawer"];
       const open = find("main");
       if (open && footerInUse(open, visible)) return ["busy", "open-chat"];
       clickNotification(pageId);  // WhatsApp's own handler: it opens the chat by its id
@@ -1154,7 +1182,7 @@
     if (!button) return ["left-as-draft", "no-button"];
     // Still this chat, this box, these words, this button, nothing waiting to be sent with them.
     if (there() !== main || composerIn(main) !== box || !sameText(canonical(boxText(box)), wanted)
-        || sendButton(main) !== button || drawerOpen("drawer-middle")) {
+        || sendButton(main) !== button || previewOpen()) {
       return ["left-as-draft", "moved"];
     }
     const before = ownKeys(main, chat);

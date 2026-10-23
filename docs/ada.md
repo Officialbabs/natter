@@ -84,6 +84,8 @@ change to Natter Den:
   `x-kde-reply-submit-button-text` and `x-kde-reply-submit-button-icon-name`), and send
   `NotificationReplied(u id, s text)` to the app. Natter Den offers it only when the notification
   shows who wrote, and accepts the text only from the server's own bus name, once per field.
+  [ada-inline-reply.md](ada-inline-reply.md) has the changes to Ada's notification server and
+  QML in detail.
 
 ## Light, Dark and Dune
 

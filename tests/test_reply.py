@@ -477,6 +477,33 @@ class Label(Fake):
         return 20, 20, -1, -1
 
 
+class Shown(Fake):
+    """A widget whose visibility is looked at."""
+
+    def __init__(self, visible=False):
+        super().__init__(visible=visible)
+
+    def set_visible(self, visible):
+        self.visible = visible
+
+    def get_visible(self):
+        return self.visible
+
+
+class Markup(Fake):
+    """A label given markup: what it says is the markup."""
+
+    def __init__(self):
+        super().__init__(label="")
+
+    def set_markup(self, markup):
+        self.calls.append(("set_markup", markup))
+        self.label = markup
+
+    def get_label(self):
+        return self.label
+
+
 class Entry(Fake):
     def __init__(self):
         super().__init__(editable=True, filtered=False)
@@ -491,9 +518,10 @@ class Entry(Fake):
         return self.filtered
 
 
-METHODS = ("_text", "_send", "_answered", "_sent", "set_outcome", "_update_send", "_show_state", "put_text", "unsent",
-           "_on_close_request", "close_for_lock", "inline_failed", "_on_key", "_unregister", "_forget_now", "forget",
-           "_open_chat", "_banner_clicked", "present_again", "untell", "_show_yours", "_replay", "_reveal")
+METHODS = ("_text", "_send", "_answered", "_sent", "set_outcome", "_update_send", "_show_problem", "_show_state",
+           "put_text", "unsent", "_on_close_request", "close_for_lock", "inline_failed", "_on_key", "_unregister",
+           "_forget_now", "forget", "_open_chat", "_action_clicked", "present_again", "untell", "_show_yours",
+           "_replay", "_reveal", "_close_after_sent")
 
 
 def target(**values):
@@ -518,12 +546,15 @@ def window(test, text="", **values):
     app = App(test, **values)
     found = Fake(app=app, target=target(), key=("main", PERSON), ref="0123456789abcdef", sending=False, outcome=None,
                  queued=[], revealed=False, told=None, told_named=False, _too_long=False, _closing=0, _fitting=0,
-                 _sticking=0, _refocus=False, hidden_row=Fake(),
-                 visible=True, buffer=Buffer(text), entry=Entry(), send_button=Switch(), caption=Fake(), actions=Fake(),
-                 open_button=Switch(), banner=Fake(), yours=Label(), yours_box=Fake(), yours_scroller=Fake())
-    found.get_width = lambda: 420
+                 _sticking=0, _refocus=False, _contrast=0, action="", hidden_row=Fake(),
+                 visible=True, buffer=Buffer(text), entry=Entry(), send_button=Switch(), send_face=Fake(),
+                 composer=Fake(), who=Switch(), problem=Shown(), problem_text=Markup(), yours=Label(),
+                 yours_box=Fake(), yours_scroller=Fake())
+    found.get_width = lambda: 360
     found.get_visible = lambda: found.visible
-    found.set_visible = lambda visible: setattr(found, "visible", visible)
+    # Recorded with the rest: what's said comes before the window goes.
+    found.set_visible = lambda visible: (found.calls.append(("set_visible", visible)),
+                                         setattr(found, "visible", visible))
     for name in METHODS:
         setattr(found, name, types.MethodType(getattr(ReplyWindow, name), found))
     app.replies[found.key] = found
@@ -597,7 +628,10 @@ class SendTest(unittest.TestCase):
         found.buffer.text += "👍"
         found._update_send()
         self.assertFalse(found.send_button.sensitive)
-        self.assertEqual(found.caption.called("set_visible")[-1], (True,))
+        # Said under the field, with the way to send it: the chat itself.
+        self.assertTrue(found.problem.visible)
+        self.assertEqual(found.action, "chat")
+        self.assertTrue(found.problem_text.label.startswith(reply.TOO_LONG + ". <a "))
         found._send()
         self.assertEqual(found.app.sends, [])
         self.assertEqual(units("👍"), 2)
@@ -620,7 +654,7 @@ class SendTest(unittest.TestCase):
         found._update_send()  # over again: said again
         self.assertEqual(said().count(reply.TOO_LONG), 3)
 
-    def test_sent(self):
+    def test_sent_goes_at_once(self):
         found = window(self, "On my way")
         found.app.reply_drafts[found.key] = "old"
         found._send()
@@ -628,9 +662,29 @@ class SendTest(unittest.TestCase):
             found.app.sends[0][2]("sent")
         self.assertEqual(found.outcome, "sent")
         self.assertNotIn(found.key, found.app.reply_drafts)
-        self.assertIn(("Reply sent", Gtk.AccessibleAnnouncementPriority.MEDIUM), found.called("announce"))
-        self.assertEqual(later.call_args[0][0], reply.SENT_SHOWN)  # then it closes
         self.assertFalse(found.send_button.sensitive)
+        # Said, then out of sight straight away, as an answered notification goes.
+        said = found.calls.index(("announce", "Reply sent", Gtk.AccessibleAnnouncementPriority.MEDIUM))
+        self.assertGreater(found.calls.index(("set_visible", False)), said)
+        self.assertFalse(found.visible)
+        # Out of the app's replies at once: Reply on that chat now opens a new window, and KDE's
+        # words for it go there (or to its kept words), not into this one.
+        self.assertNotIn(found.key, found.app.replies)
+        # Destroyed a moment later, once a screen reader has asked about what was said.
+        self.assertEqual(found.called("destroy"), [])
+        self.assertEqual(later.call_args[0][0], reply.SENT_HEARD)
+        self.assertFalse(later.call_args[0][1]())
+        self.assertEqual(found.called("destroy"), [()])
+        self.assertEqual(found.app.failed, [])
+
+    def test_a_new_window_for_the_chat_meanwhile_stays(self):
+        found = window(self, "On my way")
+        found._send()
+        with mock.patch.object(GLib, "timeout_add", return_value=9) as later:
+            found.app.sends[0][2]("sent")
+        newer = found.app.replies[found.key] = Fake()  # Reply pressed again before it was destroyed
+        later.call_args[0][1]()
+        self.assertIs(found.app.replies[found.key], newer)
 
     def test_sent_out_of_sight_just_goes(self):
         found = window(self, "On my way")
@@ -730,6 +784,35 @@ class SendTest(unittest.TestCase):
         found = self.kde_answered_while_sending("unknown", "busy", visible=False)
         self.assertEqual(found.app.failed, ["unknown"])
 
+    def test_open_chat_never_while_sending(self):
+        # Opening a chat in the page would get in the way of the send (Alt+O, or who it's from).
+        found = window(self, "On my way")
+        found._send()
+        found._open_chat()
+        self.assertEqual(found.app.called("_open_from_notification"), [])
+        self.assertFalse(found.who.sensitive)
+        found.app.sends[0][2]("not-ready")
+        self.assertTrue(found.who.sensitive)
+        found._open_chat()
+        self.assertEqual(found.app.called("_open_from_notification"), [("main", "Mum", 7, "")])
+        self.assertEqual(found.called("close"), [])  # words in it: it stays
+
+    def test_open_chat_with_nothing_typed_closes(self):
+        found = window(self, "")
+        found._open_chat()
+        self.assertEqual(len(found.app.called("_open_from_notification")), 1)
+        self.assertEqual(found.called("close"), [()])
+
+    def test_sending_shows_on_the_button(self):
+        found = window(self, "On my way")
+        found._send()
+        self.assertEqual(found.send_face.called("set_visible_child_name")[-1], ("sending",))
+        self.assertEqual(found.composer.called("add_css_class")[-1], ("natter-sending",))
+        self.assertFalse(found.problem.visible)  # nothing wrong while it's under way
+        found.app.sends[0][2]("busy")
+        self.assertEqual(found.send_face.called("set_visible_child_name")[-1], ("send",))
+        self.assertEqual(found.composer.called("remove_css_class")[-1], ("natter-sending",))
+
     def test_show_gives_the_focus_back_to_the_box(self):
         # A click on Show takes the focus, and its row goes: the box has it again, not the messages.
         found = window(self, "", notify_preview=False)
@@ -760,8 +843,10 @@ class OutcomeTest(unittest.TestCase):
         }
         self.assertEqual({result: (look.button, look.send, look.done) for result, look in OUTCOMES.items()}, expected)
         for look in OUTCOMES.values():
-            self.assertFalse(look.banner.endswith("."), look.banner)  # banners have no full stop
-            self.assertEqual(look.banner[0], look.banner[0].upper())
+            self.assertFalse(look.line.endswith("."), look.line)  # no full stop: the link or a notice adds it
+            self.assertEqual(look.line[0], look.line[0].upper())
+            self.assertLessEqual(len(look.line), 60, look.line)  # a line under the field, at 360 px
+            self.assertIn(look.button, ("", *reply.ACTIONS))
 
     def test_every_answer_the_page_gives(self):
         # Account's answers, less "sent" (the window closes) and "removed" (it goes with its account).
@@ -779,17 +864,20 @@ class OutcomeTest(unittest.TestCase):
             self.assertEqual(found.buffer.text, "On my way", result)
             self.assertTrue(found.send_button.sensitive, result)
             self.assertTrue(found.entry.editable, result)
-            self.assertEqual(found.banner.called("set_title")[-1], (OUTCOMES[result].banner,), result)
-            self.assertEqual(found.banner.called("set_revealed")[-1], (True,), result)
-            self.assertIn((OUTCOMES[result].banner, Gtk.AccessibleAnnouncementPriority.MEDIUM),
-                          found.called("announce"))
+            look = OUTCOMES[result]
+            self.assertTrue(found.problem.visible, result)
+            self.assertTrue(found.problem_text.label.startswith(GLib.markup_escape_text(look.line)), result)
+            self.assertEqual(found.problem.called("add_css_class")[-1], ("error",), result)  # it didn't go
+            self.assertIn((look.line, Gtk.AccessibleAnnouncementPriority.MEDIUM), found.called("announce"))
 
     def test_once_linked_again(self):
         # Send stays on, for after linking: until then the page is asked nothing, so nothing's lost.
         found = self.answer("needs-link")
         self.assertEqual(found.buffer.text, "On my way")
         self.assertTrue(found.send_button.sensitive)
-        self.assertEqual(found.banner.called("set_button_label")[-1], (f"Open {NAME}",))
+        self.assertEqual(found.action, "app")
+        link = "Open " + NAME
+        self.assertIn(f'<a href="natter:app"><b>{link.replace(" ", chr(0xa0))}</b></a>', found.problem_text.label)
 
     def test_whatsapp_may_have_it(self):
         for result in ("left-as-draft", "unsure", "unknown"):
@@ -804,9 +892,13 @@ class OutcomeTest(unittest.TestCase):
             self.assertFalse(found.send_button.sensitive, result)
             key(found, Gdk.KEY_Return)
             self.assertEqual(len(found.app.sends), 1, result)
+            # Under the reply it's about, in the warning colour: it may have gone.
+            self.assertEqual(found.problem.called("add_css_class")[-1], ("warning",), result)
+            self.assertTrue(found.problem.visible, result)
             found.buffer.text = "Did that go?"  # a new reply is a new press
             found._update_send()
             self.assertTrue(found.send_button.sensitive, result)
+            self.assertTrue(found.problem.visible, result)  # still said, until the next send
 
     def test_one_answer_per_send(self):
         for first in ("unknown", "not-ready"):
@@ -820,19 +912,58 @@ class OutcomeTest(unittest.TestCase):
         self.assertEqual(found.called("destroy"), [()])
         self.assertNotIn(found.key, found.app.replies)
 
-    def test_banner_buttons(self):
+    def test_the_lines_link(self):
         found = self.answer("busy")
-        found._banner_clicked()
+        found._action_clicked()
         self.assertEqual(found.app.called("open_account"), [("main",)])
         found = self.answer("draft")
-        found._banner_clicked()
+        found._action_clicked()
         self.assertEqual(found.app.called("_open_from_notification"), [("main", "Mum", 7, "")])
         self.assertEqual(len(found.app.sends), 1)  # never a send
+        found = self.answer("not-ready")  # nothing to do but wait: no link
+        self.assertEqual(found.action, "")
+        self.assertNotIn("<a ", found.problem_text.label)
+        found._action_clicked()
+        self.assertEqual((found.app.called("open_account"), found.app.called("_open_from_notification")), ([], []))
+
+    def test_too_long_comes_first_then_the_answer_again(self):
+        found = self.answer("busy")
+        found.buffer.text = "👍" * (LIMIT // 2 + 1)
+        found._update_send()
+        self.assertEqual(found.action, "chat")
+        self.assertTrue(found.problem_text.label.startswith(reply.TOO_LONG))
+        found.buffer.text = "On my way"
+        found._update_send()
+        self.assertEqual(found.action, "app")
+        self.assertTrue(found.problem_text.label.startswith(OUTCOMES["busy"].line))
+
+    def test_the_line_is_markup_made_safe(self):
+        found = window(self, "On my way")
+        with mock.patch.dict(OUTCOMES, {"busy": reply.Outcome("<b>Fish & chips</b>", "app")}):
+            found._send()
+            found.app.sends[0][2]("busy")
+        self.assertTrue(found.problem_text.label.startswith("&lt;b&gt;Fish &amp; chips&lt;/b&gt;. <a "))
+
+    def test_a_new_send_takes_the_line_away(self):
+        found = self.answer("not-ready")
+        found._send()
+        self.assertFalse(found.problem.visible)
+        with mock.patch.object(GLib, "timeout_add", return_value=9):
+            found.app.sends[1][2]("sent")
+        self.assertFalse(found.problem.visible)
+
+    def test_the_line_set_only_when_it_changes(self):
+        found = self.answer("not-ready")
+        before = len(found.problem_text.called("set_markup"))
+        for _ in range(3):
+            found._update_send()  # as at every key
+        self.assertEqual(len(found.problem_text.called("set_markup")), before)
 
 
 class LayoutTest(unittest.TestCase):
-    """What the window does with room: the reply box grows with its words, the latest message
-    stays in sight, and no caret sits in words that can't change."""
+    """What the window does with room: the field grows with its words, the messages are kept
+    whole as far as they may be (the window grows instead), the latest message stays in sight, and
+    no caret sits in words that can't change."""
 
     def field(self, natural):
         found = window(self)
@@ -854,11 +985,25 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(self.field(400)[:2], (reply.FIELD_HIGH, Gtk.PolicyType.AUTOMATIC))
         self.assertEqual(self.field(34)[2], [])  # nothing set that's already so
 
-    def test_the_latest_message_in_sight(self):
+    def messages(self, natural, width=336, least=40):
         found = window(self)
         adjustment = Gtk.Adjustment(value=0, lower=0, upper=300, page_size=120)
-        found.messages = SimpleNamespace(get_vadjustment=lambda: adjustment)
+        found.messages = Fake(least=0, width=width)
+        found.messages.get_vadjustment = lambda: adjustment
+        found.messages.get_visible = lambda: True
+        found.messages.get_width = lambda: found.messages.width
+        found.messages.get_min_content_height = lambda: found.messages.least
+        found.messages.set_min_content_height = lambda height: setattr(found.messages, "least", height)
+        measured = []
+        found.column = Fake()
+        found.column.measure = lambda orientation, size: (
+            measured.append((orientation, size)),
+            (least, least, -1, -1) if orientation == Gtk.Orientation.HORIZONTAL else (natural, natural, -1, -1))[1]
         found._to_latest = types.MethodType(ReplyWindow._to_latest, found)
+        return found, adjustment, measured
+
+    def test_the_latest_message_in_sight(self):
+        found, adjustment, _measured = self.messages(80)
         with mock.patch.object(GLib, "idle_add", return_value=5) as later:
             ReplyWindow._stick(found)
             ReplyWindow._stick(found)  # once per layout
@@ -866,6 +1011,18 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(adjustment.get_value(), 0)  # not during the layout: GTK would lose it
         later.call_args[0][0]()
         self.assertEqual(adjustment.get_value(), 180)
+
+    def test_the_messages_kept_whole(self):
+        # What's typed (or a problem's line) grows the window rather than cut a message off, as
+        # far as MESSAGES_KEPT; past that they give way, and scroll with the latest in sight.
+        for natural, least in ((80, 80), (reply.MESSAGES_KEPT, reply.MESSAGES_KEPT), (400, reply.MESSAGES_KEPT)):
+            found, _adjustment, measured = self.messages(natural)
+            found._to_latest()
+            self.assertEqual(found.messages.least, least, natural)
+            self.assertEqual(measured[-1], (Gtk.Orientation.VERTICAL, 336))  # at the width they have
+        found, _adjustment, measured = self.messages(80, width=0, least=120)
+        found._to_latest()  # not laid out yet: never narrower than they can be
+        self.assertEqual(measured[-1], (Gtk.Orientation.VERTICAL, 120))
 
     def test_no_caret_while_sending(self):
         found = window(self, "On my way")
@@ -899,7 +1056,9 @@ class WordsTest(unittest.TestCase):
         self.assertEqual(notice("not-ready", "Mum", True),
                          ("Your reply wasn't sent", "To Mum. WhatsApp is still loading. Try again in a moment."))
         self.assertEqual(notice("unsure", "Mum", False),
-                         ("Your reply may not have been sent", "Couldn't check whether your reply was sent."))
+                         ("Your reply may not have been sent", "Couldn't check whether it was sent."))
+        self.assertEqual(notice("left-as-draft", "Mum", True),
+                         ("Your reply wasn't sent", "To Mum. Left unsent in the chat's message box."))
         self.assertNotIn("Mum", repr(notice("locked", "Mum", False)))
         self.assertEqual(notice("locked", "Mum", False),
                          ("Your reply wasn't sent", f"{NAME} locked before your reply could be sent."))

@@ -322,18 +322,20 @@ you press Send:
    when WhatsApp empties the box or shows your new message.
 
 Anything that doesn't look right stops it before Send, and the reply window says why and keeps
-your words: a picture waiting to be sent, a profile or a new group open in WhatsApp, a voice
-message being recorded or waiting to be sent, a draft or a message you were replying to in that
-chat, a chat that takes no messages from you, a call. These are looked at whether Natter Den's
-window is open or not, as WhatsApp keeps them while it's hidden. If Send was pressed but the
-reply wasn't seen to go, it says so and doesn't send again. Nothing is read from or written to
-WhatsApp's code or storage, and a notification's id and actions name no chat (each has a random
-reference), as desktops may keep them. While a reply is under way nothing else acts on that page,
-and a hidden window's page isn't slowed down meanwhile. A locked Natter Den starts no send: Reply
-asks for the passcode first, words typed in a KDE notification while it's locked wait in the
-reply window until you press Send, and a reply window the lock closes with words in it comes back
-after the passcode. Natter Den's log says how each reply ended (`natter: reply: sent`), never who
-to or what.
+your words: a picture or file waiting to be sent, words typed over the chat list and not yet
+saved (a new group's name, a profile name being changed, a search), a voice message being
+recorded or waiting to be sent, a draft or a message you were replying to in that chat, a chat
+that takes no messages from you, a call. These are looked at whether Natter Den's window is open
+or not, as WhatsApp keeps them while it's hidden. Status, Settings or another tab left open over
+the chat list with nothing typed in it just closes, as WhatsApp's own notification click closes
+it. If Send was pressed but the reply wasn't seen to go, it says so and doesn't send again.
+Nothing is read from or written to WhatsApp's code or storage, and a notification's id and
+actions name no chat (each has a random reference), as desktops may keep them. While a reply is
+under way nothing else acts on that page, and a hidden window's page isn't slowed down
+meanwhile. A locked Natter Den starts no send: Reply asks for the passcode first, words typed in
+a KDE notification while it's locked wait in the reply window until you press Send, and a reply
+window the lock closes with words in it comes back after the passcode. Natter Den's log says how
+each reply ended (`natter: reply: sent`), never who to or what.
 
 ### Themes
 
@@ -517,7 +519,7 @@ says where to look in `natter/bridge.js`:
 | the search box in `#side`, and the message box in `#main footer` | opening chats by name, pasting files |
 | WhatsApp's colour names (`--WDS-accent`, `--WDS-surface-default-RGB` and the rest) and its `body.dark` class | themes: when they're gone, the theme comes off that page and WhatsApp's own colours stay (`natter/themes.py`) |
 | the open chat's messages' keys (`#main [data-id]`, `<mine>_<chat id>_<id>`), its message box in `#main footer`, and the Send button by its icon's name ("send") | replies from notifications |
-| `[data-testid="drawer-left"]` and `[data-testid="drawer-middle"]`, which WhatsApp keeps in the page and fills when a profile, a new group or a picture to send is open | replies waiting rather than closing what's open |
+| `[data-testid="drawer-middle"]` and `[data-testid="drawer-left"]`, always in the page and never empty (each holds WhatsApp's drawer manager), so what's open is read from inside them: WhatsApp's media editor in the middle one (its `input[type="file"][multiple]` or `[data-testid="media-caption-input-container"]`), and fields with words in them in the left one | replies waiting rather than closing what's open, files added to an open preview |
 | the row of the message box in `#main footer` (the box, up to the voice message button by its icon's name), with nothing else shown in the footer | replies not going out as a reply to a message picked in WhatsApp; a voice message's controls by their icons' names |
 
 When a landmark replies lean on moves, replies stop before Send and the log says which
