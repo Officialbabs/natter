@@ -25,9 +25,9 @@ gi.require_version("JavaScriptCore", "6.0")
 from gi.repository import JavaScriptCore
 
 from natter import account as natter_account
-from natter.account import (BRIDGE, CHAT_ID, PAGE_REPLY_RESULTS, REPLY_BUDGET_MS, REPLY_GUARD, REPLY_LET_GO,
-                            REPLY_LIMIT, REPLY_QUEUE_WAIT, REPLY_RESULTS, REPLY_SCRIPT, Account, diag_line,
-                            reply_answer, reply_diag, reply_length, reply_text)
+from natter.account import (BRIDGE, CHAT_ID, PAGE_HIDDEN_SCRIPT, PAGE_REPLY_RESULTS, REPLY_BUDGET_MS, REPLY_GUARD,
+                            REPLY_LET_GO, REPLY_LIMIT, REPLY_QUEUE_WAIT, REPLY_RESULTS, REPLY_SCRIPT, Account,
+                            diag_line, reply_answer, reply_diag, reply_length, reply_text)
 
 GOOD = "4917612345678@c.us"
 OTHER = "120363041234567890@g.us"
@@ -93,13 +93,16 @@ class Settings:
 
 class View:
     def __init__(self):
-        self.settings, self.mapped, self.terminated = Settings(), False, 0
+        self.settings, self.mapped, self.terminated, self.root = Settings(), False, 0, None
 
     def get_settings(self):
         return self.settings
 
     def get_mapped(self):
         return self.mapped
+
+    def get_root(self):
+        return self.root  # none: as a window that isn't minimised (loan.out_of_sight)
 
     def terminate_web_process(self):
         self.terminated += 1
@@ -287,6 +290,7 @@ class ReplyTest(unittest.TestCase):
         body, args, _done = self.replies(page)[0]
         self.assertEqual(body, REPLY_SCRIPT)
         self.assertNotIn("alert", body)
+        self.assertEqual(type(args["request"].pop("sinceMs")), int)  # how long ago its turn came
         self.assertEqual(args, {"request": {"pageId": 7, "chatId": GOOD, "text": '"); alert(1); ("',
                                             "budgetMs": REPLY_BUDGET_MS, "visible": True}})
         json.dumps(args)  # as run() sends them
@@ -305,7 +309,7 @@ class ReplyTest(unittest.TestCase):
         for result in sorted(PAGE_REPLY_RESULTS):
             page = Page()
             results = self.reply(page)
-            page.answer({"result": result, "why": "no-ids"})
+            page.answer({"result": result, "why": "unconfirmed"})
             self.clock.flush()
             self.assertEqual(results, [result])
 
@@ -318,6 +322,15 @@ class ReplyTest(unittest.TestCase):
             self.assertEqual(results, ["unknown"], value)
         self.assertEqual(reply_answer({"result": "busy", "why": "x" * 40}), ("busy", ""))
         self.assertEqual(reply_answer({"result": "busy", "why": "Mum's chat"}), ("busy", ""))
+
+    def test_how_the_chat_was_told_is_logged(self):
+        for how in ("ids", "name+body", "name+avatar", "name+click"):
+            self.assertEqual(reply_answer({"result": "sent", "why": how}), ("sent", how))
+        page = Page()
+        self.reply(page)
+        page.answer(sent("name+body"))
+        self.clock.flush()
+        self.assertEqual(self.log.getvalue(), "natter: reply: sent (name+body)\n")
 
     def test_throttling_off_while_the_page_has_it(self):
         page = Page()
@@ -428,9 +441,9 @@ class ReplyTest(unittest.TestCase):
     def test_the_log_never_says_who_or_what(self):
         page = Page()
         self.reply(page, text="Secret words")
-        page.answer({"result": "mismatch", "why": "no-ids"})
+        page.answer({"result": "mismatch", "why": "unconfirmed"})
         self.clock.flush()
-        self.assertEqual(self.log.getvalue(), "natter: reply: mismatch (no-ids)\n")
+        self.assertEqual(self.log.getvalue(), "natter: reply: mismatch (unconfirmed)\n")
         self.assertNotIn(GOOD, self.log.getvalue())
 
     # ---- The page lent to a reply card while out of sight (loan.py) -----------------------------
@@ -439,8 +452,9 @@ class ReplyTest(unittest.TestCase):
         """A reply with a lend() that lends: (its results, the loans made)."""
         loans = []
 
-        def lend():
+        def lend(hidden):
             loans.append(Loan(laid_out))
+            loans[-1].hidden = hidden
             return loans[-1]
         page.view.mapped = mapped
         results = []
@@ -508,11 +522,50 @@ class ReplyTest(unittest.TestCase):
     def test_never_lent_when_it_can_be_seen_or_isnt_asked(self):
         page = Page()
         _results, loans = self.lent_reply(page, mapped=True)
+        self.assertEqual(page.runs[0][0], PAGE_HIDDEN_SCRIPT)  # on screen: the page is asked first
+        self.assertEqual(self.replies(page), [])
+        page.answer("visible", 0)
         self.assertEqual(loans, [])
+        self.assertEqual(len(self.replies(page)), 1)
         page.answer(sent())
         page = Page()
-        page.send_reply(7, GOOD, "On my way", [].append)  # no card to lend it to
+        page.view.mapped = True
+        page.send_reply(7, GOOD, "On my way", [].append)  # no card to lend it to: nothing asked first
+        self.assertEqual([body for body, _a, _d in page.runs], [REPLY_SCRIPT])
+
+    def test_lent_from_a_window_on_screen_when_the_page_is_hidden(self):
+        # Mapped to GTK, its window not minimised, and still hidden to WebKit: lent all the same.
+        page = Page()
+        results, loans = self.lent_reply(page, mapped=True)
+        page.answer("hidden", 0)
+        (loan,) = loans
+        self.assertIs(loan.hidden, True)
         self.assertEqual(len(self.replies(page)), 1)
+        page.answer(sent())
+        self.clock.flush()
+        self.assertEqual((results, loan.returns), (["sent"], 1))
+        page = Page()
+        _results, loans = self.lent_reply(page, mapped=True)
+        page.answer(None, 0)  # no answer: as on screen
+        self.assertEqual((loans, len(self.replies(page))), ([], 1))
+
+    def test_lent_from_a_minimised_window_without_asking(self):
+        gi.require_version("Gdk", "4.0")
+        from gi.repository import Gdk
+        page = Page()
+        page.view.root = SimpleNamespace(get_surface=lambda: SimpleNamespace(
+            get_state=lambda: Gdk.ToplevelState.MINIMIZED))
+        _results, (loan,) = self.lent_reply(page, mapped=True)
+        self.assertIs(loan.hidden, False)
+        self.assertEqual([body for body, _a, _d in page.runs], [REPLY_SCRIPT])
+
+    def test_never_asked_or_lent_once_answered_while_the_page_says(self):
+        page = Page()
+        results, loans = self.lent_reply(page, mapped=True)
+        self.clock.fire(REPLY_GUARD)
+        page.answer("hidden", 0)
+        self.clock.flush()
+        self.assertEqual((results, loans, self.replies(page)), (["unknown"], [], []))
 
     def test_never_lent_for_what_never_reaches_the_page(self):
         for setup in (lambda page: setattr(page.app, "locked", True), lambda page: setattr(page, "in_call", True),
@@ -535,7 +588,7 @@ class ReplyTest(unittest.TestCase):
 
     def test_back_whatever_the_answer(self):
         answers = [{"result": result} for result in sorted(PAGE_REPLY_RESULTS)]
-        for value in [None, {"result": "mismatch", "why": "no-ids"}] + answers:
+        for value in [None, {"result": "mismatch", "why": "unconfirmed"}] + answers:
             page = Page()
             _results, (loan,) = self.lent_reply(page)
             page.answer(value)
@@ -557,13 +610,41 @@ class ReplyTest(unittest.TestCase):
         self.assertIs(self.replies(page)[0][1]["request"]["visible"], False)
         page = Page()
         page.app.page_seen = lambda account: page.view.mapped  # as if mapped were seen
-        page.send_reply(7, GOOD, "On my way", [].append, lend=lambda: (setattr(page.view, "mapped", True), Loan())[1])
+        page.send_reply(7, GOOD, "On my way", [].append,
+                        lend=lambda hidden: (setattr(page.view, "mapped", True), Loan())[1])
         self.assertTrue(page.view.mapped)  # in the card
         self.assertIs(self.replies(page)[0][1]["request"]["visible"], False)  # as it was before
         page = Page()
         page.app.seen = True
         self.reply(page)
         self.assertIs(self.replies(page)[0][1]["request"]["visible"], True)
+
+    def test_a_page_that_says_its_hidden_isnt_seen(self):
+        # On screen to GTK in a window on that account, and hidden to WebKit: nobody sees it.
+        page = Page()
+        page.app.seen = True
+        _results, loans = self.lent_reply(page, mapped=True)
+        page.answer("hidden", 0)
+        self.assertIs(self.replies(page)[0][1]["request"]["visible"], False)
+        page = Page()
+        page.app.seen = True
+        _results, loans = self.lent_reply(page, mapped=True)
+        page.answer("visible", 0)
+        self.assertIs(self.replies(page)[0][1]["request"]["visible"], True)
+
+    def test_the_page_is_told_how_long_ago_its_turn_came(self):
+        # Stamped before the loan, which may have WhatsApp close the notification (bridge.js reply).
+        clock = [100.0]
+        page = Page()
+        with mock.patch.object(natter_account, "time", SimpleNamespace(monotonic=lambda: clock[0])):
+            def lend(hidden):
+                clock[0] += 0.6  # the loan, and WhatsApp reading the chat meanwhile
+                return Loan(laid_out=False)
+            page.send_reply(7, GOOD, "On my way", [].append, lend=lend)
+            clock[0] += 0.15  # laid out a moment later
+            page._reply.loan.ready = True
+            self.clock.fire(natter_account.REPLY_LAYOUT_TICK / 1000)
+        self.assertEqual(self.replies(page)[0][1]["request"]["sinceMs"], 750)
 
     # ---- What the log may say of the page ------------------------------------------------------
 
@@ -573,10 +654,11 @@ class ReplyTest(unittest.TestCase):
     def test_the_diag_is_logged_on_the_same_line(self):
         page = Page()
         _results, (loan,) = self.lent_reply(page)
-        page.answer({"result": "mismatch", "why": "no-ids", "diag": self.DIAG})
+        page.answer({"result": "mismatch", "why": "unconfirmed", "diag": self.DIAG})
         self.clock.flush()
         self.assertEqual(self.log.getvalue(),
-                         "natter: reply: mismatch (no-ids) [page hidden, frames no, mapped no, lent yes, chat yes, "
+                         "natter: reply: mismatch (unconfirmed) [page hidden, frames no, mapped no, lent yes, "
+                         "chat yes, "
                          "header yes, footer yes, box yes, size 1000x700, keys 0, chat keys 0, rows 0, key none]\n")
 
     def test_an_odd_diag_is_left_out(self):
@@ -603,6 +685,72 @@ class ReplyTest(unittest.TestCase):
         ]
         for diag in refused:
             self.assertIsNone(reply_diag({"diag": dict(self.DIAG, **diag)}), diag)
+
+    SIGNS = {"name": True, "navigated": False, "body": False, "avatar": False, "hasBody": True, "hasIcon": True,
+             "nameAt": 2, "nameFirst": False,
+             "dataType": "object", "dataKeys": ["chat-id", "msg-key"], "tagShape": "9@a.a",
+             "mainAttrs": ["class", "id", "tabindex"], "headerAttrs": ["class"], "keyAttrs": ["class", "data-id"],
+             "rowAttrs": ["aria-rowindex", "role"], "values": ["data-id=9a9a9", "data-x=a_a"]}
+
+    def test_the_diag_takes_the_signs_and_names_it_knows(self):
+        good = dict(self.DIAG, **self.SIGNS)
+        self.assertEqual(reply_diag({"diag": good}), good)
+        self.assertEqual(reply_diag({"diag": dict(good, dataKeys=[], values=[], dataType="null")})["values"], [])
+        refused = [
+            {"dataKeys": ["Mum"]}, {"dataKeys": ["mum dad"]}, {"dataKeys": ["4917612345678"]}, {"dataKeys": ["a123"]},
+            {"dataKeys": ["chat-id", "chat-id"]}, {"dataKeys": [f"key-{n}" for n in range(17)]}, {"dataKeys": "id"},
+            {"dataKeys": [GOOD]}, {"dataKeys": ["a" * 33]}, {"dataKeys": [1]}, {"mainAttrs": ["data-id=3"]},
+            {"rowAttrs": ["Role"]}, {"headerAttrs": ["ä"]},
+            {"values": ["data-id"]}, {"values": ["data-id=Mum"]}, {"values": [f"data-id={GOOD}"]},
+            {"values": ["Mum=9a"]}, {"values": ["data-id=9"] * 9}, {"values": "data-id=9"},
+            {"tagShape": GOOD}, {"tagShape": "Mum"}, {"dataType": "Mum"}, {"dataType": "map"},
+            {"name": "yes"}, {"navigated": 1}, {"body": None}, {"avatar": "Mum"}, {"hasBody": "Did you eat?"},
+            {"title": "Mum"}, {"body": "Did you eat?"},
+            {"nameAt": -2}, {"nameAt": 3}, {"nameAt": 10}, {"nameAt": "Mum"}, {"nameAt": True}, {"nameAt": 1.0}, {"nameFirst": "Mum"},
+        ]
+        for diag in refused:
+            self.assertIsNone(reply_diag({"diag": dict(good, **diag)}), diag)
+
+    FOOTER = {"composerAt": 0, "buttons": 2, "icons": ["a-a-a", "a-a-a-a"], "quote": False, "preview": False}
+
+    def test_the_diag_takes_the_footer(self):
+        good = dict(self.DIAG, **self.FOOTER)
+        self.assertEqual(reply_diag({"diag": good}), good)
+        self.assertEqual(reply_diag({"diag": dict(good, composerAt=-1, icons=[])})["composerAt"], -1)
+        refused = [
+            {"composerAt": -2}, {"composerAt": natter_account.REPLY_DIAG_BOX_PLACES}, {"composerAt": True},
+            {"composerAt": "0"}, {"buttons": -1}, {"buttons": 1000}, {"buttons": "2"},
+            {"icons": ["ic-send-filled"]}, {"icons": ["Mum"]}, {"icons": ["a a"]}, {"icons": [""]}, {"icons": "a-a"},
+            {"icons": ["a-a", "a-a"]}, {"icons": [f"a{'-a' * n}" for n in range(9)]}, {"icons": [GOOD]},
+            {"quote": "yes"}, {"preview": 1},
+        ]
+        for diag in refused:
+            self.assertIsNone(reply_diag({"diag": dict(good, **diag)}), diag)
+
+    def test_the_diags_places_are_the_bridges(self):
+        js = JavaScriptCore.Context()
+        js.evaluate(WHERE, -1)
+        self.assertEqual(js.evaluate('WHERE["header-name"].length', -1).to_int32(), natter_account.REPLY_DIAG_PLACES)
+        self.assertEqual(js.evaluate("WHERE.composer.length", -1).to_int32(), natter_account.REPLY_DIAG_BOX_PLACES)
+        good = dict(self.DIAG, **self.SIGNS)
+        self.assertIsNotNone(reply_diag({"diag": dict(good, nameAt=natter_account.REPLY_DIAG_PLACES - 1)}))
+        self.assertIsNone(reply_diag({"diag": dict(good, nameAt=natter_account.REPLY_DIAG_PLACES)}))
+
+    def test_the_diag_line_with_the_footer(self):
+        line = diag_line(dict(self.DIAG, **self.FOOTER))
+        self.assertIn("key none, box at 0, buttons 2, icons (a-a-a a-a-a-a), quote no, preview no]", line)
+        line = diag_line(dict(self.FOOTER, composerAt=-1, icons=[], quote=True))
+        self.assertEqual(line, "[box at none, buttons 2, icons (none), quote yes, preview no]")
+
+    def test_the_diag_line_with_the_signs(self):
+        line = diag_line(dict(self.DIAG, **self.SIGNS, mapped=True, lent=False))
+        self.assertTrue(line.endswith(
+            "key none, name yes, opened no, message no, picture no, notified body yes, notified picture yes, "
+            "name at 2, name first no, data object (chat-id msg-key), tag 9@a.a, chat attrs (class id tabindex), header attrs (class), "
+            "key attrs (class data-id), row attrs (aria-rowindex role), values (data-id=9a9a9 data-x=a_a)]"), line)
+        self.assertIn("data null,", diag_line(dict(self.SIGNS, dataType="null", dataKeys=[])))
+        self.assertIn("values (none)", diag_line(dict(self.SIGNS, values=[])))
+        self.assertIn("name at none,", diag_line(dict(self.SIGNS, nameAt=-1)))
 
     def test_the_diag_line_says_no_names(self):
         line = diag_line(dict(self.DIAG, shape="aaaaa_99999@a.aa_9aa9", mapped=True, lent=False))
@@ -709,12 +857,13 @@ class BridgeRulesTest(unittest.TestCase):
     def test_a_message_being_replied_to_counts_as_a_draft(self):
         start = SECTION.index("async function replyOnce")
         before_typing = SECTION[start:SECTION.index("execCommand(", start)]
-        self.assertIn('if (besideTheBox(main, box)) return ["draft", "quote"];', before_typing)
-        # Once, before typing: a link typed brings its preview up there, and that's not theirs.
-        self.assertEqual(len(re.findall(r"(?<!function )besideTheBox\(", SECTION)), 1)
+        self.assertIn('if (besideTheBox(main, box)) return described(["draft", "quote"]);', before_typing)
+        # Once, before typing: a link typed brings its preview up there, and that's not theirs. (The
+        # log's account of the page looks too, once the answer is given: diagnose.)
+        self.assertEqual(len(re.findall(r"(?<!function )besideTheBox\(", SECTION[start:])), 1)
 
     def test_a_chat_that_takes_no_messages_isnt_busy(self):
-        self.assertIn('footerInUse(main, false) ? ["busy", "no-composer"] : ["cant-send", ""]', SECTION)
+        self.assertIn('footerInUse(main, false) ? ["busy", "no-composer"] : described(["cant-send", ""])', SECTION)
 
     def test_the_drawers_are_looked_in_not_at(self):
         # WhatsApp keeps drawer-middle and -left in its page all the time, never empty: that one is
@@ -726,7 +875,7 @@ class BridgeRulesTest(unittest.TestCase):
         before_click = SECTION[start:SECTION.index("clickNotification(pageId);", start)]
         self.assertIn('if (previewOpen()) return ["busy", "preview"];', before_click)
         before_press = SECTION[SECTION.index("clickNotification(pageId);"):SECTION.index("button.click()")]
-        self.assertIn("|| previewOpen()) {", before_press)  # looked at again just before Send
+        self.assertIn("|| previewOpen() ||", before_press)  # looked at again just before Send
 
     def test_every_answer_is_one_natter_knows(self):
         answers = set(re.findall(r'\["([a-z-]+)", ', SECTION))
@@ -760,6 +909,30 @@ class BridgeRulesTest(unittest.TestCase):
         for bad in ("", "Mum", "status@broadcast", "1203@newsletter", "call-accepted-elsewhere:123@c.us",
                     "call-link-joined:x", "waiting-room:x", "wa-web-call-active", "false_123@c.us_ABC", "1234@c.us"):
             self.assertIsNone(CHAT_ID.fullmatch(bad), bad)
+
+
+class ClosedNotificationTest(unittest.TestCase):
+    """WhatsApp's notifications as the bridge keeps them (NatterNotification), run as they are: those
+    WhatsApp closed are kept as many as those shown, each with when it was closed."""
+
+    def setUp(self):
+        notifications = BRIDGE[BRIDGE.index("  const shown = new Map();"):BRIDGE.index("  // ---- Idle audio")]
+        self.js = JavaScriptCore.Context()
+        self.js.evaluate("const window = globalThis; let clock = 0; const performance = { now: () => clock };"
+                         "const post = () => {}; const setTimeout = () => 0;"
+                         "class EventTarget { dispatchEvent() { return true; } }"
+                         "class Event { constructor(type) { this.type = type; } }\n" + notifications, -1)
+        exception = self.js.get_exception()
+        self.assertIsNone(exception, exception and exception.get_message())
+
+    def test_closed_ones_kept_as_shown_ones_are(self):
+        self.js.evaluate("const made = []; for (let i = 0; i < 310; i++) made.push(new Notification('', {}));"
+                         "made.forEach((n, i) => { clock = 1000 + i; n.close(); });", -1)
+        self.assertEqual(self.js.evaluate("closed.size", -1).to_int32(), 300)
+        self.assertFalse(self.js.evaluate("clickNotification(made[9].id)", -1).to_boolean())  # the oldest go
+        self.assertTrue(self.js.evaluate("clickNotification(made[10].id)", -1).to_boolean())
+        self.assertEqual(self.js.evaluate("closed.get(made[309].id).closedAt", -1).to_int32(), 1309)
+        self.assertEqual(self.js.evaluate("shown.size", -1).to_int32(), 0)
 
 
 class OpenChatTest(unittest.TestCase):
@@ -918,6 +1091,7 @@ class FakeElement {
   get children() { return this.childNodes.filter((node) => node.nodeType === 1); }
   get childElementCount() { return this.children.length; }
   get lastChild() { return this.childNodes[this.childNodes.length - 1] || null; }
+  get style() { return { transform: (/transform:\s*([^;]+)/.exec(this.attributes.style || "") || [, ""])[1] }; }
   get textContent() { return this.childNodes.map((node) => node.textContent).join(""); }
   get isConnected() { return true; }
   get isContentEditable() {
@@ -928,6 +1102,7 @@ class FakeElement {
     return false;
   }
   getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; }
+  getAttributeNames() { return Object.keys(this.attributes); }
   contains(other) {
     for (let node = other; node; node = node.parentElement) if (node === this) return true;
     return false;
@@ -942,6 +1117,14 @@ class FakeElement {
     return this.descendants().filter((element) => list.some((steps) => matches(element, steps, steps.length - 1)));
   }
   querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  matches(selector) {
+    return topLevel(selector, /,/).filter((_, i) => i % 2 === 0).map(complex)
+      .some((steps) => matches(this, steps, steps.length - 1));
+  }
+  closest(selector) {
+    for (let element = this; element; element = element.parentElement) if (element.matches(selector)) return element;
+    return null;
+  }
 }
 function add(parent, trees) {
   trees.forEach((tree) => parent.childNodes.push("text" in tree ? new FakeText(tree.text, parent) : new FakeElement(tree, parent)));
@@ -1142,12 +1325,319 @@ class DrawerTest(unittest.TestCase):
                              count, selector)
 
 
+# The bridge's parts the reply leans on from outside its section, as the bridge has them: names
+# as Natter compares them, and the open chat's name in a header (titleOf).
+NAMES = "\n".join((re.search(r"^  const NAME_LIMIT = .*$", BRIDGE, re.M)[0],
+                   re.search(r"^  const INVISIBLE = .*$", BRIDGE, re.M)[0],
+                   re.search(r"^  const plainName = .*$", BRIDGE, re.M)[0],
+                   BRIDGE[BRIDGE.index("  // Text with WhatsApp's emoji pictures"):
+                          BRIDGE.index("  function activeChat()")]))
+WHERE = BRIDGE[BRIDGE.index("  const WHERE = {"):BRIDGE.index("  // ---- The chat list")]
+# The chat list as the bridge reads it (chatRows), for replies telling two chats of a name apart,
+# and whether it shows all the chats (a filter chip on, a search typed).
+CHAT_LIST = "\n".join((BRIDGE[BRIDGE.index("  // ---- The chat list"):BRIDGE.index("  // Text with WhatsApp's emoji pictures")],
+                       BRIDGE[BRIDGE.index("  function searchBox()"):BRIDGE.index("  function setSearch(")],
+                       BRIDGE[BRIDGE.index("  function searching()"):BRIDGE.index("  function focusComposer()")]))
+
+
+def words(*parts):
+    """A message's words as WhatsApp draws them: text, and emoji as pictures (("img", "👍"))."""
+    return [{"tag": "img", "attrs": {"alt": part[1], "class": "emoji", "src": "data:image/gif;base64,R0lGOD"},
+             "children": []} if isinstance(part, tuple) else {"text": part} for part in parts]
+
+
+def row(key, *parts, sender=None, styled=None, way="in", said=None):
+    """A message's row as the live page has it: div[role=row] > div[data-id] (message-in, or
+    message-out for the person's own), in a group its sender's name above its words (on the first
+    row of a run of theirs), its words in a span, and its time. `styled`: words shown bold. `said`:
+    who sent it, as WhatsApp's data-pre-plain-text has it."""
+    text = words(*parts)
+    if styled:
+        text = [{"tag": "strong", "attrs": {}, "children": words(styled)}] + text
+    pre = {"data-pre-plain-text": f"[10:42, 23/10/2026] {said}: "} if said else {}
+    inner = [{"tag": "div", "attrs": {"class": "copyable-text", **pre}, "children": [
+        {"tag": "span", "attrs": {"dir": "ltr", "class": "selectable-text copyable-text"},
+         "children": [{"tag": "span", "attrs": {}, "children": text}]}]}]
+    if sender:
+        inner.insert(0, {"tag": "div", "attrs": {}, "children": [
+            {"tag": "span", "attrs": {"dir": "auto", "class": "sender"}, "children": [{"text": sender}]}]})
+    return {"tag": "div", "attrs": {"role": "row"}, "children": [
+        {"tag": "div", "attrs": {"data-id": key, "class": f"message-{way} focusable-list-item"}, "children": [
+            *inner, {"tag": "span", "attrs": {"class": "time"}, "children": [{"text": "10:42"}]}]}]}
+
+
+def header(title, picture="", title_attr=True, emoji=None):
+    """The open chat's header as the mock draws it: its picture, its name (the name's emoji as a
+    picture, `emoji`), and WhatsApp's call buttons."""
+    name = words(title, ("img", emoji)) if emoji else words(title)
+    children = [{"tag": "span", "attrs": {"dir": "auto", "data-testid": "conversation-info-header-chat-title",
+                                          **({"title": title + (emoji or "")} if title_attr else {})},
+                 "children": name}]
+    if picture:
+        children.insert(0, {"tag": "img", "attrs": {"src": picture, "alt": "", "draggable": "false"}, "children": []})
+    children.append({"tag": "button", "attrs": {"aria-label": "Voice call", "disabled": ""}, "children": []})
+    return {"tag": "header", "attrs": {}, "children": children}
+
+
+def chat_main(title="", rows=(), picture="", **named):
+    """#main for a chat, with its header, rows and an empty message box."""
+    return {"tag": "div", "attrs": {"id": "main", "tabindex": "-1"}, "children": [
+        header(title, picture, **named) if title else {"tag": "header", "attrs": {}, "children": []},
+        {"tag": "div", "attrs": {"id": "messages", "role": "application"}, "children": list(rows)},
+        {"tag": "footer", "attrs": {}, "children": [
+            {"tag": "div", "attrs": {"contenteditable": "true", "role": "textbox"}, "children": []}]}]}
+
+
+def bare(n):
+    """A message id as live WhatsApp keys its rows: no chat in it."""
+    return f"3EB0{n:04X}A1B2C3D4E5F6"
+
+
+class SameChatTest(unittest.TestCase):
+    """The bridge's check that the open chat is the notification's without its id (sameChat), run as
+    it is on stand-in chats shaped as the live page's."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = JavaScriptCore.Context()
+        cls.js.evaluate("\n".join((FAKE_PAGE, WHERE, CHAT_LIST, NAMES, SECTION)), -1)
+        exception = cls.js.get_exception()
+        assert exception is None, exception and exception.get_message()
+
+    def run_js(self, script):
+        value = self.js.evaluate(script, -1)
+        exception = self.js.get_exception()
+        self.assertIsNone(exception, exception and exception.get_message())
+        return value
+
+    def same(self, main, title="Mum", body="", icon="", before=None, closed=False):
+        """sameChat on `main` (a tree) for a notification; before: None (no click), or the chat open
+        before the click: "none" (no chat) or its title. closed: the notification clicked was closed."""
+        self.run_js(f"load({json.dumps({'tag': 'div', 'attrs': {'id': 'app'}, 'children': [main]})})")
+        names = [{"name": before, "at": 0}] if before and before != "none" else []
+        clicked = "null" if before is None else ("{main: %s, names: %s, closed: %s}" % (
+            "null" if before == "none" else "{}", json.dumps(names), json.dumps(closed)))
+        notification = json.dumps({"title": title, "body": body, "icon": icon, "tag": GOOD})
+        return self.run_js(f'sameChat(find("main"), {notification}, {clicked})').to_string()
+
+    def test_the_notified_message_there(self):
+        main = chat_main("Mum", [row(bare(1), "Did you eat?"), row(bare(2), "See you")])
+        self.assertEqual(self.same(main, body="Did you eat?"), "name+body")
+        self.assertEqual(self.same(main, body="Did  you\neat? "), "name+body")  # spaces as they come
+        self.assertEqual(self.same(main, body="Did you sleep?"), "")
+
+    def test_its_words_as_whatsapp_draws_them(self):
+        main = chat_main("Mum", [row(bare(1), "Yes mum ", ("img", "\U0001F44D")), row(bare(2), " later", styled="see"),
+                                 row(bare(3), "snake_case and 2*3")])
+        self.assertEqual(self.same(main, body="Yes mum \U0001F44D"), "name+body")  # emoji as pictures
+        self.assertEqual(self.same(main, body="*see* later"), "name+body")  # bold, not its marks
+        self.assertEqual(self.same(main, body="snake_case and 2*3"), "name+body")  # marks aside on both sides
+        main = chat_main("Mum", [row(bare(1), "Love you ", ("img", "❤"))])
+        self.assertEqual(self.same(main, body="Love you \u2764\ufe0f"), "name+body")  # U+FE0F or not
+
+    def test_a_body_cut_short(self):
+        main = chat_main("Mum", [row(bare(1), "This is a long message about dinner tonight")])
+        self.assertEqual(self.same(main, body="This is a long message ab…"), "name+body")
+        self.assertEqual(self.same(main, body="This is a long message ab"), "")  # not cut: all of it
+        self.assertEqual(self.same(main, body="Another long message ab…"), "")
+
+    def test_only_the_latest_rows(self):
+        rows = [row(bare(1), "Did you eat?")] + [row(bare(n), f"filler {n}") for n in range(2, 14)]
+        self.assertEqual(self.same(chat_main("Mum", rows), body="Did you eat?"), "")
+        self.assertEqual(self.same(chat_main("Mum", rows[1:] + rows[:1]), body="Did you eat?"), "name+body")
+
+    def test_too_short_or_generic_bodies_are_no_sign(self):
+        for body in ("k", "\U0001F44D", "\U0001F4F7 Photo", "Photo", "\U0001F3A5 Video",
+                     "\U0001F3A4 Voice message (0:12)",
+                     "Voice message", "Sticker", "GIF", "\U0001F4C4 report.pdf", "\U0001F4CD Location", "Contact",
+                     "\U0001F4CA POLL: Lunch?", "This message was deleted", "3 new messages", "New message",
+                     "Missed voice call", "Waiting for this message. This may take a while.", "", "   "):
+            main = chat_main("Mum", [row(bare(1), body), row(bare(2), "k"), row(bare(3), "Lunch?")])
+            self.assertEqual(self.same(main, body=body), "", body)  # even with the same words there
+        # A group's: the words after the sender's name are judged too.
+        main = chat_main("Mum", [row(bare(1), "\U0001F4F7 Photo", sender="Ana"), row(bare(2), "k", sender="Ana")])
+        for body in ("Ana: \U0001F4F7 Photo", "Ana: k"):
+            self.assertEqual(self.same(main, body=body), "", body)
+
+    def test_a_groups_body_after_its_sender(self):
+        main = chat_main("Football Sunday", [row(bare(1), "See you at 5", sender="Ana")])
+
+        def same(body, **named):
+            return self.same(main, title="Football Sunday", body=body, **named)
+        clicked = {"before": "Football Sunday"}  # clicked, with a chat of that name open before
+        self.assertEqual(same("Ana: See you at 5", **clicked), "name+body")
+        self.assertEqual(same("Ana: See you at 6", **clicked), "")
+        self.assertEqual(same("Ana: See you at…", **clicked), "name+body")
+        self.assertEqual(same("Bo: See you at 5", **clicked), "name+body")  # the words, whoever said them
+        # Not clicked, or a closed one clicked (which may open nothing): the sender's name in the
+        # same row too, and more words for a body cut short.
+        for strict in ({}, {"before": "Football Sunday", "closed": True}):
+            self.assertEqual(same("Ana: See you at 5", **strict), "name+body", strict)
+            self.assertEqual(same("Bo: See you at 5", **strict), "", strict)
+            self.assertEqual(same("Ana: See you at…", **strict), "", strict)
+
+    def test_a_groups_sender_on_the_first_row_of_their_run(self):
+        # WhatsApp names the sender on the first of their messages in a row only: strict, the name
+        # is taken from there, never across another sender's run or one of the person's own.
+        def same(*rows):
+            return self.same(chat_main("Football Sunday", list(rows)), title="Football Sunday",
+                             body="Ana: See you at 5")
+        self.assertEqual(same(row(bare(1), "Hi all", sender="Ana"), row(bare(2), "See you at 5")), "name+body")
+        self.assertEqual(same(row(bare(1), "Hi all", sender="Ana"), row(bare(2), "Running late"),
+                              row(bare(3), "See you at 5")), "name+body")
+        self.assertEqual(same(row(bare(1), "Hi all", sender="Ana"), row(bare(2), "See you at 5", sender="Bo")), "")
+        self.assertEqual(same(row(bare(1), "Hi all", sender="Ana"), row(bare(2), "Hello", sender="Bo"),
+                              row(bare(3), "See you at 5")), "")
+        self.assertEqual(same(row(bare(1), "Hi all", sender="Ana"), row(bare(2), "Me too", way="out"),
+                              row(bare(3), "See you at 5")), "")
+        self.assertEqual(same(row(bare(1), "Ana", sender="Bo"), row(bare(2), "See you at 5")), "")  # words, not a name
+        # Another sender's run whose name sits elsewhere: told by who WhatsApp says sent each row.
+        other = row(bare(2), "Hello", said="+44 7700 900123")
+        other["children"][0]["children"].insert(0, {"tag": "span", "attrs": {"role": "button"}, "children": [{"text": "~ Bo"}]})
+        self.assertEqual(same(row(bare(1), "Hi all", sender="Ana", said="Ana"), other,
+                              row(bare(3), "See you at 5", said="+44 7700 900123")), "")
+        self.assertEqual(same(row(bare(1), "Hi all", sender="Ana", said="Ana"), row(bare(2), "Running late", said="Ana"),
+                              row(bare(3), "See you at 5", said="Ana")), "name+body")
+        self.assertEqual(same(row(bare(1), "See you at 5")), "")  # nobody named
+
+    def test_short_words_only_once_clicked(self):
+        # "ok" could be any chat's: a sign only once WhatsApp's click has had its say.
+        main = chat_main("Mum", [row(bare(1), "ok"), row(bare(2), "Okay"), row(bare(3), "\U0001F602\U0001F602")])
+        for body in ("ok", "\U0001F602\U0001F602"):
+            self.assertEqual(self.same(main, body=body, before="Mum"), "name+body", body)
+            self.assertEqual(self.same(main, body=body), "", body)
+            self.assertEqual(self.same(main, body=body, before="Mum", closed=True), "", body)
+        self.assertEqual(self.same(main, body="Okay"), "name+body")  # four letters
+        main = chat_main("Mum", [row(bare(1), "Okay see you then")])
+        self.assertEqual(self.same(main, body="Ok…", before="Mum"), "name+body")
+        self.assertEqual(self.same(main, body="Ok…"), "")
+        self.assertEqual(self.same(main, body="Okay see you th…"), "name+body")  # twelve letters
+
+    def test_the_persons_own_messages_are_no_sign(self):
+        mine = row(bare(1), "Good afternoon")
+        mine["children"][0]["attrs"]["class"] = "message-out focusable-list-item"
+        self.assertEqual(self.same(chat_main("Mum", [mine]), body="Good afternoon", before="Mum"), "")
+        # Nor a row with neither of WhatsApp's classes, as if it had renamed them: only one that came in.
+        mine["children"][0]["attrs"]["class"] = "focusable-list-item"
+        self.assertEqual(self.same(chat_main("Mum", [mine]), body="Good afternoon", before="Mum"), "")
+        self.assertEqual(self.same(chat_main("Mum", [row(bare(1), "Good afternoon")]), body="Good afternoon",
+                                   before="Mum"), "name+body")
+
+    def test_the_name_first(self):
+        main = chat_main("Mum", [row(bare(1), "Did you eat?")], picture="blob:file:///mum")
+        self.assertEqual(self.same(main, title="Dad", body="Did you eat?", icon="blob:file:///mum", before="none"), "")
+        self.assertEqual(self.same(chat_main("", [row(bare(1), "Did you eat?")]), body="Did you eat?"), "")
+        self.assertEqual(self.same(main, title="", body="Did you eat?"), "")
+        self.assertEqual(self.same(main, title="Mum\u200e ", body="Did you eat?"), "name+body")  # marks aside
+
+    def test_the_name_wherever_the_header_has_it(self):
+        # A titled line under the name (a group's members) found first, and a name with no title.
+        def chat(*spans):
+            main = chat_main("", [row(bare(1), "Did you eat?")])
+            main["children"][0]["children"] = [{"tag": "span", "attrs": attrs, "children": children}
+                                               for attrs, children in spans]
+            return main
+        members = ({"title": "Ana, Bo, You"}, words("Ana, Bo, You"))
+        name = ({"dir": "auto"}, words("Mum"))
+        self.assertEqual(self.same(chat(members, name), body="Did you eat?"), "name+body")
+        self.assertEqual(self.same(chat(members), body="Did you eat?"), "")
+        # A badge drawn in the name: its icon's words aren't the name's.
+        badge = {"tag": "svg", "attrs": {}, "children": [{"tag": "title", "attrs": {}, "children": words("verified")}]}
+        self.assertEqual(self.same(chat(({"dir": "auto"}, words("Mum ") + [badge])), body="Did you eat?"),
+                         "name+body")
+
+    def test_a_name_with_emoji_as_whatsapp_draws_it(self):
+        main = chat_main("Book Club ", [row(bare(1), "Chapter 3 tonight")], title_attr=False, emoji="\U0001F4DA")
+        self.assertEqual(self.same(main, title="Book Club \U0001F4DA", body="Chapter 3 tonight"), "name+body")
+        self.assertEqual(self.same(main, title="Book Club", body="Chapter 3 tonight"), "")
+
+    def test_the_picture(self):
+        for icon in ("blob:file:///mum", "https://pps.whatsapp.net/v/t61/mum.jpg?oh=1&oe=2"):
+            main = chat_main("Mum", [row(bare(1), "See you")], picture=icon)
+            self.assertEqual(self.same(main, body="Did you eat?", icon=icon), "name+avatar", icon)
+            self.assertEqual(self.same(main, body="Did you eat?", icon=icon + "x"), "", icon)
+        # Stand-ins that every chat without a picture may have, and pictures from elsewhere.
+        for stand_in in ("data:image/png;base64,iVBORw0KGgo=", "https://static.whatsapp.net/rsrc.php/default.png",
+                         "https://example.com/mum.jpg", "https://pps.whatsapp.net.example.com/mum.jpg",
+                         "https://x@pps.whatsapp.net/mum.jpg"):
+            main = chat_main("Mum", [row(bare(1), "See you")], picture=stand_in)
+            self.assertEqual(self.same(main, body="Did you eat?", icon=stand_in), "", stand_in)
+        self.assertEqual(self.same(chat_main("Mum", [row(bare(1), "See you")]), body="Did you eat?", icon=""), "")
+
+    def test_the_click_opening_it(self):
+        main = chat_main("Mum", [row(bare(1), "See you")])
+        self.assertEqual(self.same(main, body="Did you eat?", before="none"), "name+click")  # from no chat
+        self.assertEqual(self.same(main, body="Did you eat?", before="Work Team"), "name+click")  # from another
+        self.assertEqual(self.same(main, body="Did you eat?", before="Mum"), "")  # one of the same name
+        self.assertEqual(self.same(main, body="Did you eat?", before=""), "")  # one with no name to tell
+        self.assertEqual(self.same(main, body="Did you eat?"), "")  # no click
+
+    def test_the_strongest_sign_is_said(self):
+        main = chat_main("Mum", [row(bare(1), "Did you eat?")], picture="blob:file:///mum")
+        self.assertEqual(self.same(main, body="Did you eat?", icon="blob:file:///mum", before="none"), "name+body")
+        self.assertEqual(self.same(main, body="Hello?", icon="blob:file:///mum", before="none"), "name+avatar")
+
+    def test_sent_seen(self):
+        def seen(keys_before, keys_after, box="", words="x", way="out"):
+            main = chat_main("Mum", [row(key, "x", way=way) for key in keys_after])
+            if box:
+                main["children"][2]["children"][0]["children"] = [{"text": box}]
+            self.run_js(f"load({json.dumps({'tag': 'div', 'attrs': {'id': 'app'}, 'children': [main]})})")
+            before = ("{own: new Set(%s), ids: new Set(%s), keyed: %s, words: %s}"
+                      % (json.dumps([k for k in keys_before if k.startswith(f"true_{GOOD}_")]), json.dumps(keys_before),
+                         json.dumps(any(k.startswith(("true_", "false_")) for k in keys_before)), json.dumps(words)))
+            return self.run_js(f'sentSince(find("main"), {json.dumps(GOOD)}, {before})').to_boolean()
+        self.assertTrue(seen([bare(1)], [bare(1), bare(2)], box="On my way"))  # a new message with the words, bare keys
+        # A new one with the words, marked as coming in: theirs, not the one sent.
+        self.assertFalse(seen([bare(1)], [bare(1), bare(2)], box="On my way", way="in"))
+        self.assertTrue(seen([bare(1)], [bare(1), bare(2)], box="On my way", way="plain"))  # no mark: as before
+        # Theirs coming in meanwhile, with other words, and the words still in the box: not sent.
+        self.assertFalse(seen([bare(1)], [bare(1), bare(2)], box="On my way", words="On my way"))
+        self.assertFalse(seen([bare(1)], [bare(1)], box="On my way"))
+        self.assertTrue(seen([bare(1)], [bare(1)]))  # the box emptied
+        old = f"false_{GOOD}_3EB01"
+        self.assertFalse(seen([old], [old, f"false_{GOOD}_3EB02"], box="On my way"))  # theirs, keys with ids
+        self.assertTrue(seen([old], [old, f"true_{GOOD}_3EB03"], box="On my way"))  # the person's own
+
+    def test_what_the_log_may_say(self):
+        main = chat_main("Mum", [row(f"false_{GOOD}_3EB0AB12", "Did you eat?")], picture="blob:file:///mum")
+        main["attrs"]["data-chat"] = GOOD
+        main["attrs"]["data-447700900104"] = "x"  # a name like an id: never said
+        main["attrs"]["aria-label"] = "Mum: mail jo_x@y"  # words: never their shape either
+        self.run_js(f"load({json.dumps({'tag': 'div', 'attrs': {'id': 'app'}, 'children': [main]})})")
+        notification = {"title": "Mum", "body": "Did you eat?", "icon": "", "tag": GOOD,
+                        "data": {"chatId": GOOD, GOOD: 1, "msgKey": "x", "Mum": 2, "id": 3}}
+        self.run_js("let told = null; document.visibilityState = 'hidden';"
+                    "let requestAnimationFrame = () => 1, timers = [], innerWidth = 1000, innerHeight = 700;"
+                    "function setTimeout(run) { timers.push(run); return 1; }"
+                    f"diagnose({json.dumps(notification)}, {{main: null, title: ''}})"
+                    ".then((facts) => { told = facts; });"
+                    "timers.forEach((run) => run());")
+        self.run_js("1")  # the promise's turn
+        diag = json.loads(self.run_js("JSON.stringify(told)").to_string())
+        self.assertEqual({key: diag[key] for key in ("name", "navigated", "body", "avatar", "hasBody", "hasIcon",
+                                                     "dataType", "dataKeys", "tagShape")},
+                         {"name": True, "navigated": True, "body": True, "avatar": False, "hasBody": True,
+                          "hasIcon": False, "dataType": "object", "dataKeys": ["chat-id", "id", "msg-key"],
+                          "tagShape": "9@a.a"})
+        self.assertEqual((diag["nameAt"], diag["nameFirst"]), (0, True))
+        self.assertEqual(diag["mainAttrs"], ["aria-label", "data-chat", "id", "tabindex"])
+        self.assertEqual(diag["headerAttrs"], [])
+        self.assertEqual(diag["keyAttrs"], ["class", "data-id"])
+        self.assertEqual(diag["rowAttrs"], ["role"])
+        self.assertEqual(diag["values"], ["data-chat=9@a.a", "data-id=a_9@a.a_9a9a9"])
+        self.assertEqual(reply_diag({"diag": diag}), diag)
+        for value in json.dumps(diag), diag_line(diag):
+            for secret in ("Mum", "eat", "447700900104", "4917612345678", "3EB0", "blob"):
+                self.assertNotIn(secret, value)
+
+
 # The page's clock, timers and observers for a whole reply run in JavaScriptCore: time moves only
 # when the test says (step), each timer runs in a turn of its own with its promises after it, an
 # animation frame comes only while frames are on (a page WebKit draws), and the observers hear of
 # a change when the test says the page changed (mutate).
 FAKE_RUNTIME = r"""
-let now = 0, nextTimer = 1, frames = false, clicked = 0;
+let now = 0, nextTimer = 1, frames = false, clicked = 0, onClick = null;
 const timers = [];
 const performance = { now: () => now };
 function setTimeout(run, ms) {
@@ -1174,21 +1664,66 @@ function step(until) {
   next.run();
   return true;
 }
-const shown = new Map();
-function clickNotification(id) { clicked++; }
+const shown = new Map(), closed = new Map();
+// WhatsApp's own handler for its notification: whatever the test has it do (onClick).
+function clickNotification(id) { clicked++; if (onClick) onClick(); mutate(); }
 function calling() { return false; }
 function liveStreams() { return false; }
 const innerWidth = 1000, innerHeight = 700;
-// A message row as WhatsApp's: the row, and its key on the div in it.
-function addRow(key) {
-  add(find("main").querySelector("#messages"), [{ tag: "div", attrs: { role: "row" },
-    children: [{ tag: "div", attrs: { "data-id": key }, children: [{ text: "words" }] }] }]);
+// A message row (a tree, as the tests' row()), into the open chat.
+function addRow(tree) {
+  add(find("main").querySelector("#messages"), [tree]);
   mutate();
 }
+// The open chat's header, drawn anew (a tree, as the tests' header()).
+function setHeader(tree) {
+  const old = find("main").querySelector("header");
+  old.childNodes = [];
+  add(old, tree.children);
+  mutate();
+}
+// #main out of the page, and back.
+let gone = null;
+function closeChat() { gone = find("main"); gone.remove(); mutate(); }
+function reopenChat() { gone.parentElement.childNodes.push(gone); mutate(); }
+// Typing, for a run past the check: the box's focus and caret, the page's editing commands (into
+// the box with the focus, while `typing`), a turn of the event loop, and a button's press (its
+// click, then onPress). Every element is on show, its words its innerText.
+let typing = true, pressed = 0, onPress = null;
+FakeElement.prototype.focus = function () { document.activeElement = this; };
+FakeElement.prototype.click = function () { pressed++; if (onPress) onPress(this); mutate(); };
+FakeElement.prototype.getClientRects = function () { return [1]; };
+FakeElement.prototype.getBoundingClientRect = function () { return { height: 20 }; };
+Object.defineProperty(FakeElement.prototype, "innerText", { get() { return this.textContent; } });
+const HTMLElement = FakeElement;
+FakeElement.prototype.createRange = function () {
+  return { endContainer: null, selectNodeContents(node) { this.endContainer = node; }, collapse() {} };
+};
+FakeElement.prototype.execCommand = function (command, _ui, text) {
+  const box = this.activeElement;
+  if (!typing || !box) return false;
+  add(box, [command === "insertLineBreak" ? { tag: "br", attrs: {}, children: [] } : { text }]);
+  mutate();
+  return true;
+};
+const selection = {
+  ranges: [], get rangeCount() { return this.ranges.length; }, removeAllRanges() { this.ranges = []; },
+  addRange(range) { this.ranges.push(range); }, getRangeAt(i) { return this.ranges[i]; },
+};
+function getSelection() { return selection; }
+class MessageChannel {
+  constructor() {
+    const port1 = { onmessage: null, close() {} };
+    this.port1 = port1;
+    this.port2 = { postMessage() { setTimeout(() => port1.onmessage && port1.onmessage({}), 0); } };
+  }
+}
 let answer = null, asked = null, answeredAt = null;
-function ask(chat, budget) {
-  asked = { pageId: 7, chatId: chat, text: "On my way", budgetMs: budget, visible: false };
-  shown.set(7, { tag: chat });
+// A reply to the notification 7, from `chat`, saying `said` ({title, body, icon}), with `more` in
+// the request.
+function ask(chat, budget, said = {}, more = {}) {
+  asked = { pageId: 7, chatId: chat, text: "On my way", budgetMs: budget, visible: false, ...more };
+  shown.set(7, { tag: chat, title: "", body: "", icon: "", data: null, ...said });
   reply(asked).then((result) => { answer = result; answeredAt = now; });
 }
 """
@@ -1197,15 +1732,17 @@ function ask(chat, budget) {
 class ReplyWaitTest(unittest.TestCase):
     """The bridge's reply run as it is, from WhatsApp's notification click to the check of the chat
     that opened, on the mock page's own markup with the page's clock in the test's hands: how long
-    it waits for the chat's messages, and what it tells Natter's log when none come."""
+    it waits for the chat's messages, how it tells the chat, and what it tells Natter's log when the
+    chat isn't the one. Most runs that get past the check stop at the box (words of the person's own
+    in it: "draft"), or for want of a box ("cant-send"), with how they told the chat; those with a
+    Send button (send_button) type, and press it."""
 
     BUDGET = REPLY_BUDGET_MS
+    MUM = {"title": "Mum", "body": "Did you eat?"}
 
     def setUp(self):
-        where = BRIDGE[BRIDGE.index("  const WHERE = {"):BRIDGE.index("  // ---- The chat list")]
-        invisible = re.search(r"^  const INVISIBLE = .*$", BRIDGE, re.M)[0]
         self.js = JavaScriptCore.Context()
-        self.run_js("\n".join((FAKE_PAGE, FAKE_RUNTIME, where, invisible, SECTION)))
+        self.run_js("\n".join((FAKE_PAGE, FAKE_RUNTIME, WHERE, CHAT_LIST, NAMES, SECTION)))
         self.run_js(f"load({json.dumps(mock_template('chats'))}); document.visibilityState = 'hidden'")
         self.chat_wait = int(re.search(r"const CHAT_WAIT_MS = (\d+);", SECTION)[1])
         self.reserve = self.run_js("TYPE_RESERVE_MS").to_int32()
@@ -1232,110 +1769,541 @@ class ReplyWaitTest(unittest.TestCase):
     def later(self, ms, script):
         self.run_js(f"setTimeout(() => {{ {script} }}, {ms})")
 
+    def header(self, title, **named):
+        self.run_js(f"setHeader({json.dumps(header(title, **named))})")
+
+    def add_row(self, tree):
+        self.run_js(f"addRow({json.dumps(tree)})")
+
+    def words_in_the_box(self):
+        """Words of the person's own in the box: a run past the check stops there, as "draft"."""
+        self.run_js('add(find("main").querySelector("footer [contenteditable]"), [{text: "my own"}])')
+
+    def run_reply(self, said=None, chat=GOOD, until=None):
+        self.run_js(f"ask({json.dumps(chat)}, {self.BUDGET}, {json.dumps(said or self.MUM)})")
+        self.until(until or self.BUDGET + 1000)
+        return self.answer()
+
+    # ---- Each sign of the chat, without ids -----------------------------------------------------
+
+    def test_open_already_with_the_message_there(self):
+        # Clicked all the same (WhatsApp's handler does nothing with its chat open), and told once
+        # WhatsApp has had a moment to open another.
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.words_in_the_box()
+        answer, why, diag, when = self.run_reply()
+        self.assertEqual((answer, why, diag), ("draft", "name+body", None))
+        self.assertEqual(self.run_js("clicked").to_int32(), 1)
+        self.assertLess(when, 2000)
+
+    def test_open_already_with_its_picture(self):
+        self.header("Mum", picture="blob:file:///mum")
+        self.add_row(row(bare(1), "See you"))
+        self.words_in_the_box()
+        answer, why, _diag, _when = self.run_reply(dict(self.MUM, icon="blob:file:///mum"))
+        self.assertEqual((answer, why), ("draft", "name+avatar"))
+        self.assertEqual(self.run_js("clicked").to_int32(), 1)
+
+    def test_open_already_by_its_keys_isnt_clicked(self):
+        self.run_js('find("main").querySelector("footer").remove()')
+        self.add_row(row(f"false_{GOOD}_3EB0AB12", "Did you eat?"))
+        self.assertEqual(self.run_reply()[:2], ("cant-send", "ids"))
+        self.assertEqual(self.run_js("clicked").to_int32(), 0)
+
+    def switch_to(self, rows, footer=False):
+        """WhatsApp's open of another chat of the same name in #main: its header drawn anew, its rows,
+        and its footer (none: it takes no messages, so a run that gets this far says "cant-send")."""
+        script = (f'find("main").querySelector("#messages").childNodes = []; '
+                  f'setHeader({json.dumps(header("Mum"))}); '
+                  + "".join(f"addRow({json.dumps(tree)}); " for tree in rows))
+        if not footer:
+            script += 'find("main").querySelector("footer").remove(); mutate();'
+        return script
+
+    def test_another_chat_of_the_same_name_with_the_same_words_open(self):
+        # Another "Mum" open, with the notified words in it and the person's own words in its box:
+        # never taken for the one notified. WhatsApp's click opens that one a moment later.
+        for delay in (0, 50, 400, 900):
+            self.setUp()
+            self.header("Mum")
+            self.add_row(row(bare(1), "Did you eat?"))
+            self.words_in_the_box()
+            switch = self.switch_to([row(bare(2), "Did you eat?")])
+            self.run_js(f"onClick = () => setTimeout(() => {{ {switch} }}, {delay})")
+            answer, why, _diag, _when = self.run_reply()
+            self.assertEqual((answer, why), ("cant-send", "name+body"), delay)
+            self.assertEqual(self.run_js("clicked").to_int32(), 1)
+
+    def test_the_same_short_words_in_another_chat_of_the_same_name(self):
+        self.header("Mum")
+        self.add_row(row(bare(1), "ok"))
+        self.words_in_the_box()
+        self.run_js(f"onClick = () => setTimeout(() => {{ {self.switch_to([row(bare(2), 'ok')])} }}, 300)")
+        self.assertEqual(self.run_reply(dict(self.MUM, body="ok"))[:2], ("cant-send", "name+body"))
+
+    def test_open_already_by_name_alone_is_clicked_and_checked_again(self):
+        # Its name, nothing else: clicked, and WhatsApp's handler opens the chat with the message.
+        self.header("Mum")
+        self.words_in_the_box()
+        self.run_js(f"onClick = () => addRow({json.dumps(row(bare(1), 'Did you eat?'))})")
+        answer, why, _diag, _when = self.run_reply()
+        self.assertEqual((answer, why), ("draft", "name+body"))
+        self.assertEqual(self.run_js("clicked").to_int32(), 1)
+
+    def test_opened_by_the_click_from_another_chat(self):
+        self.header("Work Team")
+        self.add_row(row(bare(1), "Standup at 10"))
+        self.words_in_the_box()
+        self.run_js(f"onClick = () => setTimeout(() => setHeader({json.dumps(header('Mum'))}), 300)")
+        answer, why, _diag, when = self.run_reply()
+        self.assertEqual((answer, why), ("draft", "name+click"))
+        self.assertLess(when, 2000)
+
+    def test_opened_by_the_click_from_no_chat(self):
+        self.header("Mum")
+        self.words_in_the_box()
+        self.run_js("closeChat()")
+        self.run_js("onClick = () => setTimeout(reopenChat, 300)")
+        answer, why, _diag, _when = self.run_reply()
+        self.assertEqual((answer, why), ("draft", "name+click"))
+
+    def close_it(self, said):
+        """The reply asked for, with WhatsApp having closed its notification (the chat read)."""
+        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET}, {json.dumps(said)}); "
+                    "closed.set(7, shown.get(7)); shown.delete(7)")
+        self.until(self.BUDGET + 1000)
+        return self.answer()
+
+    def test_a_closed_notification_still_says_what_it_said(self):
+        # WhatsApp closed it (the chat read): still clicked, and the open chat still told by it.
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.words_in_the_box()
+        self.assertEqual(self.close_it(self.MUM)[:2], ("draft", "name+body"))
+        self.assertEqual(self.run_js("clicked").to_int32(), 1)
+        # Its chat opened by the click, from another.
+        self.setUp()
+        self.header("Work Team")
+        self.words_in_the_box()
+        self.run_js(f"onClick = () => setHeader({json.dumps(header('Mum'))})")
+        self.assertEqual(self.close_it(self.MUM)[:2], ("draft", "name+click"))
+        self.run_js("answer = null; closed.clear()")
+        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET}, {json.dumps(self.MUM)}); shown.delete(7)")
+        self.until(2 * self.BUDGET + 2000)
+        self.assertEqual(self.answer()[:2], ("gone", "notification"))
+
+    def test_closed_after_it_was_asked_counts_as_shown(self):
+        # Lending the page had WhatsApp read the chat and close the notification after the reply was
+        # asked: as a notification still shown, short words will do. Closed before: they won't.
+        for closed_at, found in ((800, ("draft", "name+body")), (400, ("mismatch", "unconfirmed"))):
+            self.setUp()
+            self.header("Mum")
+            self.add_row(row(bare(1), "ok"))
+            self.words_in_the_box()
+            self.run_js(f"now = 1000; ask({json.dumps(GOOD)}, {self.BUDGET}, {json.dumps(dict(self.MUM, body='ok'))}, "
+                        f"{{sinceMs: 500}}); shown.get(7).closedAt = {closed_at}; closed.set(7, shown.get(7)); "
+                        "shown.delete(7)")
+            self.until(self.BUDGET + 2000)
+            self.assertEqual(self.answer()[:2], found, closed_at)
+
+    # ---- Typed and sent --------------------------------------------------------------------------
+
+    SEND = {"tag": "button", "attrs": {"aria-label": "Send"}, "children": [
+        {"tag": "span", "attrs": {"data-icon": "wds-ic-send-filled"}, "children": []}]}
+    MIC = {"tag": "button", "attrs": {"aria-label": "Voice message"}, "children": [
+        {"tag": "span", "attrs": {"data-icon": "ic-mic-outlined"}, "children": []}]}
+    FOOTER = ("footer", "composer", "composerAt", "buttons", "icons", "quote", "preview")
+
+    def send_button(self, button=None, empties=True):
+        """A button in the footer (Send, unless `button`); Send pressed empties the box (`empties`)."""
+        self.run_js(f'add(find("main").querySelector("#send-slot"), [{json.dumps(button or self.SEND)}])')
+        if empties:
+            self.run_js('onPress = () => { find("main").querySelector("footer [contenteditable]").childNodes = []; }')
+
+    def list_rows(self, *names):
+        """The chat list's rows, as the live page draws them: each name in a titled span."""
+        rows = [{"tag": "div", "attrs": {"role": "listitem", "style": f"transform: translateY({i * 72}px)"},
+                 "children": [{"tag": "div", "attrs": {"data-testid": "cell-frame-title"}, "children": [
+                     {"tag": "span", "attrs": {"dir": "auto", "title": name}, "children": words(name)}]}]}
+                for i, name in enumerate(names)]
+        self.run_js(f'add(find("pane").querySelector("#grid"), {json.dumps(rows)})')
+
+    def assert_private(self, diag):
+        self.assertEqual(reply_diag({"diag": diag}), diag)
+        for value in json.dumps(diag), diag_line(diag):
+            for secret in ("Mum", "eat", "On my way", "mic", "send", "3EB0", "4917612345678"):
+                self.assertNotIn(secret, value)
+
+    def test_typed_and_sent(self):
+        self.list_rows("Mum", "Work Team")
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.send_button()
+        answer, why, diag, _when = self.run_reply()
+        self.assertEqual((answer, why, diag), ("sent", "name+body", None))
+        self.assertEqual(self.run_js("pressed").to_int32(), 1)
+
+    def test_two_of_the_name_in_the_list_and_a_click_that_opens_nothing(self):
+        # Another "Mum" may be open with the same words, and WhatsApp's click open nothing: which of
+        # the two can't be told, so nothing is typed.
+        self.list_rows("Mum", "Work Team", "Mum")
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.send_button()
+        diag = self.assert_mismatch(self.run_reply(), "ambiguous")
+        self.assertEqual((diag["name"], diag["navigated"], diag["body"]), (True, False, True))
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+        # Its picture, rather than its words: the same.
+        self.setUp()
+        self.list_rows("Mum", "Mum")
+        self.header("Mum", picture="blob:file:///mum")
+        self.add_row(row(bare(1), "See you"))
+        self.send_button()
+        self.assert_mismatch(self.run_reply(dict(self.MUM, icon="blob:file:///mum")), "ambiguous")
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+
+    def test_a_list_showing_only_some_chats(self):
+        # A filter chip on, or a search typed: the other chat of the name may be left out of the list,
+        # so one the click didn't open isn't taken, even with one of the name in it.
+        for script in ('find("side").querySelectorAll(\'[role="tab"]\').forEach((chip, i) => '
+                       'chip.attributes["aria-selected"] = String(i === 1))',
+                       'add(find("search"), [{text: "Mu"}])'):
+            self.setUp()
+            self.list_rows("Mum", "Work Team")
+            self.header("Mum")
+            self.add_row(row(bare(1), "Did you eat?"))
+            self.send_button()
+            self.run_js(script)
+            self.assert_mismatch(self.run_reply(), "filtered")
+            self.assertEqual(self.run_js("pressed").to_int32(), 0)
+        # The click opening it, from another name: told by that, whatever the list shows.
+        self.setUp()
+        self.list_rows("Work Team")
+        self.header("Work Team")
+        self.add_row(row(bare(1), "Standup at 10"))
+        self.send_button()
+        self.run_js('add(find("search"), [{text: "Mu"}]); onClick = () => { '
+                    'find("main").querySelector("#messages").childNodes = []; '
+                    f'setHeader({json.dumps(header("Mum"))}); addRow({json.dumps(row(bare(2), "Did you eat?"))}); }}')
+        self.assertEqual(self.run_reply()[:2], ("sent", "name+body"))
+
+    def test_two_of_the_name_and_a_click_slow_to_open(self):
+        # The click opens the one notified only after the check: nothing typed in either.
+        self.list_rows("Mum", "Mum")
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.send_button()
+        switch = self.switch_to([row(bare(2), "Did you eat?")], footer=True)
+        self.run_js(f"onClick = () => setTimeout(() => {{ {switch} }}, 2000)")
+        self.assert_mismatch(self.run_reply(), "ambiguous")
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+
+    def test_two_of_the_name_and_the_click_opening_it(self):
+        # The click opened it, from a chat of another name: told by that, whatever the list holds.
+        self.list_rows("Mum", "Mum", "Work Team")
+        self.header("Work Team")
+        self.add_row(row(bare(1), "Standup at 10"))
+        self.send_button()
+        self.run_js(f'onClick = () => {{ find("main").querySelector("#messages").childNodes = []; '
+                    f'setHeader({json.dumps(header("Mum"))}); addRow({json.dumps(row(bare(2), "Did you eat?"))}); }}')
+        self.assertEqual(self.run_reply()[:2], ("sent", "name+body"))
+        self.assertEqual(self.run_js("pressed").to_int32(), 1)
+
+    def test_told_again_by_its_signs_just_before_send(self):
+        # Told by its message, with the click opening nothing: just before Send the message must still
+        # be there. Gone (another chat of the name drawn in the same place), and Send isn't pressed.
+        self.list_rows("Mum", "Work Team")
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.later(3000, 'find("main").querySelector("#messages").childNodes = []; '
+                         f'add(find("main").querySelector("#send-slot"), [{json.dumps(self.SEND)}]); mutate();')
+        self.assertEqual(self.run_reply()[:2], ("left-as-draft", "moved"))
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+
+    # ---- After the check: what the log has of the footer ----------------------------------------
+
+    def test_a_message_being_replied_to(self):
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.run_js('{ const footer = find("main").querySelector("footer"); footer.childNodes = []; add(footer, '
+                    + json.dumps([{"tag": "div", "attrs": {"class": "quote"}, "children": words("Did you eat?")},
+                                  {"tag": "div", "attrs": {}, "children": [
+                                      {"tag": "div", "attrs": {"contenteditable": "true", "role": "textbox"},
+                                       "children": []}, self.MIC]}]) + "); }")
+        answer, why, diag, _when = self.run_reply()
+        self.assertEqual((answer, why), ("draft", "quote"))
+        self.assertEqual({key: diag[key] for key in self.FOOTER},
+                         {"footer": True, "composer": True, "composerAt": 0, "buttons": 1, "icons": ["a-a-a"],
+                          "quote": True, "preview": False})
+        self.assert_private(diag)
+
+    def test_no_send_button(self):
+        # Only the voice message button, and the box found by its last place (no role).
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.run_js('delete find("main").querySelector("footer [contenteditable]").attributes.role')
+        self.send_button(self.MIC, empties=False)
+        answer, why, diag, _when = self.run_reply()
+        self.assertEqual((answer, why), ("left-as-draft", "no-button"))
+        self.assertEqual({key: diag[key] for key in self.FOOTER},
+                         {"footer": True, "composer": True, "composerAt": 2, "buttons": 1, "icons": ["a-a-a"],
+                          "quote": False, "preview": False})
+        self.assert_private(diag)
+
+    def test_words_that_dont_land(self):
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.send_button()
+        self.run_js("typing = false")
+        answer, why, diag, _when = self.run_reply()
+        self.assertEqual((answer, why), ("left-as-draft", "text"))
+        self.assertEqual((diag["composerAt"], diag["buttons"], diag["icons"]), (0, 1, ["a-a-a-a"]))
+        self.assert_private(diag)
+
+    def test_send_not_seen_to_go(self):
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.send_button(empties=False)
+        answer, why, diag, _when = self.run_reply()
+        self.assertEqual((answer, why), ("unsure", "name+body"))
+        self.assertEqual(self.run_js("pressed").to_int32(), 1)
+        self.assertEqual((diag["composerAt"], diag["buttons"], diag["quote"], diag["preview"]), (0, 1, False, False))
+        self.assert_private(diag)
+
+    # ---- Wrong chats: never typed in -------------------------------------------------------------
+
+    def assert_mismatch(self, found, why):
+        answer, told, diag, _when = found
+        self.assertEqual((answer, told), ("mismatch", why))
+        self.assertTrue(self.run_js('boxEmpty(composerIn(find("main")))').to_boolean())
+        self.assertEqual(reply_diag({"diag": diag}), diag)
+        return diag
+
+    def test_a_closed_notification_that_opens_nothing(self):
+        # Its click may open nothing: a group of the same name open, with the words from another
+        # sender, or only short ones, isn't the one.
+        said = {"title": "Family", "body": "Mum: Good morning"}
+        self.header("Family")
+        self.add_row(row(bare(1), "Good morning", sender="Dad"))
+        self.assert_mismatch(self.close_it(said), "unconfirmed")
+        self.setUp()
+        self.header("Family")
+        self.add_row(row(bare(1), "Good morning", sender="Mum"))
+        self.words_in_the_box()
+        self.assertEqual(self.close_it(said)[:2], ("draft", "name+body"))
+        self.setUp()
+        self.header("Mum")
+        self.add_row(row(bare(1), "ok"))
+        self.assert_mismatch(self.close_it(dict(self.MUM, body="ok")), "unconfirmed")
+
+    def test_the_persons_own_words_are_no_sign(self):
+        self.header("Mum")
+        mine = row(bare(1), "Good afternoon")
+        mine["children"][0]["attrs"]["class"] = "message-out focusable-list-item"
+        self.add_row(mine)
+        self.assert_mismatch(self.run_reply(dict(self.MUM, body="Good afternoon")), "unconfirmed")
+
+    def test_another_chat_of_the_same_name_with_other_messages(self):
+        self.header("Mum")
+        self.add_row(row(bare(1), "Happy birthday!"))
+        diag = self.assert_mismatch(self.run_reply(), "unconfirmed")  # the click opened nothing new
+        self.assertEqual((diag["name"], diag["navigated"], diag["body"], diag["avatar"]), (True, False, False, False))
+        self.assertEqual(self.run_js("clicked").to_int32(), 1)
+
+    def test_the_same_name_and_no_message_or_picture_to_tell_it_by(self):
+        stand_in = "data:image/png;base64,iVBORw0KGgo="
+        self.header("Mum", picture=stand_in)
+        self.add_row(row(bare(1), "See you"))
+        self.assert_mismatch(self.run_reply(dict(self.MUM, icon=stand_in)), "unconfirmed")
+
+    def test_a_generic_body_alone(self):
+        for body in ("\U0001F4F7 Photo", "Sticker", "This message was deleted"):
+            self.setUp()
+            self.header("Mum")
+            self.add_row(row(bare(1), body))  # even with the same words there
+            self.assert_mismatch(self.run_reply(dict(self.MUM, body=body)), "unconfirmed")
+
+    def test_a_group_by_its_senders_words(self):
+        said = {"title": "Football Sunday", "body": "Ana: See you at 5"}
+        self.header("Football Sunday")
+        self.add_row(row(bare(1), "See you at 5", sender="Ana"))
+        self.words_in_the_box()
+        self.assertEqual(self.run_reply(said)[:2], ("draft", "name+body"))
+        self.setUp()
+        self.header("Football Sunday")
+        self.add_row(row(bare(1), "See you at 6", sender="Ana"))  # a group of the same name
+        self.assert_mismatch(self.run_reply(said), "unconfirmed")
+
+    def test_another_name(self):
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        diag = self.assert_mismatch(self.run_reply(dict(self.MUM, title="Dad")), "other-name")
+        self.assertFalse(diag["name"])
+        # Opened by the click, with the message, under another name: still not it.
+        self.setUp()
+        self.header("Work Team")
+        self.run_js(f"onClick = () => {{ setHeader({json.dumps(header('Mum'))}); "
+                    f"addRow({json.dumps(row(bare(1), 'Did you eat?'))}); }}")
+        self.assert_mismatch(self.run_reply(dict(self.MUM, title="Dad")), "other-name")
+
+    def test_the_chat_moving_on_meanwhile(self):
+        # Opened by the click, then another chat of the same name drawn in its place: not typed in.
+        self.header("Work Team")
+        self.words_in_the_box()
+        self.run_js(f"onClick = () => setHeader({json.dumps(header('Mum'))})")
+        self.later(100, "closeChat()")
+        self.later(150, "reopenChat()")
+        answer, why, _diag, _when = self.run_reply()
+        self.assertEqual((answer, why), ("draft", "name+click"))  # the same #main back: still it
+        self.setUp()
+        self.header("Work Team")
+        self.run_js(f"onClick = () => setHeader({json.dumps(header('Mum'))})")
+        self.later(100, f"setHeader({json.dumps(header('Mum2'))})")
+        self.assertEqual(self.run_reply()[:2], ("mismatch", "moved"))
+
+    def test_a_tag_for_another_chat(self):
+        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET}, {json.dumps(self.MUM)}); "
+                    f"shown.get(7).tag = {json.dumps(OTHER)}")
+        self.until(self.BUDGET + 1000)
+        answer, why, diag, _when = self.answer()
+        self.assertEqual((answer, why), ("mismatch", "tag"))
+        self.assertEqual(diag["tagShape"], "9@a.a")
+        self.assertEqual(self.run_js("clicked").to_int32(), 0)
+
+    # ---- Waiting for the chat's messages ---------------------------------------------------------
+
     def test_no_messages_wait_out_the_budget(self):
-        # The chat opens with no messages keyed, and none come: waited for to the end of the
-        # budget less what typing takes, not just the chat's own wait, then "no-ids" with what the
-        # page was like.
-        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET})")
-        self.until(self.chat_wait + 1000)
-        self.assertIsNone(self.answer(), "still waiting past the chat's own wait")
+        # The chat opens with no messages, and none come: waited for to the end of the budget less
+        # what typing takes, not just the chat's own wait, then "unconfirmed" with what the page was like.
+        self.header("Mum")
+        self.assertIsNone(self.run_reply(until=self.chat_wait + 1000), "still waiting past the chat's own wait")
         self.until(self.BUDGET + 1000)
         answer, why, diag, when = self.answer()
-        self.assertEqual((answer, why), ("mismatch", "no-ids"))
+        self.assertEqual((answer, why), ("mismatch", "unconfirmed"))
         self.assertGreaterEqual(when, self.BUDGET - self.reserve)
         self.assertLess(when, self.BUDGET - self.reserve + 1000)
         self.assertEqual(self.run_js("clicked").to_int32(), 1)
-        self.assertEqual(diag, {"visibilityState": "hidden", "rafFired": False, "innerWidth": 1000, "innerHeight": 700,
-                                "main": True, "header": True, "footer": True, "composer": True, "keys": 0,
-                                "chatKeys": 0, "rows": 0, "shape": ""})
+        self.assertEqual({key: diag[key] for key in ("visibilityState", "rafFired", "innerWidth", "innerHeight", "main",
+                                                     "header", "footer", "composer", "keys", "chatKeys", "rows",
+                                                     "shape", "name", "navigated", "body", "avatar", "hasBody",
+                                                     "hasIcon", "dataType", "dataKeys", "tagShape")},
+                         {"visibilityState": "hidden", "rafFired": False, "innerWidth": 1000, "innerHeight": 700,
+                          "main": True, "header": True, "footer": True, "composer": True, "keys": 0, "chatKeys": 0,
+                          "rows": 0, "shape": "", "name": True, "navigated": False, "body": False, "avatar": False,
+                          "hasBody": True, "hasIcon": False, "dataType": "null", "dataKeys": [], "tagShape": "9@a.a"})
         self.assertEqual(reply_diag({"diag": diag}), diag)
 
     def test_messages_loaded_late_are_waited_for(self):
         # WhatsApp loading the messages around the notified one: they come after the chat's own
-        # wait, and the chat is checked by them as ever. (No footer: it goes no further than the
-        # check, and says the chat takes no messages.)
+        # wait, and the chat is told by them. (No footer: it goes no further than the check, and
+        # says the chat takes no messages.)
+        self.header("Mum")
         self.run_js('find("main").querySelector("footer").remove()')
-        self.later(self.chat_wait + 2000, f'addRow("false_{GOOD}_3EB0LATE")')
-        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET})")
-        self.until(self.BUDGET + 1000)
-        answer, why, diag, when = self.answer()
-        self.assertEqual((answer, why, diag), ("cant-send", "", None))
+        self.later(self.chat_wait + 2000, f"addRow({json.dumps(row(bare(1), 'Did you eat?'))})")
+        answer, why, diag, when = self.run_reply()
+        self.assertEqual((answer, why), ("cant-send", "name+body"))
+        self.assertLess(when, self.chat_wait + 3000)
+        self.assertEqual({key: diag[key] for key in self.FOOTER},
+                         {"footer": False, "composer": False, "composerAt": -1, "buttons": 0, "icons": [],
+                          "quote": False, "preview": False})
+        self.assertEqual(reply_diag({"diag": diag}), diag)
+
+    def test_keys_with_chat_ids_before_are_waited_for(self):
+        # The chat open before had keys with chat ids: one opened with its name and no messages yet
+        # is told by its keys once they come, not by the click.
+        self.header("Work Team")
+        self.add_row(row(f"false_{OTHER}_3EB0AB12", "Standup at 10"))
+        self.run_js('find("main").querySelector("footer").remove()')
+        self.run_js(f'onClick = () => {{ find("main").querySelector("#messages").childNodes = []; '
+                    f'setHeader({json.dumps(header("Mum"))}); }}')
+        self.later(2000, f'addRow({json.dumps(row(f"false_{GOOD}_3EB0CD34", "Did you eat?"))})')
+        self.assertEqual(self.run_reply()[:2], ("cant-send", "ids"))
+        self.setUp()
+        self.header("Work Team")
+        self.add_row(row(f"false_{OTHER}_3EB0AB12", "Standup at 10"))
+        self.run_js(f'onClick = () => {{ find("main").querySelector("#messages").childNodes = []; '
+                    f'setHeader({json.dumps(header("Mum"))}); }}')
+        self.later(2000, f'addRow({json.dumps(row(f"false_{OTHER}_3EB0CD34", "Did you eat?"))})')
+        self.assert_mismatch(self.run_reply(), "other-chat")
+
+    def test_keyed_messages_loaded_late_are_waited_for(self):
+        self.run_js('find("main").querySelector("footer").remove()')
+        self.later(self.chat_wait + 2000, f'addRow({json.dumps(row(f"false_{GOOD}_3EB0LATE", "x"))})')
+        answer, why, diag, when = self.run_reply()
+        self.assertEqual((answer, why, diag["footer"]), ("cant-send", "ids", False))
         self.assertLess(when, self.chat_wait + 3000)
 
     def test_time_is_kept_back_for_typing(self):
         # Messages that come too late to leave time for the draft, the words and Send: nothing typed.
-        self.later(self.BUDGET - 300, f'addRow("false_{GOOD}_3EB0LATE")')
-        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET})")
-        self.until(self.BUDGET + 1000)
-        answer, why, _diag, when = self.answer()
-        self.assertEqual((answer, why), ("mismatch", "no-ids"))
+        self.header("Mum")
+        self.later(self.BUDGET - 300, f"addRow({json.dumps(row(bare(1), 'Did you eat?'))})")
+        answer, why, _diag, when = self.run_reply()
+        self.assertEqual((answer, why), ("mismatch", "unconfirmed"))
         self.assertLess(when, self.BUDGET - self.reserve + 1000)
         self.assertTrue(self.run_js('boxEmpty(composerIn(find("main")))').to_boolean())
 
     def test_a_page_that_stalled_types_nothing_late(self):
         # The page held up (its timers late) until the messages came with less time left than the
         # rest takes: "busy" (late), nothing typed.
+        self.header("Mum")
         self.later(self.chat_wait + 1000, f'now += {self.BUDGET - self.chat_wait - 4000}; '
-                                          f'addRow("false_{GOOD}_3EB0LATE")')
-        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET})")
-        self.until(self.BUDGET + 1000)
-        answer, why, diag, _when = self.answer()
+                                          f"addRow({json.dumps(row(bare(1), 'Did you eat?'))})")
+        answer, why, diag, _when = self.run_reply()
         self.assertEqual((answer, why, diag), ("busy", "late", None))
         self.assertTrue(self.run_js('boxEmpty(composerIn(find("main")))').to_boolean())
 
-    def test_another_chats_messages_are_still_a_mismatch(self):
-        self.later(self.chat_wait + 2000, f'addRow("false_{OTHER}_3EB0LATE_{GOOD}")')
-        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET})")
-        self.until(self.BUDGET + 1000)
-        answer, why, diag, when = self.answer()
-        self.assertEqual((answer, why, diag), ("mismatch", "other-chat", None))
-        self.assertLess(when, self.chat_wait + 3000)
+    def test_another_chats_keys_are_still_a_mismatch(self):
+        self.later(self.chat_wait + 2000, f'addRow({json.dumps(row(f"false_{OTHER}_3EB0LATE_{GOOD}", "x"))})')
+        answer, why, diag, when = self.run_reply()
+        self.assertEqual((answer, why), ("mismatch", "other-chat"))
+        self.assertEqual((diag["keys"], diag["chatKeys"]), (1, 1))
+        rows_wait = int(re.search(r"const ROWS_WAIT_MS = (\d+);", SECTION)[1])
+        self.assertLess(when, self.chat_wait + 2000 + rows_wait + 1000)
 
     def test_the_wait_ends_with_the_budget(self):
         budget = self.chat_wait + 3000
-        self.later(self.chat_wait + 5000, f'addRow("false_{GOOD}_3EB0LATE")')  # after the budget
-        self.run_js(f"ask({json.dumps(GOOD)}, {budget})")
+        self.header("Mum")
+        self.later(self.chat_wait + 5000, f"addRow({json.dumps(row(bare(1), 'Did you eat?'))})")  # after the budget
+        self.run_js(f"ask({json.dumps(GOOD)}, {budget}, {json.dumps(self.MUM)})")
         self.until(budget + 10000)
         answer, why, _diag, when = self.answer()
-        self.assertEqual((answer, why), ("mismatch", "no-ids"))
+        self.assertEqual((answer, why), ("mismatch", "unconfirmed"))
         self.assertLess(when, budget + 1000)  # the budget, and the look at the page after it
 
     def test_no_chat_open_after_the_click(self):
-        self.run_js('const main = find("main"); main.parentElement.childNodes.splice('
-                    'main.parentElement.childNodes.indexOf(main), 1)')
-        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET})")
-        self.until(self.BUDGET + 1000)
-        answer, why, diag, when = self.answer()
+        self.run_js("closeChat()")
+        answer, why, diag, when = self.run_reply()
         self.assertEqual((answer, why), ("gone", "click"))
         self.assertLess(when, self.chat_wait + 1000)  # no messages to wait for without a chat
-        self.assertEqual((diag["main"], diag["header"], diag["footer"], diag["keys"], diag["shape"]),
-                         (False, False, False, 0, ""))
+        self.assertEqual((diag["main"], diag["header"], diag["footer"], diag["keys"], diag["shape"], diag["name"]),
+                         (False, False, False, 0, "", False))
 
     def test_frames_and_the_shape_of_a_key(self):
-        # A page WebKit draws, a chat whose keys aren't WhatsApp's: the shape of the first, and
-        # none of it as it was.
+        # A page WebKit draws, a chat whose keys name no chat and no name to tell it by: the shape
+        # of the first key, and none of it as it was.
         self.run_js("frames = true; document.visibilityState = 'visible'")
-        self.run_js('addRow("Mum’s chat 4917612345678 ✓")')
-        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET})")
-        self.until(self.BUDGET + 1000)
-        answer, why, diag, _when = self.answer()
-        self.assertEqual((answer, why), ("mismatch", "no-ids"))
+        self.add_row(row("Mum’s chat 4917612345678 ✓", "x"))
+        answer, why, diag, _when = self.run_reply()
+        self.assertEqual((answer, why), ("mismatch", "other-name"))
         self.assertEqual((diag["rafFired"], diag["visibilityState"], diag["keys"], diag["chatKeys"], diag["rows"]),
                          (True, "visible", 1, 0, 1))
         self.assertEqual(diag["shape"], "a?a?a?9?")  # runs, not their lengths
         self.assertEqual(reply_diag({"diag": diag}), diag)
 
+    def test_the_live_pages_keys(self):
+        # As the live page had it: rows with bare ids, a header with no name Natter could match.
+        self.add_row(row("3EB0A1B2C3D4E5F60718", "x"))
+        answer, why, diag, _when = self.run_reply()
+        self.assertEqual((answer, why), ("mismatch", "other-name"))
+        self.assertEqual((diag["keys"], diag["chatKeys"], diag["shape"]), (1, 0, "9a9a9a9a9a9a9a9"))
+        self.assertEqual((diag["keyAttrs"], diag["rowAttrs"]), (["class", "data-id"], ["role"]))
+
     def test_a_long_key_is_cut(self):
-        self.run_js(f'addRow("true_{GOOD}_3EB0" + "A".repeat(80) + "_99")')
-        self.run_js(f"ask({json.dumps(OTHER)}, {self.BUDGET})")
-        self.until(self.BUDGET + 1000)
-        answer, why, diag, _when = self.answer()
+        self.add_row(row(f"true_{GOOD}_3EB0" + "A" * 80 + "_99", "x"))
+        answer, why, diag, _when = self.run_reply(chat=OTHER)
         self.assertEqual((answer, why), ("mismatch", "other-chat"))
-        self.assertIsNone(diag)  # another chat's keys: nothing more to say
-        self.run_js('diagnose().then((d) => { answer = d.shape; })')
-        self.until(self.BUDGET + 2000)
-        shape = self.run_js("answer").to_string()
-        self.assertEqual(shape, "a_9@a.a_9a9a")  # its first 40 characters only
+        self.assertEqual(diag["shape"], "a_9@a.a_9a9a")  # its first 40 characters only
 
 
 if __name__ == "__main__":

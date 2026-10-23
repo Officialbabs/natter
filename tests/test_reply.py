@@ -1264,8 +1264,9 @@ class AppTest(unittest.TestCase):
     def kde_host(self, app):
         """The page's lend() for the last send from KDE's field, run: the host it was offered."""
         (lend,) = app.account.lends[-1:]
-        lend()
-        (_account, host), = app.called("lend_page")[-1:]
+        lend(False)
+        (_account, host, hidden), = app.called("lend_page")[-1:]
+        self.assertIs(hidden, False)  # as the page asked
         return host
 
     def test_text_from_kde_out_of_sight_brings_up_a_card_to_hold_the_page(self):

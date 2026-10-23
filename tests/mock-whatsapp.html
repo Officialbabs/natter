@@ -5,13 +5,16 @@
      Run a separate Natter against it (see docs/development.md, "The test page"): --url only works
      with an app id of its own, e.g. NATTER_APP_ID=io.github.Officialbabs.Natter.Dev plus XDG_*_HOME.
      Add ?link to start on the link screen (a QR code); linkPhone() then shows the chats.
-     For replies from notifications: each chat has an id (the notifications' tag), the open chat's
-     messages are keyed "<mine>_<chat id>_<id>", the Send button stands in for the voice note
-     button a timer tick after there are words, and the drawers are as WhatsApp's: always there and
-     never empty (each holds a drawer manager, a <div> with an empty <span>, while nothing's open).
-     What opens goes in that span (openDrawer): a pasted or dropped file's preview, shaped like
-     WhatsApp's media editor, in the middle one; an empty state there, as beside Status; Settings
-     or a new group over the chat list. A notification's click closes the left one, as WhatsApp's.
+     For replies from notifications: each chat has an id (the notifications' tag); the open chat's
+     header has its picture and its name; its messages are rows (div[role=row] > div[data-id]) keyed
+     by a bare message id, as today's WhatsApp keys them (add ?prefixed for the old keys,
+     "<mine>_<chat id>_<id>"), with their words in a span, emoji as pictures; the Send button stands
+     in for the voice note button a timer tick after there are words; and the drawers are as
+     WhatsApp's: always there and never empty (each holds a drawer manager, a <div> with an empty
+     <span>, while nothing's open). What opens goes in that span (openDrawer): a pasted or dropped
+     file's preview, shaped like WhatsApp's media editor, in the middle one; an empty state there,
+     as beside Status; Settings or a new group over the chat list. A notification's click closes
+     the left one, as WhatsApp's.
      sentMessages and voicePresses say what was sent and pressed. -->
 <html>
 <head>
@@ -41,6 +44,9 @@
   #messages { flex: 1; padding: 16px; }
   .message-in, .message-out { max-width: 60%; padding: 6px 10px; border-radius: 8px; margin: 4px 0; background: #8882; }
   .message-out { margin-left: auto; background: #2ec27e44; }
+  .message-in .time, .message-out .time { margin-left: 8px; opacity: .6; font-size: 11px; }
+  #main header img { width: 28px; height: 28px; border-radius: 50%; }
+  img.emoji { width: 1.2em; height: 1.2em; vertical-align: middle; }
   footer { padding: 10px; }
   footer [contenteditable] { padding: 10px; border-radius: 8px; background: #8882; outline: none; }
   #drop { display: none; position: absolute; inset: 0; background: #2ec27e55; align-items: center; justify-content: center; }
@@ -118,7 +124,9 @@
   const IDS = Object.fromEntries(CHATS.map((name, i) => [name, FILTERS.groups.includes(name)
     ? `1203630412345678${10 + i}@g.us` : `4477009001${String(i).padStart(2, "0")}@c.us`]));
   const app = document.getElementById("app");
-  let filter = "", openName = "", sent = 0;
+  // Messages keyed as WhatsApp once did ("<mine>_<chat id>_<id>"), with ?prefixed; else by a bare id.
+  const PREFIXED = new URLSearchParams(location.search).has("prefixed");
+  let filter = "", openName = "", made = 0;
   const drafts = {};  // what was left in each chat's box, put back when it opens again
   window.sentMessages = [];
   window.voicePresses = 0;
@@ -140,23 +148,56 @@
     });
   }
 
+  // Each chat's picture: a blob: URL of its own, as WhatsApp's are once loaded (never fetched from it).
+  const PNG = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="),
+    (c) => c.charCodeAt(0));
+  const pictures = {};
+  const pictureOf = (name) => (pictures[name] ??= URL.createObjectURL(new Blob([PNG], { type: "image/png" })));
+  window.pictureOf = pictureOf;
+
   // Each chat's header is drawn anew, WhatsApp's call buttons disabled again, as in WebKitGTK.
   function header(name) {
-    document.querySelector("#main header").innerHTML = `<span dir="auto" title="${name}">${name}</span>
+    document.querySelector("#main header").innerHTML = `<div><img src="${pictureOf(name)}" alt="" draggable="false"></div>
+      <div><span dir="auto" title="${name}" data-testid="conversation-info-header-chat-title">${name}</span></div>
       <button aria-label="Video call" disabled><span data-icon="video-call">🎥</span></button>
       <button aria-label="Voice call" disabled><span data-icon="voice-call">📞</span></button>`;
   }
 
+  // A message id as WhatsApp's: digits and capital letters, 20 of them.
+  function messageId() {
+    const n = ++made;
+    let id = "3EB0";
+    for (let i = 0; i < 16; i++) id += "0123456789ABCDEF"[(n * 11 + i * 7 + (n + i) * (i + 3)) % 16];
+    return id;
+  }
+
+  // A message's row, as WhatsApp draws one: the row, the message keyed in it, its words in a span
+  // (emoji as pictures, with the emoji as their alt), and its time.
+  function messageRow(way, text, chat) {
+    const row = document.createElement("div");
+    row.setAttribute("role", "row");
+    const id = PREFIXED ? `${way === "out"}_${chat}_${messageId()}` : messageId();
+    row.innerHTML = `<div data-id="${id}" class="message-${way} focusable-list-item"><div class="copyable-text">`
+      + `<span dir="ltr" class="selectable-text copyable-text"><span></span></span></div><span class="time">10:42</span></div>`;
+    const words = row.querySelector(".selectable-text span");
+    for (const part of text.split(/(\p{Extended_Pictographic})/u)) {
+      if (!/\p{Extended_Pictographic}/u.test(part)) {
+        words.append(part);
+        continue;
+      }
+      const emoji = document.createElement("img");
+      emoji.className = "emoji";
+      emoji.alt = part;
+      emoji.src = "data:image/gif;base64,R0lGODlhAQABAAAAACw=";
+      words.append(emoji);
+    }
+    return row;
+  }
+
   // The chat's messages, keyed as WhatsApp keys them.
   function messages(name) {
-    const rows = name === "Mum" ? [["in", "Did you eat?"], ["out", "Yes mum"]] : [["in", "See you later"]];
-    document.getElementById("messages").replaceChildren(...rows.map(([way, text], i) => {
-      const row = document.createElement("div");
-      row.className = `message-${way}`;
-      row.setAttribute("data-id", `${way === "out"}_${IDS[name]}_3EB0MOCK${i}`);
-      row.textContent = text;
-      return row;
-    }));
+    const rows = name === "Mum" ? [["in", "Did you eat?"], ["out", "Yes mum 👍"]] : [["in", "See you later"]];
+    document.getElementById("messages").replaceChildren(...rows.map(([way, text]) => messageRow(way, text, IDS[name])));
   }
 
   function open(name) {
@@ -185,11 +226,7 @@
         return;
       }
       window.sentMessages.push({ chat: IDS[openName], text: composer().innerText.trim() });
-      const row = document.createElement("div");
-      row.className = "message-out";
-      row.setAttribute("data-id", `true_${IDS[openName]}_3EB0SENT${++sent}`);
-      row.textContent = composer().innerText.trim();
-      document.getElementById("messages").appendChild(row);
+      document.getElementById("messages").appendChild(messageRow("out", composer().innerText.trim(), IDS[openName]));
       composer().textContent = "";
       setTimeout(slot, 0);
     });
@@ -280,14 +317,16 @@
     if (name) open(name);
   });
 
-  // A message notification, the way WhatsApp makes one, with a PNG picture.
-  window.fakeMessage = (from, text) => {
+  // A message notification, the way WhatsApp makes one, with a PNG picture: a data: URL, or with
+  // `samePicture` the chat's own (its header's).
+  window.fakeMessage = (from, text, samePicture = false) => {
     const picture = document.createElement("canvas");
     picture.width = picture.height = 64;
     const paint = picture.getContext("2d");
     paint.fillStyle = "#e66100";
     paint.fillRect(0, 0, 64, 64);
-    const n = new Notification(from, { body: text, tag: IDS[from], icon: picture.toDataURL("image/png") });
+    const icon = samePicture ? pictureOf(from) : picture.toDataURL("image/png");
+    const n = new Notification(from, { body: text, tag: IDS[from], icon });
     // As WhatsApp's own handler: the left drawer closes, the chat opens by its id, then its box has focus.
     n.onclick = () => {
       window.focus();

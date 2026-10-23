@@ -133,16 +133,38 @@ On Ada, adding `io.github.Officialbabs.Natter` to `AllowBackground` in
 A reply goes through WhatsApp's own page, the way you would send it by hand, once for each time you
 press Send:
 
-1. WhatsApp's own handler for its notification opens the chat by its id (unless that chat is open
-   already).
-2. The bridge checks the open chat is that chat, by the chat id in its messages' keys rather than
-   by its name, and that its message box is empty: words you left there aren't touched. It waits
-   for those messages as long as the reply may take, less the time typing and Send need: when the
-   message isn't the chat's latest, WhatsApp can take some seconds to load the ones around it.
+1. WhatsApp's own handler for its notification opens the chat by its id. It's clicked even when a
+   chat of that name is open already, as it may be another of the same name, and then given a
+   moment to open the right one. A notification WhatsApp has closed since (the chat read) is
+   clicked too.
+2. The bridge checks the open chat is that chat, and that its message box is empty: words you left
+   there aren't touched. WhatsApp's messages no longer carry the chat's id, so the chat is told by
+   its name, which must be the notification's title, and at least one more sign: the message you
+   were notified of among its latest messages (generic ones, such as "📷 Photo" or "Sticker", don't
+   count), its picture in the header being the notification's, or the reply's own click having
+   opened it, from no chat or from one with another name. A name alone is never enough, as two chats
+   can share one; a chat of that name open before the click needs the message or the picture. Only
+   messages that came in count as the message, not your own. For a notification WhatsApp had closed
+   when you asked to reply, whose click may open nothing, the message must have four letters or
+   digits at least (twelve if the notification cut it short), and in a group the sender's name must
+   show with it, or on the message that starts that sender's run of messages just above, with no
+   message between that WhatsApp says another person sent. One WhatsApp closes after you asked (the
+   reply having the chat read) counts as still shown. A chat the click didn't open is never taken
+   while the chat list shows two chats of that name, nor while a search is typed or a filter chip is
+   on, when the list may leave one out: the click may open nothing, or open the other one only
+   later, and the chat open may be the other one, with the same words. Where messages do carry the
+   chat's id, as WhatsApp's once did, that id decides instead. The bridge waits for the chat's
+   messages as long as the reply may take, less the time typing and Send need: when the message
+   isn't the chat's latest, WhatsApp can take some seconds to load the ones around it. Just before
+   Send it checks it's still the same chat, with the same name, and for a chat the click didn't
+   open, with the message or the picture still there. One case remains: with two chats of the same
+   name that aren't both in the visible chat list, and WhatsApp's click not opening the chat, or
+   opening it only after a second or so, the open one can be taken for the other if it shows the
+   same message.
 3. Your words go into the box through the page's own editing commands, a line at a time, and must
    land as you typed them (WhatsApp's own swap of `:-)` for an emoji aside).
 4. WhatsApp's Send button is pressed once, not the Enter key, and the reply counts as sent when
-   WhatsApp empties the box or shows your new message.
+   WhatsApp empties the box or shows a new message with your words in the chat.
 
 Anything that doesn't look right stops it before Send, and the reply window says why and keeps your
 words: a picture or file waiting to be sent, words typed over the chat list and not yet saved (a new
@@ -154,25 +176,39 @@ notification click closes it. If Send was pressed but the reply wasn't seen to g
 says so and doesn't send again.
 
 WhatsApp only draws a chat and its messages while its page is on screen. So while Natter Den's
-window is closed, or shows another account, Natter Den moves WhatsApp's page under the reply window
-for as long as the reply runs: unseen, out of reach and at the size it had in the window, so WhatsApp
-draws the chat and its messages as it would there. The page goes back as soon as the reply ends,
-the reply window closes, Natter Den locks or its window opens on that account. A reply typed in a KDE notification
-brings the reply window up for it, showing the words being sent. With the page on screen, WhatsApp
-may show you as online and mark the chat as read, as replying in WhatsApp itself would.
+window is closed or minimised (or hidden by the desktop some other way, as the page itself says),
+or shows another account, Natter Den moves WhatsApp's page under the reply window for as long as
+the reply runs: unseen, out of reach and at the size it had in the window, so WhatsApp draws the
+chat and its messages as it would there. The page goes back as soon as the reply ends, the reply
+window closes, Natter Den locks, or its window opens on that account, is no longer minimised or
+gets the focus. A reply typed in a KDE notification brings the reply window up for it, showing the
+words being sent. With the page on screen, WhatsApp may show you as online and mark the chat as
+read, as replying in WhatsApp itself would.
 
 While a reply is under way nothing else acts on that page (opening chats, links, files and fresh
 pages wait), and a hidden window's page isn't throttled meanwhile. A locked Natter Den starts no
 send: Reply asks for the passcode first, words typed in a KDE notification while it's locked wait in
 the reply window until you press Send, and a reply window the lock closes with words in it comes
-back after the passcode. Natter Den's log says how each reply ended (`natter: reply: sent`), not who
-to or what. When the chat couldn't be checked (`mismatch (no-ids)`, or `gone` or `not-ready` once
-WhatsApp's notification was clicked), the line ends with what the page was like, in brackets: whether
-WhatsApp's page counted itself visible and was drawing, whether it was on screen and lent to the
-reply window, whether the chat, its header, footer and message box were there, the page's size in
-hundreds of pixels, how many message keys and rows the chat held, and the shape of its first key
-(each run of digits as 9, of letters as a). Never a name, words, an id or their lengths. A notification's id and its Reply
-and Mute actions name no chat, only a random reference, as desktops may keep them.
+back after the passcode. Natter Den's log says how each reply ended, and how the chat was told
+(`natter: reply: sent (name+body)`, or `name+avatar`, `name+click`, `ids`), not who to or what. When
+the chat wasn't the one or couldn't be told (`mismatch (other-name)`, `mismatch (unconfirmed)`,
+`mismatch (ambiguous)`, `mismatch (filtered)` and the like, or `gone` or `not-ready` once WhatsApp's
+notification was clicked), or the reply stopped after the check (`draft (quote)`, `left-as-draft
+(no-button)`, `left-as-draft (text)`, `cant-send`, `unsure`), the line ends with what the page was
+like, in brackets: whether WhatsApp's page counted itself visible and was drawing, whether it was on
+screen and lent to the reply window, whether the chat, its header, footer and message box were
+there, the page's size in hundreds of pixels, how many message keys and rows the chat held, and the
+shape of its first key (each run of digits as 9, of letters as a). Then the footer: which of the
+bridge's places for the message box found it, how many buttons it had, the shapes of its icons'
+names, and whether a message being replied to or a preview showed by the box or a picture or file
+waited to be sent. Then which signs of the chat held (its name, the click opening it, the message,
+the picture), where in the header the name was found (which of the bridge's places for it, and
+whether it was the first name there), whether the notification had a body and a picture, the kind of
+its data and the names of its keys, the shape of its tag, the names of the attributes on the chat,
+its header, its first message and that message's row, and the shapes of the values with an `@` or
+`_` in them of those that hold keys (`id` and `data-` ones). Never a name, words, an id or their
+lengths. A notification's id and its Reply and Mute actions name no chat, only a random reference,
+as desktops may keep them.
 
 Where the notification server offers KDE's inline reply, Natter Den offers the field only when the
 notification shows who wrote, and takes the text only from the server's own bus name, once per

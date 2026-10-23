@@ -28,6 +28,10 @@
   // back to the same object and run WhatsApp's own handler, which opens that chat.
 
   const shown = new Map();
+  // Those closed since (WhatsApp closes them once their chat is read), as many: a reply to one
+  // still clicks it, and checks the open chat against what it said (sameChat). Each with when it
+  // was closed (closedAt, the page's clock): one closed after the reply was asked counts as shown.
+  const closed = new Map();
   // Each page load starts somewhere new, so a notification from before a reload can't be taken for
   // a newer one with the same id (by a click on it, say). Natter takes ids below 2**31: room for 2**30.
   let nextId = 1 + Math.floor(Math.random() * 2 ** 30);
@@ -85,7 +89,12 @@
       return event;
     }
     close() {
-      if (shown.delete(this.id)) post({ type: "unnotify", id: this.id });
+      if (shown.delete(this.id)) {
+        post({ type: "unnotify", id: this.id });
+        this.closedAt = performance.now();
+        closed.set(this.id, this);
+        if (closed.size > 300) closed.delete(closed.keys().next().value);
+      }
       this._fire("close");
     }
     static get permission() { return "granted"; }
@@ -97,8 +106,9 @@
   }
   Object.defineProperty(window, "Notification", { value: NatterNotification, writable: true, configurable: true });
 
+  // One WhatsApp closed since is clicked too: its handler, if it still acts, opens that chat.
   function clickNotification(id) {
-    const notification = shown.get(id);
+    const notification = shown.get(id) || closed.get(id);
     if (!notification) return false;
     notification._fire("click");
     return true;
@@ -331,7 +341,8 @@
     "footer": ["footer"],                                  // its bottom bar, in #main
     "composer": ['[contenteditable="true"][role="textbox"]', '[data-lexical-editor="true"]',
                  '[contenteditable="true"]'],              // its message box, in the footer
-    "msg-key": ["[data-id]"],                              // its messages, in #main: "<mine>_<chat id>_<id>…"
+    "msg-key": ["[data-id]"],                              // its messages, in #main: their ids (once "<mine>_<chat id>_<id>…")
+    "msg-row": ['[role="row"]'],                           // a message's row, in #main
     // WhatsApp's drawers. Their containers are in the page all the time and never empty: each
     // holds WhatsApp's drawer manager, a <div> with an empty <span> in it while nothing is open.
     // So what's open is told by what's inside (previewOpen, drawerEdit), never by the drawer.
@@ -418,21 +429,42 @@
     });
   }
 
-  // Text with WhatsApp's emoji pictures put back as the characters they stand for.
+  // Text with WhatsApp's emoji pictures put back as the characters they stand for, icons aside.
   function textOf(element) {
     return [...element.childNodes].map((node) => {
       if (node.nodeType === Node.TEXT_NODE) return node.textContent;
       if (node.tagName === "IMG") return node.getAttribute("alt") || "";
-      return node.nodeType === Node.ELEMENT_NODE ? textOf(node) : "";
+      return node.nodeType === Node.ELEMENT_NODE && !isIcon(node) ? textOf(node) : "";
     }).join("");
   }
 
+  // An icon's drawing, whose words (an SVG <title>) are its name, not what anyone reads.
+  const isIcon = (node) => String(node.tagName).toLowerCase() === "svg";
+
+  const nameIn = (element) => plainName((element.getAttribute("title") || textOf(element)).replace(/\s+/g, " "));
+
+  // The chat's name in a chat's header: its title, or its words with emoji pictures put back.
+  function titleOf(header) {
+    const title = header && find("header-name", header);
+    return title ? nameIn(title) : "";
+  }
+
+  // Every name the header may show the chat's as, for each of WHERE's places for it in turn: each
+  // element's title and its words. The first is titleOf's.
+  function namesOf(header) {
+    const names = [];
+    if (header) {
+      WHERE["header-name"].forEach((selector, at) => header.querySelectorAll(selector).forEach((element) => {
+        for (const name of [nameIn(element), plainName(textOf(element).replace(/\s+/g, " "))]) {
+          if (name && !names.some((other) => other.name === name)) names.push({ name, at });
+        }
+      }));
+    }
+    return names;
+  }
+
   function activeChat() {
-    const header = find("header");
-    if (!header) return "";
-    const title = find("header-name", header);
-    if (!title) return "";
-    return plainName((title.getAttribute("title") || textOf(title)).replace(/\s+/g, " "));
+    return titleOf(find("header"));
   }
 
   // WhatsApp's link screen (a QR code, or a code to type on the phone), told by its parts rather
@@ -838,12 +870,13 @@
   // never twice, never again after a failure, and nothing of WhatsApp's code or storage. Anything
   // that doesn't look exactly right ends it before Send, with the reason: nothing is guessed.
   // The answers (account.py REPLY_RESULTS):
-  //   "sent"           Send pressed, and WhatsApp took the words out of the box
+  //   "sent"           Send pressed, and WhatsApp took the words out of the box (or drew a new message)
   //   "unsure"         Send pressed, not seen to go: it may have, so it's never tried again
   //   "left-as-draft"  typed, not sent: the words may be in the chat's message box
   //   "draft" (the chat has words of the person's own in its box, or a message being replied to),
   //   "busy" (something's in the way), "cant-send" (the chat takes no messages from them),
-  //   "mismatch" (the chat that opened isn't that one), "gone" (no way to open it), "not-ready",
+  //   "mismatch" (the chat that opened isn't that one, or can't be told to be), "gone" (no way to
+  //   open it), "not-ready",
   //   "calling", "too-long": nothing typed
 
   const CHAT_ID = /^\d{5,24}(-\d{5,24})?@(c\.us|g\.us|lid)$/;  // people and groups (account.py CHAT_ID)
@@ -854,6 +887,7 @@
   const LINE_WAIT_MS = 2000;  // for each line to land in the box
   const SEND_WAIT_MS = 5000;  // for WhatsApp's Send button, which turns up a timer tick after the words
   const SENT_WAIT_MS = 10000;  // for the box to empty once Send is pressed
+  const ROWS_WAIT_MS = 1000;  // once a chat's first messages are drawn, for the rest of it
   const FRAME_WAIT_MS = 300;  // for an animation frame, in what Natter's log is told (diagnose)
   // Kept back from a wait for a chat's messages, for what comes after it: the draft put back, a
   // line typed, the Send button. Less than that left once the chat is checked, and nothing is typed.
@@ -946,7 +980,8 @@
     return Boolean(drawer) && [...drawer.querySelectorAll(FIELDS)].some(hasWords);
   }
 
-  // The chats the open chat's messages belong to, by their keys: "<mine>_<chat id>_<id>…".
+  // The chats the open chat's messages belong to, by their keys, when they're "<mine>_<chat id>_<id>…".
+  // WhatsApp now keys them by the message's own id alone, which names no chat: then there are none.
   function chatIds(main) {
     const ids = new Set();
     main.querySelectorAll(WHERE["msg-key"].join(", ")).forEach((row) => {
@@ -965,32 +1000,315 @@
     return ids.has(chat) && (!chat.endsWith("@g.us") || ids.size === 1);
   }
 
-  // Whether the open chat shows no message keys yet: WhatsApp has opened it and is still drawing
-  // its messages (or loading those around the one notified, which can take seconds).
+  // Whether the open chat shows no messages yet: WhatsApp has opened it and is still drawing them
+  // (or loading those around the one notified, which can take seconds).
   function keyless() {
     const main = find("main");
-    return Boolean(main) && !chatIds(main).size;
+    return Boolean(main) && !main.querySelector(WHERE["msg-key"].join(", "));
   }
 
-  // What Natter's log may say of the page when a reply found no chat to check (account.py
-  // reply_diag): whether WhatsApp is drawing it at all, and what the open chat holds, by counts and
-  // the shape of its first message key (each run of digits as 9, of letters as a, of anything else
-  // as ?). Never a name, words, an id or their lengths.
-  function diagnose() {
+  // The ids of the messages in `main`, whatever their shape, for seeing one more turn up.
+  function messageIds(main) {
+    return new Set([...main.querySelectorAll(WHERE["msg-key"].join(", "))]
+      .map((row) => row.getAttribute("data-id")).filter(Boolean));
+  }
+
+  // ---- The chat told without its id
+  // With keys that name no chat, the chat that opened is told by its name in the header, which must
+  // be the notification's title, and at least one more sign that it's the chat notified: the
+  // notified message among its latest rows, the header's picture the notification's, or the reply's
+  // own click having opened it (from no chat, or from one with another name). A name alone never:
+  // two chats can have the same one. Nor is a chat taken on its message while its notification can
+  // be clicked: the click (WhatsApp's open by id) comes first. One WhatsApp closed may not open its
+  // chat when clicked, so its message is held to more (`strict`): longer words, and a group's
+  // sender's too. And a chat the click didn't open is never taken while the chat list shows two of
+  // that name, or shows only some chats (namesakes): the click may open nothing, or the other one
+  // only later.
+
+  const LAST_ROWS = 12;  // the latest rows of the open chat, where the notified message is looked for
+
+  // A chat's name as Natter compares them (activeChat): spaces as one, no invisible marks, and NFC
+  // with U+FE0F aside, which emoji pictures may or may not carry.
+  const nameKey = (text) => plainName(String(text || "").replace(/\s+/g, " ")).normalize("NFC").replace(/\uFE0F/g, "");
+
+  function sameName(a, b) {
+    const key = nameKey(a);
+    return Boolean(key) && key === nameKey(b);
+  }
+
+  // Words as a message and its notification both have them: NFC, without spaces, invisible marks,
+  // U+FE0F or WhatsApp's formatting marks (* _ ~ `), which a message shows as styles instead.
+  const flat = (text) => String(text || "").normalize("NFC").replace(INVISIBLE, "").replace(/[\s\uFE0F*_~`]/g, "");
+
+  // What WhatsApp's notifications say for a message without words of its own (a picture, a voice
+  // message, a sticker, one deleted, a call missed, several at once), as far as Natter knows them;
+  // and the marks they start with for a picture, video, voice message, document, place, contact or
+  // poll. None of it is taken for the message: a chat with no such message doesn't show those words.
+  const MEDIA_MARK = /^(\u{1F4F7}|\u{1F4F8}|\u{1F3A5}|\u{1F4F9}|\u{1F39E}|\u{1F3AC}|\u{1F3A4}|\u{1F3B5}|\u{1F3A7}|\u{1F4C4}|\u{1F4CE}|\u{1F4C1}|\u{1F4CD}|\u{1F5FA}|\u{1F464}|\u{1F465}|\u{1F4CA}|\u{1F5BC}|\u{1F6AB}|\u{1F4DE}|\u{1F4F2}|\u{1F517})/u;
+  const GENERIC = /^(photo|image|picture|video|gif|audio|voicemessage|voicenote|sticker|document|file|location|livelocation|contact|contacts|poll|message|newmessage|\d+newmessages|\d+messages|thismessagewasdeleted|youdeletedthismessage|waitingforthismessage.*|missed(voice|video)?call|viewonce.*|incoming(voice|video)?call|reacted.*)$/;
+
+  function generic(text) {
+    const words = flat(text).toLowerCase().replace(/^[^\p{L}\p{N}]+/u, "").replace(/[.!…]+$/u, "");
+    return MEDIA_MARK.test(String(text || "").trim()) || GENERIC.test(words);
+  }
+
+  // What a notification's body may be found as in its chat: the body, and in a group the words
+  // after "<sender>: " (`strict`: with the sender's name in the same row). One cut short ("…")
+  // stands for how the message starts. Under two characters (one emoji, say), or generic: nothing,
+  // and a generic body nothing at all. `strict`: under four letters or digits (twelve for one cut
+  // short), nothing either: "ok" or "Yes" could be any chat's.
+  function bodies(body, strict) {
+    const text = String(body || "");
+    if (generic(text)) return [];
+    const found = [];
+    const add = (part, sender) => {
+      let words = flat(part);
+      const start = words.endsWith("…");
+      if (start) words = words.slice(0, -1);
+      const enough = strict ? (words.match(/[\p{L}\p{N}]/gu) || []).length >= (start ? 12 : 4) : [...words].length >= 2;
+      if (enough && !generic(part)) found.push({ words, start, sender });
+    };
+    add(text, "");
+    const colon = text.indexOf(": ");
+    if (colon > 0) add(text.slice(colon + 2), strict ? flat(text.slice(0, colon)) : "");
+    return found;
+  }
+
+  // Each element's words in `element`, itself included, emoji pictures as theirs and icons aside
+  // (as textOf), to `visit`.
+  function eachText(element, visit) {
+    const text = [...element.childNodes].map((node) => {
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+      if (node.tagName === "IMG") return node.getAttribute("alt") || "";
+      return node.nodeType === Node.ELEMENT_NODE && !isIcon(node) ? eachText(node, visit) : "";
+    }).join("");
+    visit(text);
+    return text;
+  }
+
+  // The open chat's latest message rows: WhatsApp's rows, else what carries its messages' keys.
+  function latestRows(main) {
+    const rows = [...main.querySelectorAll(WHERE["msg-row"].join(", "))];
+    return (rows.length ? rows : [...main.querySelectorAll(WHERE["msg-key"].join(", "))]).slice(-LAST_ROWS);
+  }
+
+  // The words of each element in `element`, flat.
+  function textsIn(element) {
+    const texts = [];
+    eachText(element, (text) => texts.push(flat(text)));
+    return texts;
+  }
+
+  // Whether the person sent the message in `row` (WhatsApp's class for one's own), not received it.
+  const ownRow = (row) => Boolean(row.querySelector(".message-out")) && !row.querySelector(".message-in");
+  // Whether `row` holds a message that came in (WhatsApp's class for one).
+  const inRow = (row) => row.matches(".message-in") || Boolean(row.querySelector(".message-in"));
+
+  // Who WhatsApp says sent `row`'s message, flat: the name in its copyable text's
+  // data-pre-plain-text ("[10:42, 23/10/2026] Name: "), or "" where it says none.
+  function saidBy(row) {
+    const text = row.querySelector("[data-pre-plain-text]");
+    const found = text && /^\[[^\]]*\]\s*([\s\S]*):\s*$/.exec(text.getAttribute("data-pre-plain-text"));
+    return found ? flat(found[1]) : "";
+  }
+
+  // Where `element` sits in `row`: each element up to the row, by its tag and its attributes' names.
+  function placeIn(element, row) {
+    const steps = [];
+    for (let node = element; node && node !== row; node = node.parentElement) {
+      steps.push(node.tagName + "[" + node.getAttributeNames().sort().join(" ") + "]");
+    }
+    return steps.join("<");
+  }
+
+  // The innermost element in `row` whose words are `sender` (flat), as textsIn reads them, or null.
+  function senderIn(row, sender) {
+    const all = [...row.querySelectorAll("*")].filter((element) => !isIcon(element) && flat(textOf(element)) === sender);
+    return all.find((element) => !all.some((other) => other !== element && element.contains(other))) || null;
+  }
+
+  // Whether `row`, a group's message, shows `sender` (flat) as who sent it. WhatsApp names the
+  // sender on the first row of a run of their messages only: so the row itself, or else the nearest
+  // row above it in the same run of messages coming in that shows the name, with no row between
+  // (nor `row`) holding anything where that row has the name: another sender's name, so another run.
+  // Nor any two of those rows that WhatsApp says were sent by different people (saidBy), wherever
+  // it draws their names.
+  function sentBy(main, row, sender) {
+    if (textsIn(row).includes(sender)) return true;
+    const rows = [...main.querySelectorAll(WHERE["msg-row"].join(", "))];
+    const at = rows.indexOf(row);
+    if (at < 0 || !inRow(row)) return false;
+    for (let i = at - 1; i >= 0 && inRow(rows[i]) && !ownRow(rows[i]); i--) {
+      const name = senderIn(rows[i], sender);
+      if (!name) continue;
+      const place = placeIn(name, rows[i]);
+      if (new Set(rows.slice(i, at + 1).map(saidBy).filter(Boolean)).size > 1) return false;
+      return rows.slice(i + 1, at + 1).every((other) => ![...other.querySelectorAll("*")]
+        .some((element) => placeIn(element, other) === place && flat(textOf(element))));
+    }
+    return false;
+  }
+
+  // Whether the notified message shows in `main`: something in one of its latest rows that came in
+  // (inRow: not the person's own, nor any row at all should WhatsApp's classes change), with just
+  // its words (or, for a body cut short, starting with them), and with `strict` a group's sender's
+  // name there too, or on the row that starts its run (bodies, sentBy).
+  function hasMessage(main, body, strict) {
+    const wanted = bodies(body, strict);
+    return wanted.length > 0 && latestRows(main).some((row) => {
+      if (!inRow(row)) return false;
+      const texts = textsIn(row);
+      return wanted.some((want) => texts.some((words) => (want.start ? words.startsWith(want.words) : words === want.words))
+        && (!want.sender || sentBy(main, row, want.sender)));
+    });
+  }
+
+  // Whether `icon` may be told a chat by: a blob: picture or one from WhatsApp's picture hosts. Not
+  // a data: URL or one from its static host, which may be a stand-in that every chat without a
+  // picture has.
+  function pictureAddress(icon) {
+    if (/^blob:/i.test(icon)) return true;
+    const host = /^https:\/\/([^/?#]*)/i.exec(icon);
+    const name = host ? host[1].toLowerCase() : "";
+    return /^[a-z0-9.-]+\.whatsapp\.net$/.test(name) && name !== "static.whatsapp.net";
+  }
+
+  // Whether `main`'s header shows the notification's picture, at the same address.
+  function samePicture(main, icon) {
+    const header = find("header", main);
+    if (!header || !pictureAddress(String(icon || ""))) return false;
+    const title = find("header-name", header);  // its emoji are pictures too
+    return [...header.querySelectorAll("img")].some((img) => !(title && title.contains(img)) && img.getAttribute("src") === icon);
+  }
+
+  // Which of the header's names (namesOf) is `title`, or undefined.
+  const nameAmong = (names, title) => names.find((name) => sameName(name.name, title));
+
+  // Each sign of whether the chat open in `main` is `notification`'s (its title, body and icon),
+  // without its id. `before`: the open chat before the reply's click ({main, names: its namesOf,
+  // closed: whether the notification clicked had been closed}), or null for no click.
+  function chatSigns(main, notification, before) {
+    const name = Boolean(nameAmong(namesOf(find("header", main)), notification.title));
+    return {
+      name,
+      // The click opened it: from no chat, or from one with names, none of them this one.
+      navigated: Boolean(before) && name && (!before.main
+        || (before.names.length > 0 && !nameAmong(before.names, notification.title))),
+      body: hasMessage(main, notification.body, !before || before.closed),
+      avatar: samePicture(main, notification.icon),
+    };
+  }
+
+  // Whether the chat open in `main` is `notification`'s, told without its id: by its name, and the
+  // notified message there, its picture, or the reply's click having opened it (`before`, as for
+  // chatSigns). Which, for Natter's log ("name+body"); "" if it isn't, or can't be told.
+  function sameChat(main, notification, before) {
+    if (!main || !notification) return "";
+    const signs = chatSigns(main, notification, before);
+    if (!signs.name) return "";
+    return signs.body ? "name+body" : signs.avatar ? "name+avatar" : signs.navigated ? "name+click" : "";
+  }
+
+  // How many chats in the list (chatRows, those WhatsApp has drawn) have the name `title`. Two or
+  // more, and a chat of that name the click didn't open is never taken for the one notified: it may
+  // be the other, with the same words, while WhatsApp's click opens nothing, or opens it later.
+  // With a search typed or a filter chip on, the list isn't all the chats (scan): not known, null.
+  function namesakes(title) {
+    if (searching() || filtered()) return null;
+    return chatRows().filter(([name]) => sameName(name, title)).length;
+  }
+
+  // ---- What the log may say of the page
+  // When a reply finds the chat isn't the one, or can't tell (account.py reply_diag): whether
+  // WhatsApp is drawing the page at all, what the open chat holds, by counts and shapes, which signs
+  // of the chat held, what the notification carried, and the names of the attributes on the chat,
+  // its header and its first message, and the shapes of those values with an @ or _ in them. Never
+  // a name, words, an id or their lengths.
+
+  const DIAG_NAMES = 16;  // attribute or key names, at most, for each element or object
+  const DIAG_VALUES = 8;
+
+  // A value's shape: each run of digits as 9, of letters as a, of anything else but _ @ . : - as ?,
+  // from its first 40 characters.
+  const shapeOf = (value) => String(value).slice(0, 40).replace(/[0-9]+/g, "9").replace(/[A-Za-z]+/g, "a")
+    .replace(/[^9a_@.:-]+/g, "?");
+
+  // A name the log may have: code's (an attribute's, a key's), in kebab case, never one like an id.
+  function diagName(name) {
+    const kebab = String(name).replace(/[A-Z]/g, (c) => "-" + c.toLowerCase());
+    return /^[a-z][a-z0-9-]{0,31}$/.test(kebab) && (kebab.match(/[0-9]/g) || []).length <= 2 ? kebab : "";
+  }
+
+  const diagNames = (names) => [...new Set(names.map(diagName).filter(Boolean))].sort().slice(0, DIAG_NAMES);
+  // The shapes of the names of the icons in `element` (as iconNames reads them), not the names.
+  const iconShapes = (element) => [...new Set([...element.querySelectorAll("svg title, [data-icon]")]
+    .map((icon) => shapeOf(icon.getAttribute("data-icon") || icon.textContent || "")).filter(Boolean))].sort()
+    .slice(0, DIAG_VALUES);
+  const attributeNames = (element) => (element ? diagNames(element.getAttributeNames()) : []);
+
+  // Attributes whose values are keys rather than words: the log may have their values' shapes.
+  const keyAttribute = (name) => name === "id" || (name.startsWith("data-") && diagName(name) === name);
+
+  // What the reply knew of the page and the notification (null if it had none) when it stopped.
+  // `before` as for chatSigns.
+  function diagnose(notification, before) {
     const main = find("main");
     const rows = main ? [...main.querySelectorAll(WHERE["msg-key"].join(", "))] : [];
     const keys = rows.map((row) => row.getAttribute("data-id") || "");
     const count = (n) => Math.min(n, 999);
     const size = (n) => (Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n / 100) * 100, 9900) : 0);
-    const shape = (key) => key.slice(0, 40).replace(/[0-9]+/g, "9").replace(/[A-Za-z]+/g, "a")
-      .replace(/[^9a_@.:-]+/g, "?");
+    const header = main && find("header", main);
+    // The first message's element, and the elements around it up to its row.
+    const first = rows[0] || null;
+    const around = [];
+    for (let node = first && first.parentElement; node && node !== main && around.length < 8; node = node.parentElement) {
+      around.push(node);
+      if (node.getAttribute("role") === "row") break;
+    }
+    const values = [];
+    for (const element of [main, header, first, ...around]) {
+      for (const name of element ? element.getAttributeNames() : []) {
+        const value = element.getAttribute(name) || "";
+        if (/[@_]/.test(value) && keyAttribute(name)) {
+          values.push(`${diagName(name)}=${shapeOf(value)}`);
+        }
+      }
+    }
+    const footer = main && find("footer", main);
+    const box = main && composerIn(main);
     const facts = {
       visibilityState: document.visibilityState, innerWidth: size(innerWidth), innerHeight: size(innerHeight),
-      main: Boolean(main), header: Boolean(main && find("header")), footer: Boolean(main && find("footer", main)),
-      composer: Boolean(main && composerIn(main)), keys: count(keys.length),
+      main: Boolean(main), header: Boolean(header), footer: Boolean(footer),
+      composer: Boolean(box), keys: count(keys.length),
+      // The footer: which of WHERE's places for the message box found it (-1, none), its buttons,
+      // the shapes of its icons' names, a message being replied to (or a link's preview) beside the
+      // box, and WhatsApp's media editor open.
+      composerAt: footer ? WHERE.composer.findIndex((selector) => footer.querySelector(selector)) : -1,
+      buttons: count(footer ? footer.querySelectorAll(CONTROLS).length : 0),
+      icons: footer ? iconShapes(footer) : [],
+      quote: Boolean(box && besideTheBox(main, box)), preview: previewOpen(),
       chatKeys: count(keys.filter((key) => /^(true|false)_/.test(key)).length),
-      rows: count(main ? main.querySelectorAll('[role="row"]').length : 0), shape: keys.length ? shape(keys[0]) : "",
+      rows: count(main ? main.querySelectorAll('[role="row"]').length : 0), shape: keys.length ? shapeOf(keys[0]) : "",
+      mainAttrs: attributeNames(main), headerAttrs: attributeNames(header), keyAttrs: attributeNames(first),
+      rowAttrs: diagNames(around.flatMap((element) => element.getAttributeNames())),
+      values: [...new Set(values)].sort().slice(0, DIAG_VALUES),
     };
+    if (notification) {
+      const data = notification.data;
+      Object.assign(facts, main ? chatSigns(main, notification, before)
+        : { name: false, navigated: false, body: false, avatar: false });
+      // Where in the header the name was: which of WHERE's places for it (-1, none), and whether
+      // it was the first name there (titleOf's).
+      const names = namesOf(header);
+      const named = nameAmong(names, notification.title);
+      Object.assign(facts, { nameAt: named ? named.at : -1, nameFirst: Boolean(named) && names[0] === named });
+      Object.assign(facts, {
+        hasBody: Boolean(notification.body), hasIcon: Boolean(notification.icon),
+        dataType: data === null ? "null" : Array.isArray(data) ? "array" : typeof data,
+        dataKeys: data && typeof data === "object" && !Array.isArray(data) ? diagNames(Object.keys(data)) : [],
+        tagShape: shapeOf(notification.tag || ""),
+      });
+    }
     // Whether WebKit draws the page: an animation frame raced against a timer.
     return new Promise((resolve) => {
       let over = false;
@@ -1004,10 +1322,32 @@
     });
   }
 
-  // The keys of the person's own messages in `main`, for seeing one more turn up.
+  // The keys of the person's own messages in `main`, for seeing one more turn up (keys with chat ids).
   function ownKeys(main, chat) {
     return new Set([...main.querySelectorAll(WHERE["msg-key"].join(", "))].map((row) => row.getAttribute("data-id"))
       .filter((key) => key && key.startsWith(`true_${chat}_`)));
+  }
+
+  // The open chat's messages just before Send, to see the one sent turn up (sentSince), and the
+  // words sent.
+  function beforeSend(main, chat, words) {
+    return { own: ownKeys(main, chat), ids: messageIds(main), keyed: chatIds(main).size > 0, words: flat(words) };
+  }
+
+  // Whether the words have gone since `before` (beforeSend): a new message of the person's own, by
+  // keys with chat ids; with keys without, which don't say whose a message is, a new message with
+  // just these words, as WhatsApp draws the one sent (not one of theirs coming in meanwhile, nor
+  // one marked as coming in); or the box emptied.
+  function sentSince(main, chat, before) {
+    if (!main.isConnected) return false;
+    if ([...ownKeys(main, chat)].some((key) => !before.own.has(key))) return true;
+    if (!before.keyed && [...main.querySelectorAll(WHERE["msg-key"].join(", "))].some((message) => {
+      const id = message.getAttribute("data-id");
+      const row = message.closest(WHERE["msg-row"].join(", ")) || message;
+      return id && !before.ids.has(id) && !inRow(row) && textsIn(row).includes(before.words);
+    })) return true;
+    const now = composerIn(main);
+    return Boolean(now && boxEmpty(now));
   }
 
   function composerIn(main) {
@@ -1136,18 +1476,21 @@
   const replying = new Set();
   let replies = Promise.resolve();
 
-  // One at a time, in the order asked. `request`: {pageId, chatId, text, budgetMs, visible}.
-  // Its budget runs from now, waiting included: Send is never pressed after it. The answer is
+  // One at a time, in the order asked. `request`: {pageId, chatId, text, budgetMs, visible, sinceMs}.
+  // Its budget runs from now, waiting included: Send is never pressed after it. `sinceMs`: how long
+  // ago Natter asked (before lending the page, which may have WhatsApp close the notification). The answer is
   // one of those above; why (for Natter's log, never with names or words) goes on request.why,
-  // and what the page was like when no chat could be checked (diagnose) on request.diag.
+  // which once the chat was found to be the one says how ("ids", "name+body", sameChat), and what
+  // the page was like when it wasn't, or couldn't be told (diagnose), on request.diag.
   function reply(request) {
-    const { pageId, chatId, text, budgetMs, visible } = request && typeof request === "object" ? request : {};
+    const { pageId, chatId, text, budgetMs, visible, sinceMs } = request && typeof request === "object" ? request : {};
     const budget = Number.isFinite(budgetMs) ? Math.min(Math.max(budgetMs, 0), 60000) : 0;
     const deadline = performance.now() + budget;
-    const progress = { stage: "", diag: null };
+    const asked = performance.now() - (Number.isFinite(sinceMs) ? Math.min(Math.max(sinceMs, 0), 60000) : 0);
+    const progress = { stage: "", diag: null, how: "" };
     const tell = ([answer, why]) => {
       try {
-        request.why = why || "";
+        request.why = why || progress.how || "";
         request.diag = progress.diag;
       } catch (_) { /* a frozen request: no reason told */ }
       return answer;
@@ -1155,7 +1498,7 @@
     const key = JSON.stringify([chatId, text]);
     if (replying.has(key)) return Promise.resolve(tell(["busy", "repeat"]));
     replying.add(key);
-    const run = () => replyOnce(pageId, chatId, text, deadline, Boolean(visible), progress)
+    const run = () => replyOnce(pageId, chatId, text, deadline, Boolean(visible), asked, progress)
       // A mistake of Natter's own: said for what may be in WhatsApp by then.
       .catch(() => [{ "": "busy", typed: "left-as-draft", pressed: "unsure" }[progress.stage], "exception"])
       .then((answer) => {
@@ -1166,7 +1509,7 @@
     return replies;
   }
 
-  async function replyOnce(pageId, chat, text, deadline, visible, progress) {
+  async function replyOnce(pageId, chat, text, deadline, visible, asked, progress) {
     const left = () => Math.max(0, deadline - performance.now());
     if (typeof text !== "string" || !text.trim()) return ["too-long", "blank"];
     const words = text.replace(/\r\n?/g, "\n").trim();
@@ -1180,15 +1523,39 @@
     // A picture or file waiting to be sent: another chat would drop it, and Send would send it.
     if (previewOpen()) return ["busy", "preview"];
     if (!left()) return ["busy", "queue"];
-    const there = () => {
-      const main = find("main");
-      return main && isChat(main, chat) ? main : null;
+    // What the notification said, for telling its chat without its id: only if it's that chat's.
+    // One WhatsApp closed since (its chat read) still says it, and is still clicked.
+    const notification = shown.get(pageId) || closed.get(pageId) || null;
+    const facts = notification && notification.tag === chat ? notification : null;
+    // The chat open in `main`, if it's this one: by its messages' keys while they carry chat ids
+    // (isChat), else by its name and another sign (sameChat). With how, and its name then. Once the
+    // chat open before the click had keys with chat ids, one with no messages yet is waited for.
+    const at = (main, before) => {
+      if (!main || (before && before.keyed && !main.querySelector(WHERE["msg-key"].join(", ")))) return null;
+      const how = chatIds(main).size ? (isChat(main, chat) ? "ids" : "") : facts ? sameChat(main, facts, before) : "";
+      const named = how && facts ? nameAmong(namesOf(find("header", main)), facts.title) : null;
+      return how ? { main, how, name: named ? named.name : "" } : null;
     };
-    let main = there();
-    if (!main) {
-      const notification = shown.get(pageId);
-      if (!notification) return ["gone", "notification"];
-      if (notification.tag !== chat) return ["mismatch", "tag"];
+    // Still that chat: the same #main, with its keys still this chat's, or else the same name.
+    const still = (found) => find("main") === found.main && (chatIds(found.main).size ? isChat(found.main, chat)
+      : Boolean(found.name) && namesOf(find("header", found.main)).some((name) => name.name === found.name));
+    const failed = async (answer, told, before) => {
+      progress.diag = await diagnose(told, before);
+      return answer;
+    };
+    // Open already, told by its keys: no click. Told by its name and message, it's clicked all the
+    // same: another chat of the same name may be open, with the same words.
+    const first = find("main");
+    let found = first && chatIds(first).size ? at(first, null) : null;
+    // The chat open before the click (below), and whether the chat was told without the click
+    // having opened it: by its message or picture, in a chat of that name open before.
+    let before = null;
+    let unopened = false;
+    // What the page was like, for an answer after the check (draft, left-as-draft, cant-send, unsure).
+    const described = (answer) => failed(answer, notification, before);
+    if (!found) {
+      if (!notification) return failed(["gone", "notification"], null, null);
+      if (notification.tag !== chat) return failed(["mismatch", "tag"], notification, null);
       // WhatsApp's click closes what's open over the chat list and leaves the open chat, whether
       // anyone sees the page or not (it keeps both while Natter's window is hidden): words typed
       // there (a group being made, a profile name being changed), a voice message waiting to be
@@ -1197,32 +1564,55 @@
       if (drawerEdit()) return ["busy", "drawer"];
       const open = find("main");
       if (open && footerInUse(open, visible)) return ["busy", "open-chat"];
+      // The chat open before the click, to tell whether the click opened another.
+      // Closed counts as of when the reply was asked: lending the page may have WhatsApp mark the
+      // chat read and close it since, and one shown then is held to no more than one shown now.
+      before = {
+        main: open, names: open ? namesOf(find("header", open)) : [],
+        keyed: Boolean(open) && chatIds(open).size > 0,
+        closed: !shown.has(pageId) && !(notification.closedAt > asked),
+      };
       clickNotification(pageId);  // WhatsApp's own handler: it opens the chat by its id
-      main = await until(there, Math.min(CHAT_WAIT_MS, left()));
-      if (!main && keyless()) {
-        // A chat open with no messages keyed yet: WhatsApp may still be loading them, those around
-        // the notified one when it isn't the chat's latest. Waited for, within the budget, less
-        // the time the rest takes.
-        await until(() => !keyless(), Math.max(0, left() - TYPE_RESERVE_MS));
-        main = there();
-        if (main && left() < DRAFT_WAIT_MS + SEND_WAIT_MS) return ["busy", "late"];
+      // WhatsApp opens it a moment later, and until then the chat open before is still there. One of
+      // the same name is given that moment, so as not to be taken for the one the click opens. (The
+      // page's timers aren't held back during a reply, hidden or not: account.py.)
+      if (open && nameAmong(before.names, notification.title)) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(ROWS_WAIT_MS, left())));
+        await quiet(find("app") || document.body, DRAFT_QUIET_MS, Math.min(DRAFT_WAIT_MS, left()));
       }
-      if (!main) {
-        const open = find("main");
-        if (open && chatIds(open).size) return ["mismatch", "other-chat"];
-        const answer = open ? ["mismatch", "no-ids"] : [left() ? "gone" : "not-ready", "click"];
-        progress.diag = await diagnose();
-        return answer;
+      const there = () => at(find("main"), before);
+      found = await until(there, Math.min(CHAT_WAIT_MS, left()));
+      if (!found && keyless()) {
+        // A chat open with no messages yet: WhatsApp may still be loading them, those around the
+        // notified one when it isn't the chat's latest. Waited for, within the budget, less the
+        // time the rest takes, then a moment more for the rest of the chat to be drawn.
+        const most = () => Math.max(0, left() - TYPE_RESERVE_MS);
+        await until(() => there() || !keyless(), most());
+        found = await until(there, Math.min(ROWS_WAIT_MS, most()));
       }
-      await quiet(main, DRAFT_QUIET_MS, Math.min(DRAFT_WAIT_MS, left()));
-      if (there() !== main) return ["mismatch", "moved"];
+      // Found too late to leave time for the draft and Send (the page held up, say): nothing typed.
+      if (found && left() < DRAFT_WAIT_MS + SEND_WAIT_MS) return ["busy", "late"];
+      if (!found) {
+        const now = find("main");
+        const why = !now ? "click" : chatIds(now).size ? "other-chat"
+          : nameAmong(namesOf(find("header", now)), notification.title) ? "unconfirmed" : "other-name";
+        return failed([now ? "mismatch" : left() ? "gone" : "not-ready", why], notification, before);
+      }
+      await quiet(found.main, DRAFT_QUIET_MS, Math.min(DRAFT_WAIT_MS, left()));
+      if (!still(found)) return failed(["mismatch", "moved"], notification, before);
+      unopened = found.how !== "ids" && !chatSigns(found.main, facts, before).navigated;
+      const same = unopened ? namesakes(facts.title) : 0;
+      if (same === null) return failed(["mismatch", "filtered"], notification, before);
+      if (same > 1) return failed(["mismatch", "ambiguous"], notification, before);
     }
+    progress.how = found.how;
+    const main = found.main;
     const box = composerIn(main);
     // No message box: a voice message of theirs in its place, or a chat that takes none from them.
-    if (!box) return footerInUse(main, false) ? ["busy", "no-composer"] : ["cant-send", ""];
+    if (!box) return footerInUse(main, false) ? ["busy", "no-composer"] : described(["cant-send", ""]);
     if (!boxEmpty(box)) return ["draft", ""];  // the person's own words are never touched
     // Looked at once, before typing: words with a link in them bring a preview up there too.
-    if (besideTheBox(main, box)) return ["draft", "quote"];
+    if (besideTheBox(main, box)) return described(["draft", "quote"]);
     box.focus();
     const range = document.createRange();
     range.selectNodeContents(box);
@@ -1244,28 +1634,25 @@
       await settle();
       const wanted = canonical(lines.slice(0, i + 1).join("\n"));
       if (!(await until(() => sameText(canonical(boxText(box)), wanted), Math.min(LINE_WAIT_MS, left())))) {
-        return ["left-as-draft", "text"];
+        return described(["left-as-draft", "text"]);
       }
     }
     const wanted = canonical(words);
     const button = await until(() => sendButton(main), Math.min(SEND_WAIT_MS, left()));
     if (!left()) return ["left-as-draft", "late"];
-    if (!button) return ["left-as-draft", "no-button"];
-    // Still this chat, this box, these words, this button, nothing waiting to be sent with them.
-    if (there() !== main || composerIn(main) !== box || !sameText(canonical(boxText(box)), wanted)
-        || sendButton(main) !== button || previewOpen()) {
+    if (!button) return described(["left-as-draft", "no-button"]);
+    // Still this chat, this box, these words, this button, nothing waiting to be sent with them;
+    // and one told without the click having opened it, told again by all its signs.
+    if (!still(found) || composerIn(main) !== box || !sameText(canonical(boxText(box)), wanted)
+        || sendButton(main) !== button || previewOpen() || (unopened && !sameChat(main, facts, before))) {
       return ["left-as-draft", "moved"];
     }
-    const before = ownKeys(main, chat);
+    if (chatIds(main).size) progress.how = "ids";  // keys with chat ids, this chat's (still)
+    const pressed = beforeSend(main, chat, words);
     progress.stage = "pressed";
     button.click();  // the one press
-    const sent = await until(() => {
-      if (!main.isConnected) return false;
-      if ([...ownKeys(main, chat)].some((key) => !before.has(key))) return true;
-      const now = composerIn(main);
-      return Boolean(now && boxEmpty(now));
-    }, SENT_WAIT_MS);
-    return sent ? ["sent", ""] : ["unsure", ""];
+    const sent = await until(() => sentSince(main, chat, pressed), SENT_WAIT_MS);
+    return sent ? ["sent", ""] : described(["unsure", ""]);
   }
 
   // ---- Classes Natter's style sheet hangs off -----------------------------------------------

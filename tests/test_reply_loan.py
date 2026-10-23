@@ -1,7 +1,7 @@
 """A reply's page lent to its reply card while nobody can see it (loan.py), and the window's and
 the app's side of it (window.py lend_page, app.py lend_page, page_seen): lent only while out of
-sight, never while locked, and back where and as it was on every way out. Stand-in widgets: no
-display, no page."""
+sight (not on screen, its window minimised or suspended, or the page hidden all the same), never
+while locked, and back where and as it was on every way out. Stand-in widgets: no display, no page."""
 
 import inspect
 import tempfile
@@ -13,13 +13,14 @@ from unittest import mock
 
 import gi
 
+gi.require_version("Gdk", "4.0")
 gi.require_version("Gtk", "4.0")
 gi.require_version("WebKit", "6.0")
-from gi.repository import Gtk, WebKit
+from gi.repository import Gdk, Gtk, WebKit
 
 from natter import loan as natter_loan
 from natter.app import Natter
-from natter.loan import FALLBACK_SIZE, PageLoan, page_size
+from natter.loan import FALLBACK_SIZE, PageLoan, out_of_sight, page_size, toplevel_hidden
 from natter.settings import Settings
 from natter.window import Window
 
@@ -46,17 +47,51 @@ class Signals:
                 handler(self, *args)
 
 
+class Surface:
+    """A window's Gdk.Toplevel: its state."""
+
+    def __init__(self, state=Gdk.ToplevelState(0)):
+        self.state = state
+
+    def get_state(self):
+        return self.state
+
+
+class Root:
+    """The window a view is in: its surface, and where its focus is."""
+
+    def __init__(self, state=Gdk.ToplevelState(0)):
+        self.surface, self.focus = Surface(state), None
+
+    def get_surface(self):
+        return self.surface
+
+    def get_focus(self):
+        return self.focus
+
+
 class View(Signals):
     """A WebKit.WebView as the loan moves it."""
 
-    def __init__(self, mapped=False, width=1200, height=800):
+    def __init__(self, mapped=False, width=1200, height=800, root=None):
         super().__init__()
-        self.mapped, self.width, self.height = mapped, width, height
+        self.mapped, self.width, self.height, self.root = mapped, width, height, root
         self.size, self.can_focus, self.focusable, self.can_target = (-1, -1), True, True, True
         self.parent = None
 
     def get_mapped(self):
         return self.mapped
+
+    def get_root(self):
+        return self.root
+
+    def is_ancestor(self, other):
+        return False
+
+    def grab_focus(self):
+        if self.root is not None:
+            self.root.focus = self
+        return True
 
     def get_width(self):
         return self.width
@@ -232,7 +267,56 @@ class LoanTest(unittest.TestCase):
     def test_never_when_it_is_on_screen(self):
         self.view.mapped = True
         self.assertFalse(self.loan().lend())
+        self.view.root = Root(Gdk.ToplevelState.FOCUSED | Gdk.ToplevelState.MAXIMIZED)
+        self.assertFalse(self.loan().lend())
         self.assertIs(self.home.get_child(), self.view)
+
+    def test_out_of_a_window_minimised_or_suspended(self):
+        # Mapped to GTK, hidden to WebKit: lent, and back exactly as it was, the window's focus too.
+        for state in (Gdk.ToplevelState.MINIMIZED, Gdk.ToplevelState.SUSPENDED):
+            self.view.mapped, self.view.root = True, Root(state)
+            self.view.root.focus = self.view
+            self.ended.clear()
+            loan = self.loan()
+            self.assertTrue(loan.lend(), state)
+            self.assertIs(self.view.parent, loan._viewport)
+            self.view.root.focus = None  # GTK takes the focus off what leaves the window
+            loan.give_back()
+            self.assert_home(loan)
+            self.assertIs(self.view.root.focus, self.view)
+
+    def test_the_focus_back_only_if_it_was_there(self):
+        self.view.mapped, self.view.root = True, Root(Gdk.ToplevelState.MINIMIZED)
+        elsewhere = SimpleNamespace(is_ancestor=lambda widget: False)  # a button in the header, say
+        self.view.root.focus = elsewhere
+        loan = self.loan()
+        loan.lend()
+        loan.give_back()
+        self.assertIs(self.view.root.focus, elsewhere)
+        self.view.root.focus = self.view
+        loan = self.loan()
+        loan.lend()
+        self.view.root.focus = elsewhere  # where GTK put it once the page left
+        loan.give_back()
+        self.assertIs(self.view.root.focus, self.view)
+
+    def test_out_of_sight_when_the_page_says_it_is_hidden(self):
+        self.view.mapped, self.view.root = True, Root()
+        loan = PageLoan(self.view, self.home, self.card, (1200, 800), ended=self.ended.append, hidden=True)
+        self.assertTrue(loan.lend())
+        loan.give_back()
+        self.assert_home(loan)
+
+    def test_what_counts_as_out_of_sight(self):
+        self.assertTrue(out_of_sight(View()))
+        self.assertFalse(out_of_sight(View(mapped=True)))  # no window yet: as on screen
+        self.assertFalse(out_of_sight(View(mapped=True, root=Root(Gdk.ToplevelState.FOCUSED))))
+        self.assertTrue(out_of_sight(View(mapped=True, root=Root(Gdk.ToplevelState.MINIMIZED))))
+        self.assertTrue(out_of_sight(View(mapped=True, root=Root(Gdk.ToplevelState.SUSPENDED
+                                                                 | Gdk.ToplevelState.FOCUSED))))
+        self.assertFalse(toplevel_hidden(None))
+        self.assertFalse(toplevel_hidden(SimpleNamespace(get_surface=lambda: None)))  # not realised
+        self.assertFalse(toplevel_hidden(SimpleNamespace(get_surface=lambda: object())))  # not a window's
 
     def test_never_into_a_card_out_of_sight(self):
         self.card.mapped = False
@@ -282,10 +366,11 @@ class WindowTest(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def window(self, default=(1100, 750), **values):
+    def window(self, default=(1100, 750), root=None, **values):
         found = SimpleNamespace(pages={}, loans={}, app=SimpleNamespace(settings=settings(self, **values)),
-                                get_default_size=lambda: default, shown=None)
-        for name in ("lend_page", "give_back_pages", "give_back_shown"):
+                                get_default_size=lambda: default, shown=None, _was_hidden=False)
+        found.get_surface = lambda: root.surface if root is not None else None
+        for name in ("lend_page", "give_back_pages", "give_back_shown", "_on_surface_state"):
             setattr(found, name, types.MethodType(getattr(Window, name), found))
         found.account = None
         return found
@@ -352,6 +437,46 @@ class WindowTest(unittest.TestCase):
         # The window shown: only the page it shows (another account's stays with its reply).
         self.assertIn('"notify::visible", lambda *_: (self.get_visible() and self.give_back_shown()', source)
 
+    def test_lent_out_of_a_minimised_window_and_back_once_it_is_not(self):
+        root = Root(Gdk.ToplevelState.MINIMIZED)
+        found = self.window(root=root)
+        account = self.account(found, mapped=True, root=root)
+        found.account = account
+        found._was_hidden = True
+        loan = found.lend_page(account, Card())
+        self.assertIsNotNone(loan)
+        for state in (Gdk.ToplevelState.MINIMIZED | Gdk.ToplevelState.FOCUSED, Gdk.ToplevelState.SUSPENDED):
+            root.surface.state = state
+            found._on_surface_state(root.surface)
+            self.assertTrue(loan.lent, state)  # still out of sight
+        root.surface.state = Gdk.ToplevelState(0)
+        found._on_surface_state(root.surface)
+        self.assertFalse(loan.lent)
+        self.assertEqual(found.loans, {})
+        self.assertIs(account.home.get_child(), account.view)
+        self.assertFalse(found._was_hidden)
+
+    def test_lent_as_the_page_says_hidden_and_back_once_the_window_has_the_focus(self):
+        root = Root()
+        found = self.window(root=root)
+        account = self.account(found, mapped=True, root=root)
+        found.account = account
+        self.assertIsNone(found.lend_page(account, Card()))  # in sight, and the page didn't say otherwise
+        loan = found.lend_page(account, Card(), hidden=True)
+        self.assertTrue(loan.lent)
+        root.surface.state = Gdk.ToplevelState.MAXIMIZED  # the focus going to the reply card, say
+        found._on_surface_state(root.surface)
+        self.assertTrue(loan.lent)
+        root.surface.state = Gdk.ToplevelState.MAXIMIZED | Gdk.ToplevelState.FOCUSED
+        found._on_surface_state(root.surface)
+        self.assertFalse(loan.lent)
+
+    def test_the_windows_state_is_watched(self):
+        source = inspect.getsource(Window.__init__)
+        self.assertIn('self.connect("realize", self._watch_surface)', source)
+        self.assertIn('surface.connect("notify::state", self._on_surface_state)',
+                      inspect.getsource(Window._watch_surface))
+
     def test_nothing_back_with_no_tab_shown(self):
         found = self.window()
         main = self.account(found)
@@ -366,7 +491,7 @@ class WindowTest(unittest.TestCase):
 class AppTest(unittest.TestCase):
     def app(self, **values):
         lent = []
-        window = SimpleNamespace(lend_page=lambda account, card: lent.append((account, card)) or "loan",
+        window = SimpleNamespace(lend_page=lambda account, card, hidden: lent.append((account, card, hidden)) or "loan",
                                  get_visible=lambda: values.get("visible", False), account=None,
                                  give_back_pages=lambda account=None: lent.append(("back", account)))
         found = SimpleNamespace(window=window, locked=values.get("locked", False), calling=values.get("calling", False),
@@ -377,13 +502,21 @@ class AppTest(unittest.TestCase):
             setattr(found, name, types.MethodType(getattr(Natter, name), found))
         return found
 
-    def account(self, mapped=False):
-        return SimpleNamespace(id="main", view=View(mapped=mapped), calling=False)
+    def account(self, mapped=False, root=None):
+        return SimpleNamespace(id="main", view=View(mapped=mapped, root=root), calling=False)
 
     def test_lent_to_the_card_on_screen(self):
         app, account, card = self.app(), self.account(), Card()
         self.assertEqual(app.lend_page(account, lambda: card), "loan")
-        self.assertEqual(app.lent, [(account, card)])
+        self.assertEqual(app.lent, [(account, card, False)])
+
+    def test_lent_from_a_window_on_screen_but_out_of_sight(self):
+        app, card = self.app(), Card()
+        account = self.account(mapped=True, root=Root(Gdk.ToplevelState.MINIMIZED))
+        self.assertEqual(app.lend_page(account, lambda: card), "loan")
+        account = self.account(mapped=True, root=Root(Gdk.ToplevelState.FOCUSED))
+        self.assertEqual(app.lend_page(account, lambda: card, True), "loan")  # the page says it's hidden
+        self.assertEqual(app.lent[1:], [(account, card, True)])
 
     def test_not_lent(self):
         asked = []
@@ -396,6 +529,7 @@ class AppTest(unittest.TestCase):
             self.assertIsNone(app.lend_page(self.account(), host), values)
         app = self.app()
         self.assertIsNone(app.lend_page(self.account(mapped=True), host))  # on screen already
+        self.assertIsNone(app.lend_page(self.account(mapped=True, root=Root(Gdk.ToplevelState.FOCUSED)), host))
         self.assertEqual(asked, [], "no card brought up for it")
         app.window = None
         self.assertIsNone(app.lend_page(self.account(), host))
@@ -420,6 +554,17 @@ class AppTest(unittest.TestCase):
         app.window = None
         self.assertFalse(app.page_seen(account))
 
+    def test_a_window_minimised_or_suspended_isnt_seen(self):
+        # As lend_page has it: on screen to GTK, but out of sight on the desktop.
+        hidden = Gdk.ToplevelState.MINIMIZED | getattr(Gdk.ToplevelState, "SUSPENDED", 0)
+        for state in (Gdk.ToplevelState.MINIMIZED, hidden):
+            app, account = self.app(visible=True), self.account(mapped=True, root=Root(state))
+            app.window.account = account
+            self.assertFalse(app.page_seen(account), state)
+        app, account = self.app(visible=True), self.account(mapped=True, root=Root(Gdk.ToplevelState.FOCUSED))
+        app.window.account = account
+        self.assertTrue(app.page_seen(account))
+
     def test_given_back_at_the_lock_and_when_quitting(self):
         app = SimpleNamespace(lock_enabled=True, locked=False, settings={}, replies={}, notifier=SimpleNamespace(
             conceal=lambda: None), _refresh_tray=lambda: None, events=[])
@@ -432,7 +577,9 @@ class AppTest(unittest.TestCase):
 
     def test_a_reply_window_offers_itself_and_the_page_is_asked_with_it(self):
         source = inspect.getsource(Natter.send_reply)
-        self.assertIn("lend=(lambda: self.lend_page(account, host)) if host is not None else None", source)
+        self.assertIn("lend = (lambda hidden=False: self.lend_page(account, host, hidden)) if host is not None else None",
+                      source)
+        self.assertIn("account.send_reply(page_id, target.chat, text, answered, lend=lend)", source)
 
 
 if __name__ == "__main__":

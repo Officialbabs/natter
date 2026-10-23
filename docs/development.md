@@ -16,7 +16,7 @@ Natter Den's log names any it didn't find (`natter: <account>: WhatsApp's page h
 
 | Landmark | What leans on it |
 |---|---|
-| `#pane-side` and its rows (`[role="listitem"]`, `[role="row"]`) | the chat list, Ctrl+K, the dock menu, desktop search |
+| `#pane-side` and its rows (`[role="listitem"]`, `[role="row"]`) | the chat list, Ctrl+K, the dock menu, desktop search, and replies (two chats of the same name in it) |
 | `[data-testid="cell-frame-title"] span[title]` in a row (else its `span[title]`) | chat names |
 | `#main header`, with the title in `[data-testid="conversation-info-header-chat-title"]` | which chat is open |
 | the link screen: a `canvas`, `[data-ref]` or `[data-link-code]` in `#app` (the QR code), with no `#pane-side` | telling the link screen from a page still loading |
@@ -24,20 +24,21 @@ Natter Den's log names any it didn't find (`natter: <account>: WhatsApp's page h
 | call buttons in `#main header`, by their label, title or icon name ("call", "video") | starting calls from Natter Den, and turning WhatsApp's disabled buttons back on when calls don't run in the page |
 | the search box in `#side`, and the message box in `#main footer` | opening chats by name, pasting files |
 | WhatsApp's colour names (`--WDS-accent`, `--WDS-surface-default-RGB` and the rest) and its `body.dark` class | themes: when they're gone, the theme comes off that page and WhatsApp's own colours stay (`natter/themes.py`) |
-| the open chat's messages' keys (`#main [data-id]`, `<mine>_<chat id>_<id>`), its message box in `#main footer`, and the Send button by its icon's name ("send") | replies from notifications |
+| the open chat's name in its header, its picture (an `img` in `#main header`), its messages' rows (`#main [role="row"]`, with WhatsApp's `message-in` and `message-out` classes, and who sent each in its `data-pre-plain-text`) and keys (`[data-id]`: a bare message id now, once `<mine>_<chat id>_<id>`), its message box in `#main footer`, and the Send button by its icon's name ("send") | replies from notifications |
 | `[data-testid="drawer-middle"]` and `[data-testid="drawer-left"]`, always in the page and never empty, so what's open is read from inside them: WhatsApp's media editor in the middle one (its `input[type="file"][multiple]` or `[data-testid="media-caption-input-container"]`), and fields with words in them in the left one | replies waiting rather than closing what's open, files added to an open preview |
 | the row of the message box in `#main footer` (the box, up to the voice message button by its icon's name), with nothing else shown in the footer | replies not going out as a reply to a message picked in WhatsApp; a voice message's controls by their icons' names |
 
 The canary doesn't judge the reply landmarks, as most need a chat open. When one of those moves,
-replies stop before Send and the log says which (`natter: reply: mismatch (no-ids)`,
+replies stop before Send and the log says which (`natter: reply: mismatch (unconfirmed)`,
 `left-as-draft (no-button)`); a footer laid out anew could make every reply stop as
 `draft (quote)`. *Show Reply Button* in Preferences → Notifications takes Reply off notifications
 until there's a fix.
 
 ## The test page
 
-`tests/mock-whatsapp.html` copies most of these landmarks (not WhatsApp's colour names, its
-`body.dark` class or the header's title), so you can try changes without your account. Run it as a
+`tests/mock-whatsapp.html` copies most of these landmarks (not WhatsApp's colour names or its
+`body.dark` class), so you can try changes without your account. Its messages are keyed by bare ids,
+as WhatsApp's are now; add `?prefixed` to the address for the old keys with chat ids. Run it as a
 separate instance, with its own app id and folders, so it doesn't touch the Natter Den you use:
 
 ```sh

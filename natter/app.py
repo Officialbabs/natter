@@ -32,6 +32,7 @@ from .audiosizes import debug_line as audio_debug_line
 from .distro import os_release
 from .gstfix import debug_line as camera_fix_line
 from .links import chat_link, page_link
+from .loan import out_of_sight
 from .launcher import Badge, chat_key, exec_quote, set_menu_chats
 from .memguard import (KILL_MEMORY, OOM_SCORE_ADJ, MiB, MemoryGuard, in_flatpak, kill as kill_web_process,
                        mem_total, page_ceiling, page_limit, page_limits, page_sizes, web_processes)
@@ -1775,25 +1776,30 @@ class Natter(Adw.Application):
         elif reply_units(text) > REPLY_LIMIT:
             refused("too-long")
         else:
-            account.send_reply(page_id, target.chat, text, answered,
-                               lend=(lambda: self.lend_page(account, host)) if host is not None else None)
+            lend = (lambda hidden=False: self.lend_page(account, host, hidden)) if host is not None else None
+            account.send_reply(page_id, target.chat, text, answered, lend=lend)
 
-    def lend_page(self, account: Account, host: Callable[[], Optional[ReplyWindow]]):
+    def lend_page(self, account: Account, host: Callable[[], Optional[ReplyWindow]], hidden: bool = False):
         """`account`'s page, lent to the reply window `host()` for as long as a reply runs in it
         with nobody seeing the page (loan.py): WhatsApp draws a chat only while its page is on
-        screen. Never while locked or quitting, or with the page on screen. (A call in that page
-        refuses the reply before it gets here, Account._reply_refusal; one in another account's page
-        isn't touched by it.) The loan, or None."""
-        if self.window is None or self.locked or getattr(self, "_quitting", False) or account.view.get_mapped():
+        screen. Never while locked or quitting, or with the page in sight: on screen in a window
+        that isn't minimised or suspended, unless the page says it's `hidden` all the same. (A call
+        in that page refuses the reply before it gets here, Account._reply_refusal; one in another
+        account's page isn't touched by it.) The loan, or None."""
+        if (self.window is None or self.locked or getattr(self, "_quitting", False)
+                or not (hidden or out_of_sight(account.view))):
             return None
         card = host()
         if card is None or not card.get_mapped():
             return None
-        return self.window.lend_page(account, card)
+        return self.window.lend_page(account, card, hidden)
 
     def page_seen(self, account: Account) -> bool:
-        """Whether the person can see `account`'s page: the window is up, on that account."""
-        return bool(self.window is not None and self.window.get_visible() and self.window.account is account)
+        """Whether the person can see `account`'s page: the window is up, on that account, and the
+        page in sight as lend_page has it (not in a window minimised or suspended). A page that says
+        it's hidden isn't seen either (Account._lend_for)."""
+        return bool(self.window is not None and self.window.get_visible() and self.window.account is account
+                    and not out_of_sight(account.view))
 
     def reply_failed(self, window: ReplyWindow, result: str) -> None:
         """A reply that failed out of sight (its window closed meanwhile, or Natter locked): a

@@ -18,7 +18,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gtk, Pango, WebKit
 from . import DEFAULT_APP_ID, NAME
 from . import clipboard, lock as applock, themes
 from .account import Account
-from .loan import PageLoan, page_size
+from .loan import PageLoan, page_size, toplevel_hidden
 from .prefs import shown_folder
 
 # The header bar is GNOME's own, unstyled: its buttons and window controls are the size and
@@ -329,8 +329,10 @@ class Window(Adw.ApplicationWindow):
         self.app = app
         self.pages: dict[str, Adw.ViewStackPage] = {}
         self._refused_at: dict[str, float] = {}  # when each kind's last refused_toast showed
-        # Pages lent to reply cards while out of sight (lend_page), by account id.
+        # Pages lent to reply cards while out of sight (lend_page), by account id, and whether the
+        # window was minimised or suspended when last looked (_on_surface_state).
         self.loans: dict[str, PageLoan] = {}
+        self._was_hidden = False
 
         self.stack = Adw.ViewStack(vexpand=True)
         self.stack.connect("notify::visible-child",
@@ -414,6 +416,9 @@ class Window(Adw.ApplicationWindow):
         # Shown some way other than app.present_window, which gives the shown page back first: back
         # now, still before anything is drawn.
         self.connect("notify::visible", lambda *_: (self.get_visible() and self.give_back_shown(), self._behind_lock()))
+        # Minimised, or suspended by the desktop, the window still has its page on screen to GTK,
+        # but not to WebKit: a reply may lend it out then (Account._start_reply). Back once it's not.
+        self.connect("realize", self._watch_surface)
 
         snapshot = os.environ.get("NATTER_SNAPSHOT")
         if snapshot:
@@ -655,9 +660,10 @@ class Window(Adw.ApplicationWindow):
 
     # ---- Pages lent to reply cards (loan.py) -------------------------------------------------
 
-    def lend_page(self, account: Account, card) -> Optional[PageLoan]:
+    def lend_page(self, account: Account, card, hidden: bool = False) -> Optional[PageLoan]:
         """`account`'s page into the reply card `card` for a reply (app.lend_page), at the size it
-        had here. None if it isn't in its place, or is lent already."""
+        had here. None if it isn't in its place, or is lent already, or is in sight (unless the page
+        says it's `hidden`)."""
         stack_page = self.pages.get(account.id)
         if stack_page is None or account.id in self.loans:
             return None
@@ -667,7 +673,8 @@ class Window(Adw.ApplicationWindow):
         size = page_size((view.get_width(), view.get_height()),
                          (width, height) if width > 0 and height > 0 else (settings["width"], settings["height"]))
         loan = PageLoan(view, stack_page.get_child(), card, size,
-                        ended=lambda done: self.loans.get(account.id) is done and self.loans.pop(account.id))
+                        ended=lambda done: self.loans.get(account.id) is done and self.loans.pop(account.id),
+                        hidden=hidden)
         if not loan.lend():
             return None
         self.loans[account.id] = loan
@@ -679,6 +686,21 @@ class Window(Adw.ApplicationWindow):
         for account_id, loan in list(self.loans.items()):
             if account is None or account.id == account_id:
                 loan.give_back()
+
+    def _watch_surface(self, *_args) -> None:
+        surface = self.get_surface()
+        if surface is not None:
+            self._was_hidden = toplevel_hidden(self)
+            surface.connect("notify::state", self._on_surface_state)
+
+    def _on_surface_state(self, surface, _pspec=None) -> None:
+        """The window's state changed: once it's no longer minimised or suspended, or it has the
+        focus (someone is looking at it), the page it shows comes back from any reply card. Not
+        for other changes, such as the focus going to that card."""
+        hidden = toplevel_hidden(self)
+        was, self._was_hidden = self._was_hidden, hidden
+        if not hidden and (was or surface.get_state() & Gdk.ToplevelState.FOCUSED):
+            self.give_back_shown()
 
     def give_back_shown(self) -> None:
         """The shown tab's page back in it, should it be lent: when the tab or the window is shown,

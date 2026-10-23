@@ -24,6 +24,7 @@ from gi.repository import Gio, GLib, GObject, Gtk, JavaScriptCore, WebKit
 
 from . import NAME, WHATSAPP_URL, audiosizes, rtc, themes
 from .links import chat_link, is_whatsapp, page_link, same_site, short_link, unread_in
+from .loan import out_of_sight
 from .media import KINDS as MEDIA_KINDS, refusal, refusals
 from .settings import CACHE, DATA, ChatIndex
 from .system import open_uri
@@ -85,18 +86,43 @@ PAGE_REPLY_RESULTS = REPLY_RESULTS - {"locked", "needs-link", "removed", "unknow
 REPLY_SCRIPT = """if (!window.__natter || !window.__natter.reply) return {result: "not-ready", why: "no-bridge"};
 const result = await window.__natter.reply(request);
 return {result, why: request.why || "", diag: request.diag || null};"""
-# What the bridge may say of the page when a reply found no chat to check (bridge.js diagnose), for
-# the log: whether WhatsApp drew it, and what the open chat held, by counts and the shape of one
-# message key (each run of digits as 9, of letters as a). Never a name, words or an id. Natter adds
-# whether the page was on screen to WebKit (mapped) and lent to a reply card (loan.py).
+# Asked before a reply when the page is on screen to GTK, in a window not minimised or suspended:
+# whether WebKit has it hidden all the same, so it's lent to the reply card (loan.py) then too.
+PAGE_HIDDEN_SCRIPT = "return document.visibilityState;"
+# What the bridge may say of the page when a reply found the chat isn't the one, or couldn't tell,
+# or stopped after the check (a draft, words left in the box, no box, Send not seen to go: bridge.js
+# diagnose), for the log: whether WhatsApp drew it, what the open chat held, by counts and the
+# shape of one message key (each run of digits as 9, of letters as a), its footer (which place
+# found the message box, how many buttons, the shapes of its icons' names, whether a message being
+# replied to or a preview showed), which signs of the chat held (sameChat) and where in the header
+# the name was, what the notification carried (whether a body and a picture, its data's kind and
+# key names, its tag's shape), the names of the attributes on the chat, its header, its first
+# message and the elements up to that message's row, and the shapes of the values with an @ or _ in
+# them of those that carry keys (id, data-*). Never a name, words or an id. Natter adds whether
+# the page was on screen to WebKit (mapped) and lent to a reply card (loan.py).
 REPLY_DIAG_COUNT = 999  # counts are capped at this
 REPLY_DIAG_SIZE = 9900  # sizes are in hundreds of pixels, up to this
 REPLY_DIAG_SHAPE = re.compile(r"[9a_@.:?-]{0,40}")
+# Names of attributes and keys: code's own, in kebab case, with two digits at most (an id has more).
+REPLY_DIAG_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
+REPLY_DIAG_NAMES = 16  # names, at most, in each list
+REPLY_DIAG_VALUES = 8  # "<name>=<shape>", at most
+# Where in the header the name was, and which place found the message box: one of WHERE's places
+# for it (bridge.js "header-name", "composer"), from 0, or -1 for none.
+REPLY_DIAG_PLACES = 3
+REPLY_DIAG_BOX_PLACES = 3
 REPLY_DIAG = {
     "visibilityState": ("visible", "hidden", "prerender", "unloaded"),
     "rafFired": bool, "main": bool, "header": bool, "footer": bool, "composer": bool,
     "innerWidth": "size", "innerHeight": "size", "keys": "count", "chatKeys": "count", "rows": "count",
     "shape": "shape",
+    "composerAt": "box-place", "buttons": "count", "icons": "shapes", "quote": bool, "preview": bool,
+    "name": bool, "navigated": bool, "body": bool, "avatar": bool, "hasBody": bool, "hasIcon": bool,
+    "nameAt": "place", "nameFirst": bool,
+    "dataType": ("null", "undefined", "object", "array", "string", "number", "boolean", "function", "bigint", "symbol"),
+    "dataKeys": "names", "tagShape": "shape",
+    "mainAttrs": "names", "headerAttrs": "names", "keyAttrs": "names", "rowAttrs": "names",
+    "values": "values",
 }
 
 # After a crash the page reloads after 1, 5, 30, then 120 s; a crash more than ten minutes
@@ -279,7 +305,40 @@ def reply_answer(value) -> tuple[str, str]:
     if not isinstance(value, dict) or value.get("result") not in PAGE_REPLY_RESULTS:
         return "unknown", "lost" if value is None else "odd-answer"
     why = value.get("why")
-    return value["result"], why if isinstance(why, str) and re.fullmatch(r"[a-z-]{1,24}", why) else ""
+    return value["result"], why if isinstance(why, str) and re.fullmatch(r"[a-z+-]{1,24}", why) else ""
+
+
+def _diag_name(item) -> bool:
+    """An attribute's or key's name the log may have (REPLY_DIAG_NAME), never one with an id's digits."""
+    return (isinstance(item, str) and REPLY_DIAG_NAME.fullmatch(item) is not None
+            and sum(c.isdigit() for c in item) <= 2)
+
+
+def _diag_good(kind, item) -> bool:
+    if kind is bool:
+        return isinstance(item, bool)
+    if kind == "shape":
+        return isinstance(item, str) and REPLY_DIAG_SHAPE.fullmatch(item) is not None
+    if kind == "names":
+        return (isinstance(item, list) and len(item) <= REPLY_DIAG_NAMES and all(map(_diag_name, item))
+                and len(set(item)) == len(item))
+    if kind == "shapes":
+        return (isinstance(item, list) and len(item) <= REPLY_DIAG_VALUES and len(set(item)) == len(item)
+                and all(isinstance(shape, str) and shape and REPLY_DIAG_SHAPE.fullmatch(shape) for shape in item))
+    if kind == "values":
+        if not (isinstance(item, list) and len(item) <= REPLY_DIAG_VALUES):
+            return False
+        for value in item:
+            name, equals, shape = value.partition("=") if isinstance(value, str) else ("", "", "")
+            if not (equals and _diag_name(name) and REPLY_DIAG_SHAPE.fullmatch(shape)):
+                return False
+        return True
+    if isinstance(kind, tuple):
+        return isinstance(item, str) and item in kind
+    if kind in ("place", "box-place"):
+        return type(item) is int and -1 <= item < (REPLY_DIAG_PLACES if kind == "place" else REPLY_DIAG_BOX_PLACES)
+    most = REPLY_DIAG_COUNT if kind == "count" else REPLY_DIAG_SIZE  # a count, or a size in hundreds
+    return type(item) is int and 0 <= item <= most and (kind == "count" or item % 100 == 0)
 
 
 def reply_diag(value) -> Optional[dict]:
@@ -289,30 +348,23 @@ def reply_diag(value) -> Optional[dict]:
     diag = value.get("diag") if isinstance(value, dict) else None
     if not isinstance(diag, dict) or not diag or not set(diag) <= set(REPLY_DIAG):
         return None
-    for key, item in diag.items():
-        kind = REPLY_DIAG[key]
-        if kind is bool:
-            good = isinstance(item, bool)
-        elif kind == "shape":
-            good = isinstance(item, str) and REPLY_DIAG_SHAPE.fullmatch(item) is not None
-        elif isinstance(kind, tuple):
-            good = isinstance(item, str) and item in kind
-        else:  # a count, or a size in hundreds
-            most = REPLY_DIAG_COUNT if kind == "count" else REPLY_DIAG_SIZE
-            good = type(item) is int and 0 <= item <= most and (kind == "count" or item % 100 == 0)
-        if not good:
-            return None
-    return dict(diag)
+    if not all(_diag_good(REPLY_DIAG[key], item) for key, item in diag.items()):
+        return None
+    return {key: list(item) if isinstance(item, list) else item for key, item in diag.items()}
 
 
 def diag_line(diag: dict) -> str:
     """reply_diag's account, with Natter's mapped and lent, as the log says it: in brackets."""
     words = []
+
+    def yes(value) -> str:
+        return "yes" if value else "no"
+
     for key, name in (("visibilityState", "page"), ("rafFired", "frames"), ("mapped", "mapped"), ("lent", "lent"),
                       ("main", "chat"), ("header", "header"), ("footer", "footer"), ("composer", "box")):
         if key in diag:
             value = diag[key]
-            words.append(f"{name} {value}" if isinstance(value, str) else f"{name} {'yes' if value else 'no'}")
+            words.append(f"{name} {value}" if isinstance(value, str) else f"{name} {yes(value)}")
     if "innerWidth" in diag or "innerHeight" in diag:
         words.append(f"size {diag.get('innerWidth', '?')}x{diag.get('innerHeight', '?')}")
     for key, name in (("keys", "keys"), ("chatKeys", "chat keys"), ("rows", "rows")):
@@ -320,6 +372,34 @@ def diag_line(diag: dict) -> str:
             words.append(f"{name} {diag[key]}")
     if "shape" in diag:
         words.append(f"key {diag['shape'] or 'none'}")
+    # The footer: where the box was found, its buttons and its icons (their names' shapes).
+    if "composerAt" in diag:
+        words.append(f"box at {diag['composerAt'] if diag['composerAt'] >= 0 else 'none'}")
+    if "buttons" in diag:
+        words.append(f"buttons {diag['buttons']}")
+    if "icons" in diag:
+        words.append(f"icons ({' '.join(diag['icons']) or 'none'})")
+    for key, name in (("quote", "quote"), ("preview", "preview")):
+        if key in diag:
+            words.append(f"{name} {yes(diag[key])}")
+    # The signs of the chat (bridge.js sameChat), and what the notification carried.
+    for key, name in (("name", "name"), ("navigated", "opened"), ("body", "message"), ("avatar", "picture"),
+                      ("hasBody", "notified body"), ("hasIcon", "notified picture")):
+        if key in diag:
+            words.append(f"{name} {yes(diag[key])}")
+    # Where in the header the name was (which of the bridge's places for it), and whether first there.
+    if "nameAt" in diag:
+        words.append(f"name at {diag['nameAt'] if diag['nameAt'] >= 0 else 'none'}")
+    if "nameFirst" in diag:
+        words.append(f"name first {yes(diag['nameFirst'])}")
+    if "dataType" in diag:
+        words.append(f"data {diag['dataType']}" + (f" ({' '.join(diag['dataKeys'])})" if diag.get("dataKeys") else ""))
+    if "tagShape" in diag:
+        words.append(f"tag {diag['tagShape'] or 'none'}")
+    for key, name in (("mainAttrs", "chat attrs"), ("headerAttrs", "header attrs"), ("keyAttrs", "key attrs"),
+                      ("rowAttrs", "row attrs"), ("values", "values")):
+        if key in diag:
+            words.append(f"{name} ({' '.join(diag[key]) or 'none'})")
     return "[" + ", ".join(words) + "]"
 
 
@@ -336,10 +416,11 @@ class _Reply:
     answered: bool = False
     # The page lent to a reply card while it runs out of sight (app.lend_page, loan.py): what lends
     # it, the loan while it's out, and whether it was lent.
-    lend: Optional[Callable[[], object]] = None
+    lend: Optional[Callable[[bool], object]] = None
     loan: object = None
     lent: bool = False
     layout_timer: int = 0  # waiting for the lent page to be laid out at its size (REPLY_LAYOUT_WAIT)
+    asked: float = 0.0  # when the page's turn came (time.monotonic), before any loan: the page is told how long ago
 
 
 def reload_delay(crashes: list[float]) -> Optional[int]:
@@ -724,9 +805,9 @@ class Account(GObject.Object):
     # One reply is one act of the person's, so one send through WhatsApp's own page, the way
     # their hands would do it (bridge.js reply): never retried, never two at once in a page,
     # never begun while Natter is locked or a call is on. The words go to the page as arguments,
-    # never in a script, and Natter's log has the outcome only (and, when no chat could be checked,
-    # what the page was like: reply_diag): no names, ids or words. Out of sight, the page is lent to
-    # a reply card while it runs (loan.py).
+    # never in a script, and Natter's log has the outcome only (with how the chat was told, or when
+    # it wasn't the one or couldn't be told, what the page was like: reply_diag): no names, ids or
+    # words. Out of sight, the page is lent to a reply card while it runs (loan.py).
 
     @property
     def replying(self) -> int:
@@ -734,15 +815,17 @@ class Account(GObject.Object):
         return self._in_page
 
     def send_reply(self, page_id: int, chat_id: str, text: str, done: Callable[[str], None],
-                   lend: Optional[Callable[[], object]] = None) -> None:
+                   lend: Optional[Callable[[bool], object]] = None) -> None:
         """Send `text` to WhatsApp's chat `chat_id`, the one the page's notification `page_id`
         came from: WhatsApp's handler for that notification opens it (unless it's open already),
-        and only if the chat that opens has that id do the words go into its message box, only
+        and only if the chat that opens is that one (by the id in its messages' keys, or else by
+        its name and another sign, bridge.js sameChat) do the words go into its message box, only
         if the box was empty, and Send is pressed once. `done(result)` later, once, with one of
         REPLY_RESULTS. One at a time in the page, in the order asked; the same words for the same
         chat asked for again while the first is still going are "busy" (one act, one send).
-        `lend()`, as the page is asked, if it's out of sight: lends it to a reply card until the
-        answer (app.lend_page), and gives the loan, or None.
+        `lend(hidden)`, as the page is asked, if it's out of sight (not on screen, its window
+        minimised or suspended, or the page `hidden` all the same): lends it to a reply card until
+        the answer (app.lend_page), and gives the loan, or None.
         """
         job = _Reply(page_id, chat_id, reply_text(text), done, lend=lend)
         refused = self._reply_refusal()
@@ -803,15 +886,35 @@ class Account(GObject.Object):
         self._apply_throttle()
         self.app.reclaimer.stop()  # nothing of the page's goes to swap under it
         job.timer = GLib.timeout_add_seconds(REPLY_GUARD, self._reply_guard, job)
+        job.asked = time.monotonic()
         # Whether the person can see the page, as it was before any loan: a card isn't that.
         visible = self.app.page_seen(self)
-        if job.lend is not None and not self.view.get_mapped():
-            job.loan = job.lend()
-            job.lent = job.loan is not None
         request = {"pageId": job.page_id, "chatId": job.chat_id, "text": job.text, "budgetMs": REPLY_BUDGET_MS,
                    "visible": visible}
-        self._when_laid_out(job, lambda: self.run(REPLY_SCRIPT, {"request": request},
-                                                  lambda value: self._reply_answered(job, value)), REPLY_LAYOUT_WAIT)
+        if job.lend is not None and not out_of_sight(self.view):
+            # On screen to GTK, in a window that isn't minimised: the page may still be hidden to
+            # WebKit (the desktop hid the window some other way), and it says so.
+            self.run(PAGE_HIDDEN_SCRIPT, None, lambda value: self._lend_for(job, request, value == "hidden"))
+        else:
+            self._lend_for(job, request, False)
+
+    def _lend_for(self, job: _Reply, request: dict, hidden: bool) -> None:
+        """The page lent to `job`'s card if it's out of sight, or `hidden` (its visibilityState),
+        then asked to send once it's laid out; never once `job` is answered."""
+        if job.answered:  # the guard came first: never asked now
+            return
+        if hidden:  # nobody sees a page that says it's hidden (as page_seen for a minimised window)
+            request["visible"] = False
+        if job.lend is not None and (hidden or out_of_sight(self.view)):
+            job.loan = job.lend(hidden)
+            job.lent = job.loan is not None
+        self._when_laid_out(job, lambda: self._ask_page(job, request), REPLY_LAYOUT_WAIT)
+
+    def _ask_page(self, job: _Reply, request: dict) -> None:
+        """The page asked to send `job`, told how long ago its turn came (sinceMs): a notification
+        WhatsApp closed since, as the loan had it read the chat, counts as shown (bridge.js reply)."""
+        request["sinceMs"] = max(0, round((time.monotonic() - job.asked) * 1000))
+        self.run(REPLY_SCRIPT, {"request": request}, lambda value: self._reply_answered(job, value))
 
     def _when_laid_out(self, job: _Reply, start: Callable[[], None], left: int) -> bool:
         """`start()` once the page lent for `job` is laid out at its size (REPLY_LAYOUT_WAIT), at
