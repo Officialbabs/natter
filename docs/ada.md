@@ -25,9 +25,10 @@ messages.
 
 Searches are answered from the chat lists Natter Den keeps on disk (`chats.json` per account), not
 from WhatsApp's page, so a search never starts WhatsApp. The provider file says
-`AutoStart=false`: a search only asks a Natter Den that's already running, and never launches one.
-(If something does start it over D-Bus anyway, Natter Den answers from disk and leaves again once
-the searching stops; WhatsApp only starts when a result is opened.)
+`AutoStart=false`, so a desktop that honours it only asks a Natter Den that's already running.
+Natter Den's bus name can still be started over D-Bus: if a search does that, Natter Den answers
+from disk and leaves again 30 s after the last search; WhatsApp only starts when a result is
+opened.
 
 Ada's search (Super, then type) shows these under "Results from apps" since Ada's 22 October
 2026 update; Settings → Keyboard switches it, per app. Opening a result needs one thing from Ada:
@@ -56,9 +57,9 @@ Until then, adding `io.github.Officialbabs.Natter` to `AllowBackground` in
 `~/.config/os-ai/lifecycle.ini` does it (replacing `io.natter.Natter` if it was there:
 `./install.sh` says when it still is, and leaves the file to you).
 
-Natter Den keeps itself light while hidden instead of being paused. It reclaims its own scope's
+Natter Den gives memory back while hidden instead of being paused. It reclaims its own scope's
 cold memory (`memory.reclaim`, 64 MB steps, swappiness=100, down to 800 MB, and no further once 1 GB of it or 60% of the computer's swap is in use), the same thing
-lifecycled does for paused apps, so it ends up about as small while still delivering messages.
+lifecycled does for paused apps, while still delivering messages.
 It only does that where swap is cheap (zram, or zswap enabled), and Ada's launcher scope
 (`app-ada-io.github.Officialbabs.Natter-<pid>.scope`) counts as its own, so it doesn't make
 another.

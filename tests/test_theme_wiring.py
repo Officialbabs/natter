@@ -689,7 +689,7 @@ class PageLookTest(unittest.TestCase):
         self.assertIsNone(fake.preferences)
 
 
-# ---- The ban-safety rules (README: How it works, Themes) --------------------------------------
+# ---- The ban-safety rules (docs/how-it-works.md, Themes) --------------------------------------
 
 
 THEME_CODE = [Account.apply_theme, Natter._start_theme, Natter._apply_theme_window, Natter._apply_theme,
