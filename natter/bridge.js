@@ -252,12 +252,26 @@
     setInterval(rest, IDLE_MS);
   }
 
+  // For Natter's debug info and log (audiosizes.py): what's live, and how much each set and map
+  // the bridge keeps here holds, once the same pruning rest() does has run, so one that grows
+  // without end shows. Counts only: no names, no URLs, nothing of what's in them.
   function audio() {
     const states = [];
-    eachContext((context) => states.push(context.state));
-    return { contexts: states, sources: playingSources(), streams: liveStreams(), media: mediaPlaying(),
-             elements: elements.size, idle: Math.round(performance.now() - lastStart),
-             rtc: window.__natterRtc ? window.__natterRtc.counts() : null };
+    let restedCount = 0;
+    let callCount = 0;
+    eachContext((context) => {
+      states.push(context.state);
+      if (rested.has(context)) restedCount++;
+      if (callContexts.has(context)) callCount++;
+    });
+    const playing = playingSources();
+    const live = liveStreams();
+    const media = mediaPlaying();  // after it, elements holds only what it keeps
+    return { contexts: states, sources: playing, streams: live, media, elements: elements.size,
+             idle: Math.round(performance.now() - lastStart),
+             rtc: window.__natterRtc ? window.__natterRtc.counts() : null,
+             sizes: { contexts: states.length, rested: restedCount, calls: callCount, elements: elements.size,
+                      sources: playing, streams: live, notifications: shown.size } };
   }
 
   // ---- Videos aren't pictures ---------------------------------------------------------------

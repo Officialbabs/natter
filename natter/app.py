@@ -28,12 +28,13 @@ from .account import Account
 from .media import KINDS as MEDIA_KINDS, DesktopMedia
 from .ada import AdaStyle, on_ada
 from .calls import CallWindow, available as calls_available
+from .audiosizes import debug_line as audio_debug_line
 from .distro import os_release
 from .gstfix import debug_line as camera_fix_line
 from .links import chat_link, page_link
 from .launcher import Badge, chat_key, exec_quote, set_menu_chats
-from .memguard import (KILL_MEMORY, OOM_SCORE_ADJ, MiB, MemoryGuard, mem_total, page_ceiling, page_limit,
-                       page_limits, page_sizes)
+from .memguard import (KILL_MEMORY, OOM_SCORE_ADJ, MiB, MemoryGuard, in_flatpak, kill as kill_web_process,
+                       mem_total, page_ceiling, page_limit, page_limits, page_sizes, web_processes)
 from .notify import Notifier, ReplyTarget
 from .reply import LIMIT as REPLY_LIMIT, ReplyWindow, notice as reply_notice, units as reply_units
 from .search import SearchProvider
@@ -329,10 +330,12 @@ def media_debug(kind: str, state: dict, fallback: bool = False) -> str:
     return line + (", turned off for all apps" if state["lockdown"] else "")
 
 
-def debug_info(calls: str, missing: Optional[list[str]], sandboxed: bool, devices: Iterable[str] = ()) -> str:
+def debug_info(calls: str, missing: Optional[list[str]], sandboxed: bool, devices: Iterable[str] = (),
+               audio: Iterable[str] = ()) -> str:
     """The About dialog's troubleshooting text, for bug reports: versions and the desktop, never
     anything from WhatsApp. `missing` is None while the codec check hasn't answered; `devices`
-    are media_debug's lines."""
+    are media_debug's lines, `audio` audiosizes.debug_line's (how much the bridge's audio sets
+    hold: counts only)."""
     def version(library) -> str:
         return f"{library.get_major_version()}.{library.get_minor_version()}.{library.get_micro_version()}"
 
@@ -354,6 +357,7 @@ def debug_info(calls: str, missing: Optional[list[str]], sandboxed: bool, device
         camera_fix_line(),
         f"Codecs for videos and voice messages: {codecs}",
         *devices,
+        *audio,
     ]) + "\n"
 
 
@@ -438,6 +442,107 @@ def start_again(args: list[str]) -> bool:
               flush=True)
         return False
     return True
+
+
+# ---- Quitting (Natter.quit_natter, do_shutdown) -------------------------------------------------
+# WebKit's web processes used to be left to end on their own once Natter had gone: each saw its
+# connection to Natter close and ran its normal exit (C's atexit handlers, C++'s destructors) with
+# its own threads still running. Now and then one crashed there: from 19 to 23 Oct 2026 the
+# kernel logged 19 "WebKitWebProces[…]: segfault at …00000012" in libc.so.6 at b0f97 (malloc's
+# unlink_chunk, a freed block's pointer with its low half overwritten by a 2), each as a Natter
+# ended, and on 20 Oct one hung in its exit until WebKit's watchdog ("WebProcess didn't exit as
+# expected after the UI process connection was closed"). Now Natter ends them before it quits, with
+# WebKit's own terminate, as a fresh page does: a SIGKILL, so no exit runs in them. The pages go
+# first and the sandbox anchor last (its sandbox names theirs, _make_web_context); one still
+# running QUIT_GRACE later (a web process no view has) Natter ends itself, as the memory guard
+# would; and it quits once they're all gone, or after QUIT_WAIT whatever. Nothing is lost:
+# WhatsApp's stored data and cookies are the network process's, which still ends on its own, as
+# before, once Natter has gone.
+QUIT_WAIT = 1.0  # seconds at most
+QUIT_GRACE = 0.25  # seconds WebKit's terminate has before Natter ends what's left itself
+QUIT_LOOK = 10  # ms between looks
+
+
+def process_ended(pid: int, proc: Path = Path("/proc")) -> bool:
+    """Whether process `pid` has ended: gone, or a zombie its parent hasn't reaped yet."""
+    try:
+        stat = (proc / str(pid) / "stat").read_text()
+    except (OSError, ValueError):
+        return True
+    state = stat.rpartition(")")[2].split()[:1]
+    return state in ([], ["Z"], ["X"])
+
+
+def end_pages(accounts: Iterable, anchor, then: Optional[Callable[[], None]] = None, wait: float = QUIT_WAIT,
+              find: Optional[Callable[[], set[int]]] = None, ended: Optional[Callable[[int], bool]] = None,
+              kill: Optional[Callable[[int], bool]] = None, grace: float = QUIT_GRACE) -> None:
+    """End every page's web process (Account.end_page), then the sandbox anchor's (`anchor`, a
+    WebView, or None), and once every web process Natter had is gone, or after `wait` seconds,
+    call `then()`. One still running `grace` seconds in is ended with `kill` (a SIGKILL, only to
+    a web process of Natter's own). Waits with the main loop running; with no `then`, it waits
+    there and then (do_shutdown, when the main loop has stopped). With nothing to end, `then()`
+    runs at once. A page that fails to end doesn't stop the others, nor the quit, and nor does a
+    look at them that fails: `then()` runs all the same."""
+    accounts = list(accounts)
+    if not accounts and anchor is None:
+        if then is not None:
+            then()
+        return
+    if find is None:
+        find = lambda: web_processes(flatpak=in_flatpak())  # noqa: E731
+    if ended is None:
+        ended = process_ended
+    if kill is None:
+        # In Flatpak they aren't Natter's children. Looked at when used, inside the looks' guard.
+        kill = lambda pid: kill_web_process(pid, ancestor=None if in_flatpak() else os.getpid())  # noqa: E731
+    try:
+        running = set(find())  # taken first: the ones to wait for
+    except Exception:
+        traceback.print_exc()
+        running = set()
+    enders = [account.end_page for account in accounts]
+    if anchor is not None:
+        enders.append(anchor.terminate_web_process)  # a no-op once it has none
+    for end in enders:
+        try:
+            end()
+        except Exception:
+            traceback.print_exc()
+    started = time.monotonic()
+    killed: Optional[list[int]] = None  # once tried: those Natter ended itself
+
+    def done() -> bool:
+        nonlocal killed
+        running.difference_update({pid for pid in running if ended(pid)})
+        if not running:
+            return True
+        waited = time.monotonic() - started
+        if waited >= grace and killed is None:
+            killed = [pid for pid in sorted(running) if kill(pid)]
+            if killed:
+                print(f"natter: quitting: ended {len(killed)} of WebKit's web processes itself", flush=True)
+        if waited < wait:
+            return False
+        print(f"natter: quitting with {len(running)} of WebKit's web processes still running", flush=True)
+        return True
+
+    if then is None:
+        while not done():
+            time.sleep(QUIT_LOOK / 1000)
+        return
+
+    def look() -> bool:
+        try:
+            if not done():
+                return GLib.SOURCE_CONTINUE
+        except Exception:
+            # A timer that raises is dropped, and Natter would never quit: quit now instead.
+            traceback.print_exc()
+        then()
+        return GLib.SOURCE_REMOVE
+
+    if look():
+        GLib.timeout_add(QUIT_LOOK, look)
 
 
 class Natter(Adw.Application):
@@ -2604,51 +2709,95 @@ class Natter(Adw.Application):
             calls = "the call window" if self.calls is not None else "the browser"
 
         devices = [media_debug(kind, self.media_state(kind), self.camera_fallback) for kind in ("camera", "microphone")]
+        # How much each page's bridge holds in its audio sets: the last check's sizes at once,
+        # then the page's own answer, asked now.
+        accounts = list(self.accounts)
+        audio = [audio_debug_line(account.audio_sizes.last, index, len(accounts))
+                 for index, account in enumerate(accounts)]
+        codecs = [self._media[0] if self._media else None]
+
+        def show() -> None:
+            about.set_debug_info(debug_info(calls, codecs[0], in_sandbox(), devices, audio))
 
         def checked(missing: list[str], _hint: str) -> None:
-            about.set_debug_info(debug_info(calls, missing, in_sandbox(), devices))
+            codecs[0] = missing
+            show()
 
-        about.set_debug_info(debug_info(calls, self._media[0] if self._media else None, in_sandbox(), devices))
+        def counted(index: int, sizes: Optional[dict]) -> None:
+            audio[index] = audio_debug_line(sizes, index, len(accounts))
+            show()
+
+        show()
+        for index, account in enumerate(accounts):
+            account.audio_sizes.ask(lambda sizes, index=index: counted(index, sizes))
         if self._media is None:
-            self.media(checked)  # the codec check, if it hasn't run yet: it fills in the last line
+            self.media(checked)  # the codec check, if it hasn't run yet: it fills in its line
         about.present(self.window)
 
     def quit_natter(self) -> None:
-        """Quit for real: save what Natter knows and take its notifications and tray icon away."""
+        """Quit for real: save what Natter knows and take its notifications and tray icon away,
+        then end WebKit's web processes and quit once they're gone (end_pages: QUIT_WAIT at most).
+        Whatever fails on the way, the pages still end and it still quits. Asked again meanwhile
+        (Ctrl+Q twice, SIGTERM), it's under way already."""
+        if getattr(self, "_quitting", False):
+            return
         self._quitting = True  # WebKit's processes end now: not a lost network process
-        for account in self.accounts:
-            account.chats.save()
-        self.notifier.withdraw()
-        # Only true of this instance, and one started next could neither take it away nor act on
-        # its Restart: GLib leaves it up when Natter ends.
-        self.withdraw_notification("media-lost")
-        # So do the notices of replies that failed out of sight: their words end with this Natter,
-        # and their Show Reply would find nothing.
-        for window in list(self.replies.values()):
-            if window.told:
-                window.untell()
-        if self.tray:
-            self.tray.close()
-            self.tray = None
-        if self.window:
-            self._write_menu_chats(force=True)
-            if self.window.get_visible():
-                self.window.remember_size()
-        self.reclaimer.stop()
-        self.call_sound.stop()
-        self.audio_follower.stop()
-        if self.memory_guard is not None:
-            self.memory_guard.stop()  # the pages end now: nothing for it to watch
-        if self.ada_style is not None:
-            self.ada_style.close()
-            self.ada_style = None
-        if self.desktop_media is not None:
-            self.desktop_media.close()
-            self.desktop_media = None
-        if self.calls:
-            self.calls.keep_running = False
-            self.calls.stop()
-        self.quit()
+        try:
+            # First, so nothing ends a page under end_pages, nor counts their end as its own.
+            if self.memory_guard is not None:
+                self.memory_guard.stop()  # the pages end now: nothing for it to watch
+            for account in self.accounts:
+                account.chats.save()
+            self.notifier.withdraw()
+            # Only true of this instance, and one started next could neither take it away nor act on
+            # its Restart: GLib leaves it up when Natter ends.
+            self.withdraw_notification("media-lost")
+            # So do the notices of replies that failed out of sight: their words end with this Natter,
+            # and their Show Reply would find nothing.
+            for window in list(self.replies.values()):
+                if window.told:
+                    window.untell()
+            if self.tray:
+                self.tray.close()
+                self.tray = None
+            if self.window:
+                self._write_menu_chats(force=True)
+                if self.window.get_visible():
+                    self.window.remember_size()
+            self.reclaimer.stop()
+            self.call_sound.stop()
+            self.audio_follower.stop()
+            if self.ada_style is not None:
+                self.ada_style.close()
+                self.ada_style = None
+            if self.desktop_media is not None:
+                self.desktop_media.close()
+                self.desktop_media = None
+            if self.calls:
+                self.calls.keep_running = False
+                self.calls.stop()
+        finally:
+            # Last, whatever went before: the pages (their calls' connections first,
+            # Account.end_page), then the anchor, with the main loop running while they end (the
+            # window stays as it was meanwhile), then the quit.
+            self._pages_ended = True
+            try:
+                end_pages(self.accounts, getattr(self, "_sandbox_anchor", None), self.quit)
+            except Exception:
+                traceback.print_exc()
+                self.quit()  # whatever ending the pages ran into: still out
+
+    def do_shutdown(self) -> None:
+        """Every way out ends here, also those that don't go through quit_natter (Ctrl+C in a
+        terminal, a window that couldn't be made): web processes still running end first, as
+        quit_natter ends them, waiting QUIT_WAIT at most. After quit_natter there are none."""
+        self._quitting = True
+        try:
+            if not getattr(self, "_pages_ended", False):
+                self._pages_ended = True
+                end_pages(self.accounts, getattr(self, "_sandbox_anchor", None))
+        finally:
+            Adw.Application.do_shutdown(self)
 
 
 def main(argv: list[str]) -> int:

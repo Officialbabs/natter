@@ -105,8 +105,9 @@ class WarmUp:
 
     def loaded(self, chat_open: bool) -> None:
         """A new page has replaced the old one. With `chat_open` (a chat was open in the old
-        one), Natter may open that chat again in it (Account._reopen_after_load), so this load
-        isn't run under the cover at all."""
+        one), this load isn't run under the cover at all. Natter opens that chat again in it
+        (Account._reopen_when_up), but only once unlocked, never under the cover, so this is
+        caution now rather than a need."""
         self.drawn = False
         self.skip = chat_open
         self.listed = False  # its first chats were listed (the bridge's "chats", with rows)

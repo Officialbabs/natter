@@ -22,7 +22,7 @@ gi.require_version("WebKit", "6.0")
 gi.require_version("JavaScriptCore", "6.0")
 from gi.repository import Gio, GLib, GObject, Gtk, JavaScriptCore, WebKit
 
-from . import NAME, WHATSAPP_URL, rtc, themes
+from . import NAME, WHATSAPP_URL, audiosizes, rtc, themes
 from .links import chat_link, is_whatsapp, page_link, same_site, short_link, unread_in
 from .media import KINDS as MEDIA_KINDS, refusal, refusals
 from .settings import CACHE, DATA, ChatIndex
@@ -394,6 +394,12 @@ class Account(GObject.Object):
         self._blank_reloads: list[float] = []
         self._link: Optional[str] = None  # while a link opens in the page: the chat that was open before
         self._link_timer = 0
+        # The chat that was open when Natter last loaded the page again itself, to open again once
+        # the new page is up (_reopen_after_load, _reopen_when_up); "" for none. And the page that
+        # came up with it still waiting (for the unlock, or a reply's answer), by its loaded_at:
+        # replaced by a page WhatsApp loaded itself, it's dropped (_reopen_waiting).
+        self._reopen = ""
+        self._reopen_up: Optional[float] = None
         # Only the bridge knows this, so messages from anything else in the page (a frame, say) are ignored.
         self._token = secrets.token_hex(16)
         # The theme's style sheet on the page (apply_theme), and what the page last said of its own
@@ -458,6 +464,8 @@ class Account(GObject.Object):
         content.register_script_message_handler("natterRtc", None)
         self._connect(content, "script-message-received::natterRtc", self._on_rtc_message)
         self._codec_log = None if app.calls_in_page else rtc.CodecLog(later=GLib.timeout_add)
+        # The sizes of the bridge's audio sets (bridge.js audio()), for the log and About.
+        self.audio_sizes = audiosizes.Watch(self)
         if app.calls_in_page:
             self.rtc = rtc.Host(self._on_page_call)
             content.register_script_message_handler_with_reply("natterRtcCall", None)
@@ -613,6 +621,8 @@ class Account(GObject.Object):
                 otherwise()
 
     def open_chat(self, name: str, done: Optional[Callable[[bool], None]] = None) -> None:
+        self._reopen = ""  # this chat, not the one open before a reload (_reopen_after_load)
+
         def go() -> None:
             if self._held(go):
                 return
@@ -628,6 +638,7 @@ class Account(GObject.Object):
 
         If the page doesn't have it (it has reloaded since, say), the chat `title` opens instead.
         """
+        self._reopen = ""  # its chat, not the one open before a reload (_reopen_after_load)
         if self._held(lambda: self.click_notification(page_id, title)):
             return
         if page_id < 0:
@@ -817,6 +828,7 @@ class Account(GObject.Object):
         """
         if not (page_link(uri) or chat_link(uri)):
             return False
+        self._reopen = ""  # what it opens, not the chat open before a reload (_reopen_after_load)
         if self._held(lambda: self.open_link(uri)):
             return True
         shown = page_link(uri)
@@ -1011,17 +1023,63 @@ class Account(GObject.Object):
         self._load(self.home)
 
     def _reopen_after_load(self) -> None:
-        """Open the chat that's open now again once the page is back."""
-        chat = self.active_chat
-        if chat:
-            GLib.timeout_add_seconds(1, lambda: self.open_chat(chat) and False)
+        """Natter loads the page again itself (a fresh page, a crash, a page ended for its memory,
+        the network process lost, Reload): remember the chat open now, to open again once the new
+        page is up (_reopen_when_up), however long that takes. With none open now, a chat still
+        waiting from a reload before this one (whose page never came up, or came up locked) keeps
+        waiting, for the page this load brings. Taken here, as the page goes: the new page says at
+        once that it has no chat open."""
+        if self.active_chat:
+            self._reopen = self.active_chat
+        self._reopen_up = None  # a load of Natter's: what waits, waits for the page it brings
+
+    def _reopen_waiting(self) -> str:
+        """The chat waiting to open again (_reopen_after_load), "" for none. None waits any more
+        once the page that came up with it waiting has been replaced by one WhatsApp loaded
+        itself (Natter's own loads take it on, in _reopen_after_load): it never opens after
+        WhatsApp's own reloads."""
+        if self._reopen_up is not None and self._reopen_up != self.loaded_at:
+            self._reopen, self._reopen_up = "", None
+        return self._reopen
+
+    def _reopen_when_up(self) -> None:
+        """WhatsApp's chat list is up (the "ready" message): open the chat that was open when
+        Natter last loaded the page again, if one waits (_reopen_after_load), the window shown or
+        not. Not if a chat is open already: one asked for since (a search, a notification, a
+        link) or opened in the page, which stays. While locked it waits for the unlock, and with a
+        reply in the page for its answer, and then looks again; if WhatsApp loads itself again
+        meanwhile, it's dropped (_reopen_waiting). Once tried, it's done."""
+        chat = self._reopen_waiting()
+        if not chat or self.removed or self.needs_link or not self.ready:
+            return  # nothing waits, or not up (any more): its next "ready" comes back here
+        if self.active_chat:
+            self._reopen = ""
+            return
+        if self.app.locked:
+            # After whatever else waits for the unlock (a notification's chat, say), which may
+            # open a chat of its own.
+            self._reopen_up = self.loaded_at
+            self.app._wait_for_unlock(f"reopen:{self.id}",
+                                      lambda: GLib.idle_add(lambda: self._reopen_when_up() and False))
+            return
+        if self._held(self._reopen_when_up):
+            self._reopen_up = self.loaded_at
+            return
+        self._reopen = ""
+
+        def opened(ok) -> None:
+            print(f"natter: {self.name}: " + ("back on the chat that was open" if ok
+                                               else "the chat that was open didn't open again"), flush=True)
+
+        self.run("return window.__natter ? await window.__natter.openChat(name) : false", {"name": chat}, opened)
 
     def reload(self) -> None:
-        """Load WhatsApp again, also after a crash loop."""
+        """Load WhatsApp again, also after a crash loop, back on the chat that was open."""
         self.failed = None
         self.crashing = self.memory_stopped = False
         self._crashes.clear()
         self._memory_ends.clear()
+        self._reopen_after_load()
         self._load(self.home)
         self.emit("state-changed")
 
@@ -1051,6 +1109,7 @@ class Account(GObject.Object):
     def remove(self, done: Callable[[], None]) -> None:
         """Stop this account for good: its page closes and WebKit forgets the session. Then `done()`."""
         self.removed = True
+        self.audio_sizes.stop()
         for target, handler in self._handlers:
             target.disconnect(handler)
         self._handlers.clear()
@@ -1076,6 +1135,27 @@ class Account(GObject.Object):
             done()
 
         self.session.get_website_data_manager().clear(WebKit.WebsiteDataTypes.ALL, 0, None, cleared)
+
+    def end_page(self) -> None:
+        """Natter quits (app.end_pages): the page's web process ends now, with WebKit's terminate,
+        as for a fresh page, rather than on its own once Natter has gone, which crashed it at
+        times. Its calls' connections close first (their GStreamer pipelines stop with them), and
+        its timers stop, so nothing planned looks at the page or loads it again: the account is
+        done with, for this run (removed: no fresh page, no script run in it). WhatsApp's data
+        stays, with the network process. The process ends whatever fails before it. Called again,
+        it changes nothing."""
+        self.removed = True
+        try:
+            if self._reload_timer:
+                GLib.source_remove(self._reload_timer)
+                self._reload_timer = 0
+            self._watch_page(0, None)
+            self._end_link()
+            if self.rtc:
+                self.rtc.close()
+        finally:
+            self.ready = False
+            self.view.terminate_web_process()  # reported as TERMINATED_BY_API (_on_crash): not a crash
 
     # ---- What the page tells Natter --------------------------------------------------------
 
@@ -1165,6 +1245,8 @@ class Account(GObject.Object):
         elif kind == "active":
             changed = message["name"] != self.active_chat
             self.active_chat = message["name"]
+            if self.active_chat and self.active_chat != self._reopen:
+                self._reopen = ""  # another chat opened since Natter's reload began: it stays
             if self._link is not None and self.active_chat != self._link:
                 self._end_link()  # the link opened its chat in the page
                 self._set_ready(True)
@@ -1174,6 +1256,9 @@ class Account(GObject.Object):
                 self.emit("state-changed")  # the window shows the call button only with a chat open
         elif kind == "ready":
             self._set_ready(message["ready"])
+            if message["ready"]:
+                self.audio_sizes.ready()  # a new page's first check of its audio sets
+                self._reopen_when_up()  # after what waited for it (when_ready): it may open a chat
         elif kind == "state":
             needs_link = message["value"] == "needs-link"
             if needs_link:
@@ -1182,6 +1267,7 @@ class Account(GObject.Object):
                 self.needs_link = needs_link
                 if needs_link:
                     self._drop_pending()
+                    self._reopen = ""  # logged out: no chat of before to go back to
                 self.emit("state-changed")
         elif kind == "call":
             self.emit("call-requested", message["video"])
@@ -1509,6 +1595,9 @@ class Account(GObject.Object):
         return GLib.SOURCE_REMOVE
 
     def _reload_blank(self, what: str) -> None:
+        """The page came back empty or stopped loading (`what`): load it again, a few times. It
+        never came up, so it had no chat open: the chat waiting from Natter's reload before it
+        (_reopen_after_load) waits on for the next page, and after WhatsApp's own reload none does."""
         if self.removed or self.ready or self.needs_link:
             return
         now = time.monotonic()
@@ -1539,6 +1628,9 @@ class Account(GObject.Object):
             self.rtc.close()
         if reason == WebKit.WebProcessTerminationReason.TERMINATED_BY_API or self.removed:
             return
+        # Whatever loads it next (a reload after a second or a backoff, or Try Again after a crash
+        # loop) opens the chat that was open again.
+        self._reopen_after_load()
         if reason == WebKit.WebProcessTerminationReason.EXCEEDED_MEMORY_LIMIT:
             self._on_memory_ended("WebKit")
             return
@@ -1589,7 +1681,6 @@ class Account(GObject.Object):
         else:
             print(f"natter: {self.name}'s page was ended for its memory ({by}); a fresh page", flush=True)
             self.fresh_at = now
-            self._reopen_after_load()
             self._reload_timer = GLib.timeout_add_seconds(1, self._reload_after_crash)
             self.reloading = True
         self.emit("state-changed")

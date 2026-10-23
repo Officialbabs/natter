@@ -89,6 +89,7 @@ def fake_app(test):
     # The microphone and camera, as About's debug info reads them (media_state): nothing known.
     fake.desktop_media, fake.media_lost, fake.microphone_present, fake.camera_fallback = None, False, None, False
     fake.media_state = lambda kind: Natter.media_state(fake, kind)
+    fake.accounts = []  # none: About's debug info has no audio sets to ask for (test_audio_sizes)
     return fake
 
 

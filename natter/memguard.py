@@ -379,8 +379,13 @@ class MemoryGuard:
             print(f"natter: memory: a page may hold {soft >> 20} MB, {hard >> 20} MB holding still; in a call "
                   f"{call_soft >> 20} MB, {call_hard >> 20} MB holding still", flush=True)
 
-    def stop(self) -> None:
+    def stop(self, wait: float = 0.25) -> None:
+        """Stop looking: back once the thread has stopped (it may be partway through a look, and
+        ending a page), or after `wait` seconds."""
         self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread() and wait > 0:
+            thread.join(wait)
 
     def _run(self, stop: threading.Event) -> None:
         while not stop.wait(self.poll):
