@@ -120,10 +120,12 @@ class HeldWhileLockedTest(unittest.TestCase):
     def test_present_window_gives_the_token_first(self):
         done = []
         fake = SimpleNamespace(window=SimpleNamespace(set_startup_id=lambda token: done.append(token),
+                                                      give_back_shown=lambda: done.append("back"),
                                                       present=lambda: done.append("present")))
         self.assertTrue(Natter.present_window(fake, "token-1"))
         self.assertTrue(Natter.present_window(fake))
-        self.assertEqual(done, ["token-1", "present", "present"])
+        # The page it shows back in it first, if lent to a reply card (loan.py): never an empty page on show.
+        self.assertEqual(done, ["token-1", "back", "present", "back", "present"])
 
     def test_a_wrong_passcode_runs_nothing(self):
         fake = fake_app(self)

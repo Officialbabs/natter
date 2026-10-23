@@ -854,6 +854,10 @@
   const LINE_WAIT_MS = 2000;  // for each line to land in the box
   const SEND_WAIT_MS = 5000;  // for WhatsApp's Send button, which turns up a timer tick after the words
   const SENT_WAIT_MS = 10000;  // for the box to empty once Send is pressed
+  const FRAME_WAIT_MS = 300;  // for an animation frame, in what Natter's log is told (diagnose)
+  // Kept back from a wait for a chat's messages, for what comes after it: the draft put back, a
+  // line typed, the Send button. Less than that left once the chat is checked, and nothing is typed.
+  const TYPE_RESERVE_MS = DRAFT_WAIT_MS + LINE_WAIT_MS + SEND_WAIT_MS;
   // WhatsApp's own swap of a text emoticon just before the caret for an emoji ("Replace text
   // with emoji"); the thumbs up and down in the skin tone the person picked.
   const EMOTICONS = [["(y)", "\u{1F44D}"], ["(Y)", "\u{1F44D}"], ["(n)", "\u{1F44E}"], ["(N)", "\u{1F44E}"],
@@ -959,6 +963,45 @@
   function isChat(main, chat) {
     const ids = chatIds(main);
     return ids.has(chat) && (!chat.endsWith("@g.us") || ids.size === 1);
+  }
+
+  // Whether the open chat shows no message keys yet: WhatsApp has opened it and is still drawing
+  // its messages (or loading those around the one notified, which can take seconds).
+  function keyless() {
+    const main = find("main");
+    return Boolean(main) && !chatIds(main).size;
+  }
+
+  // What Natter's log may say of the page when a reply found no chat to check (account.py
+  // reply_diag): whether WhatsApp is drawing it at all, and what the open chat holds, by counts and
+  // the shape of its first message key (each run of digits as 9, of letters as a, of anything else
+  // as ?). Never a name, words, an id or their lengths.
+  function diagnose() {
+    const main = find("main");
+    const rows = main ? [...main.querySelectorAll(WHERE["msg-key"].join(", "))] : [];
+    const keys = rows.map((row) => row.getAttribute("data-id") || "");
+    const count = (n) => Math.min(n, 999);
+    const size = (n) => (Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n / 100) * 100, 9900) : 0);
+    const shape = (key) => key.slice(0, 40).replace(/[0-9]+/g, "9").replace(/[A-Za-z]+/g, "a")
+      .replace(/[^9a_@.:-]+/g, "?");
+    const facts = {
+      visibilityState: document.visibilityState, innerWidth: size(innerWidth), innerHeight: size(innerHeight),
+      main: Boolean(main), header: Boolean(main && find("header")), footer: Boolean(main && find("footer", main)),
+      composer: Boolean(main && composerIn(main)), keys: count(keys.length),
+      chatKeys: count(keys.filter((key) => /^(true|false)_/.test(key)).length),
+      rows: count(main ? main.querySelectorAll('[role="row"]').length : 0), shape: keys.length ? shape(keys[0]) : "",
+    };
+    // Whether WebKit draws the page: an animation frame raced against a timer.
+    return new Promise((resolve) => {
+      let over = false;
+      const finish = (fired) => {
+        if (over) return;
+        over = true;
+        resolve({ ...facts, rafFired: fired });
+      };
+      requestAnimationFrame(() => finish(true));
+      setTimeout(() => finish(false), FRAME_WAIT_MS);
+    });
   }
 
   // The keys of the person's own messages in `main`, for seeing one more turn up.
@@ -1095,19 +1138,23 @@
 
   // One at a time, in the order asked. `request`: {pageId, chatId, text, budgetMs, visible}.
   // Its budget runs from now, waiting included: Send is never pressed after it. The answer is
-  // one of those above; why (for Natter's log, never with names or words) goes on request.why.
+  // one of those above; why (for Natter's log, never with names or words) goes on request.why,
+  // and what the page was like when no chat could be checked (diagnose) on request.diag.
   function reply(request) {
     const { pageId, chatId, text, budgetMs, visible } = request && typeof request === "object" ? request : {};
     const budget = Number.isFinite(budgetMs) ? Math.min(Math.max(budgetMs, 0), 60000) : 0;
     const deadline = performance.now() + budget;
+    const progress = { stage: "", diag: null };
     const tell = ([answer, why]) => {
-      try { request.why = why || ""; } catch (_) { /* a frozen request: no reason told */ }
+      try {
+        request.why = why || "";
+        request.diag = progress.diag;
+      } catch (_) { /* a frozen request: no reason told */ }
       return answer;
     };
     const key = JSON.stringify([chatId, text]);
     if (replying.has(key)) return Promise.resolve(tell(["busy", "repeat"]));
     replying.add(key);
-    const progress = { stage: "" };
     const run = () => replyOnce(pageId, chatId, text, deadline, Boolean(visible), progress)
       // A mistake of Natter's own: said for what may be in WhatsApp by then.
       .catch(() => [{ "": "busy", typed: "left-as-draft", pressed: "unsure" }[progress.stage], "exception"])
@@ -1152,10 +1199,20 @@
       if (open && footerInUse(open, visible)) return ["busy", "open-chat"];
       clickNotification(pageId);  // WhatsApp's own handler: it opens the chat by its id
       main = await until(there, Math.min(CHAT_WAIT_MS, left()));
+      if (!main && keyless()) {
+        // A chat open with no messages keyed yet: WhatsApp may still be loading them, those around
+        // the notified one when it isn't the chat's latest. Waited for, within the budget, less
+        // the time the rest takes.
+        await until(() => !keyless(), Math.max(0, left() - TYPE_RESERVE_MS));
+        main = there();
+        if (main && left() < DRAFT_WAIT_MS + SEND_WAIT_MS) return ["busy", "late"];
+      }
       if (!main) {
         const open = find("main");
-        if (!open) return [left() ? "gone" : "not-ready", "click"];
-        return ["mismatch", chatIds(open).size ? "other-chat" : "no-ids"];
+        if (open && chatIds(open).size) return ["mismatch", "other-chat"];
+        const answer = open ? ["mismatch", "no-ids"] : [left() ? "gone" : "not-ready", "click"];
+        progress.diag = await diagnose();
+        return answer;
       }
       await quiet(main, DRAFT_QUIET_MS, Math.min(DRAFT_WAIT_MS, left()));
       if (there() !== main) return ["mismatch", "moved"];

@@ -15,7 +15,9 @@ nothing is sent again by itself, and an answer that leaves it unclear whether Wh
 ends that reply for good (its words stay on show to read, and the field is for a new one).
 
 It isn't a dialog of the main window: replying shouldn't bring that window forward (it's usually
-hidden in the tray), and the lock closes every dialog.
+hidden in the tray), and the lock closes every dialog. With that window out of sight, WhatsApp's
+page is lent to the card that sends (loan.py) until the answer, so the card stays up meanwhile
+unless it's closed.
 """
 
 from __future__ import annotations
@@ -201,6 +203,9 @@ class ReplyWindow(Adw.Window):
         self._too_long = False  # said once when the reply grows too long, not at every key
         self._closing = 0  # the timer that destroys it once it has gone, sent
         self._refocus = False  # the field gave up the focus for a send, to have it back after
+        self.holding = None  # WhatsApp's page while it's lent here (loan.PageLoan), for any reply
+        self._hide_when_back = False  # sent, and out of sight once the page it holds goes back
+        self._inline_draft = ""  # words kept for the chat while it shows KDE's (show_inline)
         self.action = ""  # what the problem's line offers (ACTIONS), while it's on show
         style = Adw.StyleManager.get_default()
         self._contrast = style.connect("notify::high-contrast", lambda *_: self._show_contrast())
@@ -325,7 +330,10 @@ class ReplyWindow(Adw.Window):
         content.append(Gtk.WindowHandle(child=top))
         content.append(messages)
         content.append(bottom)
-        self.set_content(content)
+        # While a reply runs with Natter's window out of sight, WhatsApp's page is lent to the card
+        # that sends it (loan.py), unseen, in this overlay: it doesn't count towards the card's size.
+        self.page_slot = Gtk.Overlay(child=content)
+        self.set_content(self.page_slot)
 
         # Escape after the input method has had its say (it cancels what's being composed first).
         shortcuts = Gtk.ShortcutController()
@@ -611,7 +619,30 @@ class ReplyWindow(Adw.Window):
         self.outcome = None
         self._show_state()
         self.announce("Sending reply", Gtk.AccessibleAnnouncementPriority.MEDIUM)
-        self.app.send_reply(self.target, text, self._answered)
+        # This window holds WhatsApp's page while it's sent, should nobody see it (app.lend_page).
+        self.app.send_reply(self.target, text, self._answered, lambda: self)
+
+    def show_inline(self, text: str) -> None:
+        """Words typed in KDE's reply field, being sent with no card of their own (app._send_inline):
+        on show here as this card's own send, so the card can hold WhatsApp's page meanwhile. Its
+        answer comes through inline_answered, and it goes on as for Send. Words kept for the chat
+        (in the field as it came up) are put aside until then (inline_answered)."""
+        self._inline_draft = self._text()
+        self.buffer.set_text(text)
+        self.sending = True
+        self.outcome = None
+        self._show_state()
+
+    def inline_answered(self, result: str) -> None:
+        """show_inline's words answered. The words kept for the chat go back in the field if the
+        card stays up, or are kept for its next one as before it came up, if it goes (sent)."""
+        draft, self._inline_draft = self._inline_draft, ""
+        if draft.strip() and (result != "sent" or self.queued):
+            self.queued.insert(0, (draft, None))  # first in the field once it has answered
+            draft = ""
+        self._answered(result)
+        if draft.strip():
+            self.app.reply_drafts[self.key] = draft  # after _sent, which drops the chat's
 
     def _answered(self, result: str) -> None:
         if not self.sending:
@@ -647,8 +678,23 @@ class ReplyWindow(Adw.Window):
         # has asked about what was said (SENT_HEARD).
         self.announce("Reply sent", Gtk.AccessibleAnnouncementPriority.MEDIUM)
         self._unregister()
+        if self.holding is not None:
+            # It holds WhatsApp's page for another reply to the chat (from KDE's field, app.lend_page):
+            # hidden, the page would go out of sight under it. Gone once that's given back.
+            self._hide_when_back = True
+            return
         self.set_visible(False)
         self._closing = GLib.timeout_add(SENT_HEARD, self._close_after_sent)
+
+    def loan_ended(self) -> None:
+        """The page lent here is back in its place (loan.PageLoan.give_back)."""
+        if not self._hide_when_back:
+            return
+        self._hide_when_back = False
+        if self.get_visible():  # not closed meanwhile (which destroys it)
+            self.set_visible(False)
+            if not self._closing:
+                self._closing = GLib.timeout_add(SENT_HEARD, self._close_after_sent)
 
     def _close_after_sent(self) -> bool:
         self._closing = 0

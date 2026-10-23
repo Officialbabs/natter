@@ -1141,6 +1141,9 @@ class Natter(Adw.Application):
             return False
         if token:
             self.window.set_startup_id(token)
+        # The page it shows back before it's on screen: never an empty page in it. Another account's
+        # stays with its reply until that tab is shown (Window.give_back_shown).
+        self.window.give_back_shown()
         self.window.present()
         return True
 
@@ -1168,6 +1171,7 @@ class Natter(Adw.Application):
         self.locked = True
         self.settings["locked"] = True  # still locked after quitting and starting again
         if self.window:
+            self.window.give_back_pages()  # under the lock, not in a reply card
             self.window.show_lock(True)
         for window in list(self.replies.values()):
             if window.close_for_lock():
@@ -1674,8 +1678,32 @@ class Natter(Adw.Application):
 
     def _send_inline(self, target: ReplyTarget, text: str) -> None:
         """Send what was typed in KDE's reply field, with no window. If it isn't sent, the reply
-        window shows why, with the words: to send again, or to read if WhatsApp may have them."""
+        window shows why, with the words: to send again, or to read if WhatsApp may have them.
+        With WhatsApp's page out of sight, the reply window comes up anyway while it's sent, to
+        hold the page (lend_page), and goes on as it does after Send."""
+        key = (target.account, target.chat)
+        hosting: list[ReplyWindow] = []  # the window that came up for it
+
+        def host() -> Optional[ReplyWindow]:
+            window = self.replies.get(key)
+            if window is None:
+                window = self._reply_window(target)
+                window.show_inline(text)
+                hosting.append(window)
+                # Shown, not presented: it asks for no focus, and takes none if the desktop agrees.
+                window.set_visible(True)
+            elif not window.get_visible() and not window.sending:
+                # One out of sight with a reply that failed (its notice up), since these words were
+                # asked for: on show again, as its notice's Show Reply would show it, to hold the
+                # page. It shows this answer as it would with no page to hold.
+                window.untell()
+                window.set_visible(True)
+            return window
+
         def answered(result: str) -> None:
+            if hosting and hosting[0].sending and self.replies.get(key) is hosting[0]:
+                hosting[0].inline_answered(result)
+                return
             if result in ("sent", "removed"):
                 return
             window = self._reply_window(target)
@@ -1687,7 +1715,7 @@ class Natter(Adw.Application):
             else:
                 window.present_again()
 
-        self.send_reply(target, text, answered)
+        self.send_reply(target, text, answered, host)
 
     def _reply_window(self, target: ReplyTarget) -> ReplyWindow:
         """The chat's reply window, made if it has none (not shown yet)."""
@@ -1718,10 +1746,12 @@ class Natter(Adw.Application):
         window.untell()
         window.present_again()
 
-    def send_reply(self, target: ReplyTarget, text: str, done: Callable[[str], None]) -> None:
+    def send_reply(self, target: ReplyTarget, text: str, done: Callable[[str], None],
+                   host: Optional[Callable[[], Optional[ReplyWindow]]] = None) -> None:
         """Send `text` to the chat, through WhatsApp's page (Account.send_reply), and `done(result)`
         with its answer (reply.OUTCOMES). Never started while locked. Logged by the answer alone
-        (the page's by Account): never who to, or what."""
+        (the page's by Account): never who to, or what. `host()`: the reply window that holds the
+        page while it's sent, should nobody see it then (lend_page)."""
         # The message it answers, now: a reply window moves its target on to newer messages.
         page_id = target.page_id
 
@@ -1745,7 +1775,25 @@ class Natter(Adw.Application):
         elif reply_units(text) > REPLY_LIMIT:
             refused("too-long")
         else:
-            account.send_reply(page_id, target.chat, text, answered)
+            account.send_reply(page_id, target.chat, text, answered,
+                               lend=(lambda: self.lend_page(account, host)) if host is not None else None)
+
+    def lend_page(self, account: Account, host: Callable[[], Optional[ReplyWindow]]):
+        """`account`'s page, lent to the reply window `host()` for as long as a reply runs in it
+        with nobody seeing the page (loan.py): WhatsApp draws a chat only while its page is on
+        screen. Never while locked or quitting, or with the page on screen. (A call in that page
+        refuses the reply before it gets here, Account._reply_refusal; one in another account's page
+        isn't touched by it.) The loan, or None."""
+        if self.window is None or self.locked or getattr(self, "_quitting", False) or account.view.get_mapped():
+            return None
+        card = host()
+        if card is None or not card.get_mapped():
+            return None
+        return self.window.lend_page(account, card)
+
+    def page_seen(self, account: Account) -> bool:
+        """Whether the person can see `account`'s page: the window is up, on that account."""
+        return bool(self.window is not None and self.window.get_visible() and self.window.account is account)
 
     def reply_failed(self, window: ReplyWindow, result: str) -> None:
         """A reply that failed out of sight (its window closed meanwhile, or Natter locked): a
@@ -2750,6 +2798,8 @@ class Natter(Adw.Application):
             return
         self._quitting = True  # WebKit's processes end now: not a lost network process
         try:
+            if self.window:
+                self.window.give_back_pages()  # each page in its own place as it ends
             # First, so nothing ends a page under end_pages, nor counts their end as its own.
             if self.memory_guard is not None:
                 self.memory_guard.stop()  # the pages end now: nothing for it to watch

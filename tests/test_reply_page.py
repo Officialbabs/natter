@@ -7,6 +7,7 @@ a page: its rules, and its text comparison run in JavaScriptCore, and what it ta
 WhatsApp's drawers run there on the mock page's own markup."""
 
 import contextlib
+import inspect
 import io
 import json
 import re
@@ -25,8 +26,8 @@ from gi.repository import JavaScriptCore
 
 from natter import account as natter_account
 from natter.account import (BRIDGE, CHAT_ID, PAGE_REPLY_RESULTS, REPLY_BUDGET_MS, REPLY_GUARD, REPLY_LET_GO,
-                            REPLY_LIMIT, REPLY_QUEUE_WAIT, REPLY_RESULTS, REPLY_SCRIPT, Account, reply_answer,
-                            reply_length, reply_text)
+                            REPLY_LIMIT, REPLY_QUEUE_WAIT, REPLY_RESULTS, REPLY_SCRIPT, Account, diag_line,
+                            reply_answer, reply_diag, reply_length, reply_text)
 
 GOOD = "4917612345678@c.us"
 OTHER = "120363041234567890@g.us"
@@ -111,8 +112,9 @@ class Page:
     replying = Account.replying
 
     def __init__(self):
-        self.app = SimpleNamespace(locked=False, reclaimer=SimpleNamespace(stops=0))
+        self.app = SimpleNamespace(locked=False, reclaimer=SimpleNamespace(stops=0), seen=False)
         self.app.reclaimer.stop = lambda: setattr(self.app.reclaimer, "stops", self.app.reclaimer.stops + 1)
+        self.app.page_seen = lambda account: self.app.seen
         self.view, self.rtc, self.in_call, self.trusted = View(), None, False, True
         self.removed = self.needs_link = self.crashing = False
         self.ready = True
@@ -143,6 +145,21 @@ class Page:
         """The page answers one of its calls."""
         body, args, done = self.runs[index]
         done(value)
+
+
+class Loan:
+    """A page lent to a reply card (loan.PageLoan), as Account sees it: given back how often, and
+    whether GTK has laid it out at its size yet."""
+
+    def __init__(self, laid_out=True):
+        self.returns, self.lent, self.ready = 0, True, laid_out
+
+    def laid_out(self):
+        return self.ready
+
+    def give_back(self):
+        self.returns += 1
+        self.lent = False
 
 
 def sent(why=""):
@@ -265,7 +282,7 @@ class ReplyTest(unittest.TestCase):
 
     def test_the_words_go_as_arguments(self):
         page = Page()
-        page.view.mapped = True
+        page.app.seen = True
         self.reply(page, text='"); alert(1); ("')
         body, args, _done = self.replies(page)[0]
         self.assertEqual(body, REPLY_SCRIPT)
@@ -415,6 +432,186 @@ class ReplyTest(unittest.TestCase):
         self.clock.flush()
         self.assertEqual(self.log.getvalue(), "natter: reply: mismatch (no-ids)\n")
         self.assertNotIn(GOOD, self.log.getvalue())
+
+    # ---- The page lent to a reply card while out of sight (loan.py) -----------------------------
+
+    def lent_reply(self, page, mapped=False, laid_out=True):
+        """A reply with a lend() that lends: (its results, the loans made)."""
+        loans = []
+
+        def lend():
+            loans.append(Loan(laid_out))
+            return loans[-1]
+        page.view.mapped = mapped
+        results = []
+        page.send_reply(7, GOOD, "On my way", results.append, lend=lend)
+        return results, loans
+
+    def test_lent_while_it_runs_out_of_sight(self):
+        page = Page()
+        results, (loan,) = self.lent_reply(page)
+        self.assertEqual(loan.returns, 0)
+        page.answer(sent())
+        self.assertEqual(loan.returns, 1)  # back with the answer, before it's told
+        self.clock.flush()
+        self.assertEqual(results, ["sent"])
+        page._give_back(page._reply)  # nothing more to give back
+        self.assertEqual(loan.returns, 1)
+
+    def test_a_page_never_laid_out_is_asked_once_it_is(self):
+        # Lent before GTK has laid it out (Natter started hidden): WebKit has the card's size until
+        # then, and WhatsApp would open the chat in a page that small.
+        tick = natter_account.REPLY_LAYOUT_TICK / 1000
+        page = Page()
+        results, (loan,) = self.lent_reply(page, laid_out=False)
+        self.assertEqual(self.replies(page), [])
+        self.clock.fire(tick)
+        self.assertEqual(self.replies(page), [])
+        loan.ready = True
+        self.clock.fire(tick)
+        self.assertEqual(len(self.replies(page)), 1)
+        page.answer(sent())
+        self.clock.flush()
+        self.assertEqual(results, ["sent"])
+
+    def test_the_wait_for_a_layout_is_short(self):
+        tick = natter_account.REPLY_LAYOUT_TICK / 1000
+        page = Page()
+        _results, (loan,) = self.lent_reply(page, laid_out=False)
+        for _ in range(natter_account.REPLY_LAYOUT_WAIT // natter_account.REPLY_LAYOUT_TICK - 1):
+            self.clock.fire(tick)
+        self.assertEqual(self.replies(page), [])
+        self.clock.fire(tick)
+        self.assertEqual(len(self.replies(page)), 1)  # asked anyway
+        self.assertLessEqual(natter_account.REPLY_LAYOUT_WAIT, 2000)  # a frame or two, but for a slow display
+        page = Page()
+        _results, (loan,) = self.lent_reply(page, laid_out=False)
+        loan.give_back()  # the card closed meanwhile: asked as it is
+        self.clock.fire(tick)
+        self.assertEqual(len(self.replies(page)), 1)
+
+    def test_never_asked_once_answered_or_gone_while_it_waits_for_a_layout(self):
+        tick = natter_account.REPLY_LAYOUT_TICK / 1000
+        page = Page()
+        results, (loan,) = self.lent_reply(page, laid_out=False)
+        page._answer(page._reply, "unknown")
+        self.assertEqual((loan.returns, page._reply.layout_timer), (1, 0))
+        self.clock.fire(tick)
+        self.assertEqual(self.replies(page), [])
+        page = Page()
+        results, (loan,) = self.lent_reply(page, laid_out=False)
+        page.removed = True
+        self.clock.fire(tick)
+        self.clock.flush()
+        self.assertEqual((self.replies(page), results, page.replying), ([], ["removed"], 0))
+
+    def test_never_lent_when_it_can_be_seen_or_isnt_asked(self):
+        page = Page()
+        _results, loans = self.lent_reply(page, mapped=True)
+        self.assertEqual(loans, [])
+        page.answer(sent())
+        page = Page()
+        page.send_reply(7, GOOD, "On my way", [].append)  # no card to lend it to
+        self.assertEqual(len(self.replies(page)), 1)
+
+    def test_never_lent_for_what_never_reaches_the_page(self):
+        for setup in (lambda page: setattr(page.app, "locked", True), lambda page: setattr(page, "in_call", True),
+                      lambda page: setattr(page, "trusted", False)):
+            page = Page()
+            setup(page)
+            results, loans = self.lent_reply(page)
+            self.clock.flush()
+            self.assertEqual((len(results), loans), (1, []))
+
+    def test_back_at_the_guard_and_after(self):
+        page = Page()
+        results, (loan,) = self.lent_reply(page)
+        self.clock.fire(REPLY_GUARD)
+        self.assertEqual(loan.returns, 1)  # "unknown" said: back now, while the page may still go on
+        self.clock.fire(REPLY_LET_GO - REPLY_GUARD)
+        page.answer(sent())
+        self.clock.flush()
+        self.assertEqual((results, loan.returns), (["unknown"], 1))
+
+    def test_back_whatever_the_answer(self):
+        answers = [{"result": result} for result in sorted(PAGE_REPLY_RESULTS)]
+        for value in [None, {"result": "mismatch", "why": "no-ids"}] + answers:
+            page = Page()
+            _results, (loan,) = self.lent_reply(page)
+            page.answer(value)
+            self.assertEqual(loan.returns, 1, value)
+
+    def test_back_when_the_page_ends(self):
+        page = Page()
+        _results, (loan,) = self.lent_reply(page)
+        page._give_back(page._reply)  # as Account.remove does (a crash or a new load: the loan's own watch)
+        self.assertEqual(loan.returns, 1)
+        self.assertIn("self._give_back(self._reply)", inspect.getsource(Account.remove))
+
+    def test_visible_is_seen_not_mapped(self):
+        # Mapped in a card isn't seen, nor mapped in a window showing another account's tab: the
+        # page says what the person can see, as it was before any loan.
+        page = Page()
+        page.view.mapped = True
+        self.reply(page)
+        self.assertIs(self.replies(page)[0][1]["request"]["visible"], False)
+        page = Page()
+        page.app.page_seen = lambda account: page.view.mapped  # as if mapped were seen
+        page.send_reply(7, GOOD, "On my way", [].append, lend=lambda: (setattr(page.view, "mapped", True), Loan())[1])
+        self.assertTrue(page.view.mapped)  # in the card
+        self.assertIs(self.replies(page)[0][1]["request"]["visible"], False)  # as it was before
+        page = Page()
+        page.app.seen = True
+        self.reply(page)
+        self.assertIs(self.replies(page)[0][1]["request"]["visible"], True)
+
+    # ---- What the log may say of the page ------------------------------------------------------
+
+    DIAG = {"visibilityState": "hidden", "rafFired": False, "innerWidth": 1000, "innerHeight": 700, "main": True,
+            "header": True, "footer": True, "composer": True, "keys": 0, "chatKeys": 0, "rows": 0, "shape": ""}
+
+    def test_the_diag_is_logged_on_the_same_line(self):
+        page = Page()
+        _results, (loan,) = self.lent_reply(page)
+        page.answer({"result": "mismatch", "why": "no-ids", "diag": self.DIAG})
+        self.clock.flush()
+        self.assertEqual(self.log.getvalue(),
+                         "natter: reply: mismatch (no-ids) [page hidden, frames no, mapped no, lent yes, chat yes, "
+                         "header yes, footer yes, box yes, size 1000x700, keys 0, chat keys 0, rows 0, key none]\n")
+
+    def test_an_odd_diag_is_left_out(self):
+        page = Page()
+        self.reply(page, text="Secret words")
+        page.answer({"result": "gone", "why": "click", "diag": dict(self.DIAG, shape="Mum")})
+        self.clock.flush()
+        self.assertEqual(self.log.getvalue(), "natter: reply: gone (click)\n")
+
+    def test_the_diag_takes_only_what_it_knows(self):
+        good = dict(self.DIAG, shape="a_9@a.a_9a9a", keys=999, innerWidth=9900, innerHeight=0)
+        self.assertEqual(reply_diag({"diag": good}), good)
+        self.assertEqual(reply_diag({"diag": {"keys": 3}}), {"keys": 3})
+        for value in (None, [], "diag", {}, {"diag": None}, {"diag": []}, {"diag": {}}):
+            self.assertIsNone(reply_diag(value), value)
+        refused = [
+            {"name": "Mum"}, {"title": "Work Team"}, {"text": "On my way"}, {"chat": GOOD},  # unknown fields
+            {"shape": "Mum"}, {"shape": "on my way"}, {"shape": GOOD}, {"shape": "false_" + GOOD},
+            {"shape": "true_4917612345678@c.us_3EB0"}, {"shape": "a" * 41}, {"shape": 9},
+            {"visibilityState": "Mum"}, {"visibilityState": True},
+            {"rafFired": "yes"}, {"rafFired": 1}, {"main": None},
+            {"keys": True}, {"keys": -1}, {"keys": 1000}, {"keys": 2.0}, {"keys": "3"},
+            {"innerWidth": 1024}, {"innerWidth": 10000}, {"innerHeight": -100},
+        ]
+        for diag in refused:
+            self.assertIsNone(reply_diag({"diag": dict(self.DIAG, **diag)}), diag)
+
+    def test_the_diag_line_says_no_names(self):
+        line = diag_line(dict(self.DIAG, shape="aaaaa_99999@a.aa_9aa9", mapped=True, lent=False))
+        self.assertTrue(line.startswith("[page hidden, frames no, mapped yes, lent no, "), line)
+        self.assertTrue(line.endswith("key aaaaa_99999@a.aa_9aa9]"), line)
+
+    def test_the_script_hands_the_diag_back(self):
+        self.assertIn("diag: request.diag || null", REPLY_SCRIPT)
+        self.assertIn("request.diag = progress.diag;", SECTION)
 
     # ---- Nothing else acts on the page meanwhile ---------------------------------------------
 
@@ -943,6 +1140,202 @@ class DrawerTest(unittest.TestCase):
                                 ('[data-testid="drawer-left"] > span', 0)):
             self.assertEqual(self.run_js(f"document.querySelectorAll({json.dumps(selector)}).length").to_int32(),
                              count, selector)
+
+
+# The page's clock, timers and observers for a whole reply run in JavaScriptCore: time moves only
+# when the test says (step), each timer runs in a turn of its own with its promises after it, an
+# animation frame comes only while frames are on (a page WebKit draws), and the observers hear of
+# a change when the test says the page changed (mutate).
+FAKE_RUNTIME = r"""
+let now = 0, nextTimer = 1, frames = false, clicked = 0;
+const timers = [];
+const performance = { now: () => now };
+function setTimeout(run, ms) {
+  const id = nextTimer++;
+  timers.push({ id, at: now + Math.max(0, ms || 0), run });
+  return id;
+}
+function clearTimeout(id) { const i = timers.findIndex((timer) => timer.id === id); if (i >= 0) timers.splice(i, 1); }
+function requestAnimationFrame(run) { if (frames) setTimeout(run, 16); return 1; }
+const observers = new Set();
+class MutationObserver {
+  constructor(callback) { this.callback = callback; }
+  observe() { observers.add(this); }
+  disconnect() { observers.delete(this); }
+}
+function mutate() { [...observers].forEach((observer) => observer.callback([])); }
+// The next timer due by `until` ms, or the clock moved on to it: true while there was one.
+function step(until) {
+  timers.sort((a, b) => a.at - b.at || a.id - b.id);
+  const next = timers[0];
+  if (!next || next.at > until) { now = Math.max(now, until); return false; }
+  timers.shift();
+  now = Math.max(now, next.at);
+  next.run();
+  return true;
+}
+const shown = new Map();
+function clickNotification(id) { clicked++; }
+function calling() { return false; }
+function liveStreams() { return false; }
+const innerWidth = 1000, innerHeight = 700;
+// A message row as WhatsApp's: the row, and its key on the div in it.
+function addRow(key) {
+  add(find("main").querySelector("#messages"), [{ tag: "div", attrs: { role: "row" },
+    children: [{ tag: "div", attrs: { "data-id": key }, children: [{ text: "words" }] }] }]);
+  mutate();
+}
+let answer = null, asked = null, answeredAt = null;
+function ask(chat, budget) {
+  asked = { pageId: 7, chatId: chat, text: "On my way", budgetMs: budget, visible: false };
+  shown.set(7, { tag: chat });
+  reply(asked).then((result) => { answer = result; answeredAt = now; });
+}
+"""
+
+
+class ReplyWaitTest(unittest.TestCase):
+    """The bridge's reply run as it is, from WhatsApp's notification click to the check of the chat
+    that opened, on the mock page's own markup with the page's clock in the test's hands: how long
+    it waits for the chat's messages, and what it tells Natter's log when none come."""
+
+    BUDGET = REPLY_BUDGET_MS
+
+    def setUp(self):
+        where = BRIDGE[BRIDGE.index("  const WHERE = {"):BRIDGE.index("  // ---- The chat list")]
+        invisible = re.search(r"^  const INVISIBLE = .*$", BRIDGE, re.M)[0]
+        self.js = JavaScriptCore.Context()
+        self.run_js("\n".join((FAKE_PAGE, FAKE_RUNTIME, where, invisible, SECTION)))
+        self.run_js(f"load({json.dumps(mock_template('chats'))}); document.visibilityState = 'hidden'")
+        self.chat_wait = int(re.search(r"const CHAT_WAIT_MS = (\d+);", SECTION)[1])
+        self.reserve = self.run_js("TYPE_RESERVE_MS").to_int32()
+
+    def run_js(self, script):
+        value = self.js.evaluate(script, -1)
+        exception = self.js.get_exception()
+        self.assertIsNone(exception, exception and exception.get_message())
+        return value
+
+    def until(self, ms):
+        """The page's clock on to `ms`, a timer at a time."""
+        while self.run_js(f"step({ms})").to_boolean():
+            pass
+
+    def answer(self):
+        """(answer, why, diag, when), once the reply has answered; None before."""
+        if self.run_js("answer === null").to_boolean():
+            return None
+        found = json.loads(self.run_js("JSON.stringify({answer, why: asked.why, diag: asked.diag, answeredAt})")
+                           .to_string())
+        return found["answer"], found["why"], found["diag"], found["answeredAt"]
+
+    def later(self, ms, script):
+        self.run_js(f"setTimeout(() => {{ {script} }}, {ms})")
+
+    def test_no_messages_wait_out_the_budget(self):
+        # The chat opens with no messages keyed, and none come: waited for to the end of the
+        # budget less what typing takes, not just the chat's own wait, then "no-ids" with what the
+        # page was like.
+        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET})")
+        self.until(self.chat_wait + 1000)
+        self.assertIsNone(self.answer(), "still waiting past the chat's own wait")
+        self.until(self.BUDGET + 1000)
+        answer, why, diag, when = self.answer()
+        self.assertEqual((answer, why), ("mismatch", "no-ids"))
+        self.assertGreaterEqual(when, self.BUDGET - self.reserve)
+        self.assertLess(when, self.BUDGET - self.reserve + 1000)
+        self.assertEqual(self.run_js("clicked").to_int32(), 1)
+        self.assertEqual(diag, {"visibilityState": "hidden", "rafFired": False, "innerWidth": 1000, "innerHeight": 700,
+                                "main": True, "header": True, "footer": True, "composer": True, "keys": 0,
+                                "chatKeys": 0, "rows": 0, "shape": ""})
+        self.assertEqual(reply_diag({"diag": diag}), diag)
+
+    def test_messages_loaded_late_are_waited_for(self):
+        # WhatsApp loading the messages around the notified one: they come after the chat's own
+        # wait, and the chat is checked by them as ever. (No footer: it goes no further than the
+        # check, and says the chat takes no messages.)
+        self.run_js('find("main").querySelector("footer").remove()')
+        self.later(self.chat_wait + 2000, f'addRow("false_{GOOD}_3EB0LATE")')
+        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET})")
+        self.until(self.BUDGET + 1000)
+        answer, why, diag, when = self.answer()
+        self.assertEqual((answer, why, diag), ("cant-send", "", None))
+        self.assertLess(when, self.chat_wait + 3000)
+
+    def test_time_is_kept_back_for_typing(self):
+        # Messages that come too late to leave time for the draft, the words and Send: nothing typed.
+        self.later(self.BUDGET - 300, f'addRow("false_{GOOD}_3EB0LATE")')
+        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET})")
+        self.until(self.BUDGET + 1000)
+        answer, why, _diag, when = self.answer()
+        self.assertEqual((answer, why), ("mismatch", "no-ids"))
+        self.assertLess(when, self.BUDGET - self.reserve + 1000)
+        self.assertTrue(self.run_js('boxEmpty(composerIn(find("main")))').to_boolean())
+
+    def test_a_page_that_stalled_types_nothing_late(self):
+        # The page held up (its timers late) until the messages came with less time left than the
+        # rest takes: "busy" (late), nothing typed.
+        self.later(self.chat_wait + 1000, f'now += {self.BUDGET - self.chat_wait - 4000}; '
+                                          f'addRow("false_{GOOD}_3EB0LATE")')
+        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET})")
+        self.until(self.BUDGET + 1000)
+        answer, why, diag, _when = self.answer()
+        self.assertEqual((answer, why, diag), ("busy", "late", None))
+        self.assertTrue(self.run_js('boxEmpty(composerIn(find("main")))').to_boolean())
+
+    def test_another_chats_messages_are_still_a_mismatch(self):
+        self.later(self.chat_wait + 2000, f'addRow("false_{OTHER}_3EB0LATE_{GOOD}")')
+        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET})")
+        self.until(self.BUDGET + 1000)
+        answer, why, diag, when = self.answer()
+        self.assertEqual((answer, why, diag), ("mismatch", "other-chat", None))
+        self.assertLess(when, self.chat_wait + 3000)
+
+    def test_the_wait_ends_with_the_budget(self):
+        budget = self.chat_wait + 3000
+        self.later(self.chat_wait + 5000, f'addRow("false_{GOOD}_3EB0LATE")')  # after the budget
+        self.run_js(f"ask({json.dumps(GOOD)}, {budget})")
+        self.until(budget + 10000)
+        answer, why, _diag, when = self.answer()
+        self.assertEqual((answer, why), ("mismatch", "no-ids"))
+        self.assertLess(when, budget + 1000)  # the budget, and the look at the page after it
+
+    def test_no_chat_open_after_the_click(self):
+        self.run_js('const main = find("main"); main.parentElement.childNodes.splice('
+                    'main.parentElement.childNodes.indexOf(main), 1)')
+        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET})")
+        self.until(self.BUDGET + 1000)
+        answer, why, diag, when = self.answer()
+        self.assertEqual((answer, why), ("gone", "click"))
+        self.assertLess(when, self.chat_wait + 1000)  # no messages to wait for without a chat
+        self.assertEqual((diag["main"], diag["header"], diag["footer"], diag["keys"], diag["shape"]),
+                         (False, False, False, 0, ""))
+
+    def test_frames_and_the_shape_of_a_key(self):
+        # A page WebKit draws, a chat whose keys aren't WhatsApp's: the shape of the first, and
+        # none of it as it was.
+        self.run_js("frames = true; document.visibilityState = 'visible'")
+        self.run_js('addRow("Mum’s chat 4917612345678 ✓")')
+        self.run_js(f"ask({json.dumps(GOOD)}, {self.BUDGET})")
+        self.until(self.BUDGET + 1000)
+        answer, why, diag, _when = self.answer()
+        self.assertEqual((answer, why), ("mismatch", "no-ids"))
+        self.assertEqual((diag["rafFired"], diag["visibilityState"], diag["keys"], diag["chatKeys"], diag["rows"]),
+                         (True, "visible", 1, 0, 1))
+        self.assertEqual(diag["shape"], "a?a?a?9?")  # runs, not their lengths
+        self.assertEqual(reply_diag({"diag": diag}), diag)
+
+    def test_a_long_key_is_cut(self):
+        self.run_js(f'addRow("true_{GOOD}_3EB0" + "A".repeat(80) + "_99")')
+        self.run_js(f"ask({json.dumps(OTHER)}, {self.BUDGET})")
+        self.until(self.BUDGET + 1000)
+        answer, why, diag, _when = self.answer()
+        self.assertEqual((answer, why), ("mismatch", "other-chat"))
+        self.assertIsNone(diag)  # another chat's keys: nothing more to say
+        self.run_js('diagnose().then((d) => { answer = d.shape; })')
+        self.until(self.BUDGET + 2000)
+        shape = self.run_js("answer").to_string()
+        self.assertEqual(shape, "a_9@a.a_9a9a")  # its first 40 characters only
 
 
 if __name__ == "__main__":

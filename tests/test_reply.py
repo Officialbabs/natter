@@ -521,7 +521,7 @@ class Entry(Fake):
 METHODS = ("_text", "_send", "_answered", "_sent", "set_outcome", "_update_send", "_show_problem", "_show_state",
            "put_text", "unsent", "_on_close_request", "close_for_lock", "inline_failed", "_on_key", "_unregister",
            "_forget_now", "forget", "_open_chat", "_action_clicked", "present_again", "untell", "_show_yours",
-           "_replay", "_reveal", "_close_after_sent")
+           "_replay", "_reveal", "_close_after_sent", "show_inline", "inline_answered", "loan_ended")
 
 
 def target(**values):
@@ -533,10 +533,11 @@ class App(Fake):
     """The app as a reply window sees it."""
 
     def __init__(self, test, **values):
-        super().__init__(replies={}, reply_drafts={}, settings=settings(test, **values), sends=[], failed=[])
+        super().__init__(replies={}, reply_drafts={}, settings=settings(test, **values), sends=[], failed=[], hosts=[])
 
-    def send_reply(self, target, text, done):
+    def send_reply(self, target, text, done, host=None):
         self.sends.append((target, text, done))
+        self.hosts.append(host)
 
     def reply_failed(self, window, result):
         self.failed.append(result)
@@ -546,7 +547,8 @@ def window(test, text="", **values):
     app = App(test, **values)
     found = Fake(app=app, target=target(), key=("main", PERSON), ref="0123456789abcdef", sending=False, outcome=None,
                  queued=[], revealed=False, told=None, told_named=False, _too_long=False, _closing=0, _fitting=0,
-                 _sticking=0, _refocus=False, _contrast=0, action="", hidden_row=Fake(),
+                 _sticking=0, _refocus=False, _contrast=0, action="", hidden_row=Fake(), holding=None,
+                 _hide_when_back=False, _inline_draft="",
                  visible=True, buffer=Buffer(text), entry=Entry(), send_button=Switch(), send_face=Fake(),
                  composer=Fake(), who=Switch(), problem=Shown(), problem_text=Markup(), yours=Label(),
                  yours_box=Fake(), yours_scroller=Fake())
@@ -812,6 +814,79 @@ class SendTest(unittest.TestCase):
         found.app.sends[0][2]("busy")
         self.assertEqual(found.send_face.called("set_visible_child_name")[-1], ("send",))
         self.assertEqual(found.composer.called("remove_css_class")[-1], ("natter-sending",))
+
+    def test_the_card_offers_itself_to_hold_the_page(self):
+        found = window(self, "On my way")
+        found._send()
+        (host,) = found.app.hosts
+        self.assertIs(host(), found)
+
+    def test_words_from_kde_sent_with_the_card_holding_the_page(self):
+        found = window(self, "")
+        found.show_inline("On my way")
+        self.assertEqual((found.buffer.text, found.sending), ("On my way", True))
+        self.assertFalse(found.entry.editable)  # on show, not to change
+        self.assertFalse(found.send_button.sensitive)
+        self.assertEqual(found.app.sends, [], "sent already, from KDE's field")
+        self.assertTrue(found._on_close_request(None))  # closed while it goes: hidden, the send goes on
+        found.visible = True
+        with mock.patch.object(GLib, "timeout_add", return_value=9):
+            found.inline_answered("sent")
+        self.assertEqual((found.outcome, found.visible), ("sent", False))  # gone, as after Send
+        failed = window(self, "")
+        failed.show_inline("On my way")
+        failed.inline_answered("busy")
+        self.assertEqual((failed.buffer.text, failed.outcome, failed.sending), ("On my way", "busy", False))
+        self.assertTrue(failed.entry.editable)
+        self.assertTrue(failed.send_button.sensitive)  # to send again from here
+
+    def test_words_kept_for_the_chat_stay_with_a_card_holding_the_page(self):
+        found = window(self, "Half a thought")  # kept from before, in the field as it came up
+        found.show_inline("On my way")
+        self.assertEqual(found.buffer.text, "On my way")
+        with mock.patch.object(GLib, "timeout_add", return_value=9):
+            found.inline_answered("sent")
+        # Gone as after any send, the words kept for the chat's next card, as before it came up.
+        self.assertEqual((found.outcome, found.visible), ("sent", False))
+        self.assertEqual(found.app.reply_drafts, {found.key: "Half a thought"})
+        more = window(self, "Half a thought")
+        more.show_inline("On my way")
+        more.put_text("And another")  # from KDE's field meanwhile: it stays for that
+        with mock.patch.object(GLib, "timeout_add", return_value=9):
+            more.inline_answered("sent")
+        self.assertEqual((more.buffer.text, more.visible), ("Half a thought\nAnd another", True))
+        self.assertEqual(more.app.reply_drafts, {})
+        failed = window(self, "Half a thought")
+        failed.show_inline("On my way")
+        failed.inline_answered("busy")
+        self.assertEqual(failed.buffer.text, "On my way\nHalf a thought")
+
+    def test_a_card_sent_stays_while_it_holds_the_page_for_another_reply(self):
+        # Sent, while the next reply to the chat (from KDE's field) has the page lent to it: hidden,
+        # the page would go out of sight under that one. Out of the way at once, gone once it's back.
+        found = window(self, "On my way")
+        found._send()
+        found.holding = object()
+        found.app.sends[0][2]("sent")
+        self.assertEqual((found.outcome, found.visible), ("sent", True))
+        self.assertNotIn(found.key, found.app.replies)  # Reply for the chat makes a new one
+        found.holding = None
+        with mock.patch.object(GLib, "timeout_add", return_value=9):
+            found.loan_ended()
+        self.assertEqual((found.visible, found._closing), (False, 9))
+        found.loan_ended()  # again: nothing
+        self.assertEqual(found.called("set_visible"), [(False,)])
+        other = window(self, "On my way")
+        other.loan_ended()  # a loan for its own send: nothing
+        self.assertEqual((other.visible, other.called("set_visible")), (True, []))
+
+    def test_the_card_stays_up_while_it_sends(self):
+        # It holds WhatsApp's page while the page is out of sight (app.lend_page): only closing it,
+        # or the lock, takes it away before the answer.
+        found = window(self, "On my way")
+        found._send()
+        self.assertTrue(found.visible)
+        self.assertEqual(found.called("set_visible"), [])
 
     def test_show_gives_the_focus_back_to_the_box(self):
         # A click on Show takes the focus, and its row goes: the box has it again, not the messages.
@@ -1079,10 +1154,13 @@ class Window(Fake):
 
     def __init__(self, active=False, sending=False, outcome=None, words=False, chat=PERSON):
         super().__init__(ref="fedcba9876543210", active=active, sending=sending, outcome=outcome, words=words,
-                         target=target(chat=chat), told=None, told_named=False)
+                         target=target(chat=chat), told=None, told_named=False, visible=True)
 
     def is_active(self):
         return self.active
+
+    def get_visible(self):
+        return self.visible
 
     def close_for_lock(self):
         self.calls.append(("close_for_lock",))
@@ -1094,7 +1172,9 @@ class AppTest(unittest.TestCase):
         app = Fake(locked=locked, settings=settings(self, **values), replies={}, reply_drafts={}, held=[],
                    held_keys=[], held_tokens=[], accounts=[], window=None, _after_unlock=[])
         account = Fake(id="main", name="Personal", removed=False, active_chat="", sent=[])
-        account.send_reply = lambda page_id, chat, text, done: account.sent.append((page_id, chat, text, done))
+        account.lends = []
+        account.send_reply = lambda page_id, chat, text, done, lend=None: (
+            account.sent.append((page_id, chat, text, done)), account.lends.append(lend))
         app.accounts.append(account)
         app.account = account
         app.account_by_id = lambda account_id: account if account_id == "main" else None
@@ -1180,6 +1260,85 @@ class AppTest(unittest.TestCase):
         self.assertEqual((key_, title), ("reply-fedcba9876543210", "Your reply may not have been sent"))
         self.assertNotIn("Mum", body)
         self.assertEqual(button[:2], ("Show Reply", "app.show-reply"))
+
+    def kde_host(self, app):
+        """The page's lend() for the last send from KDE's field, run: the host it was offered."""
+        (lend,) = app.account.lends[-1:]
+        lend()
+        (_account, host), = app.called("lend_page")[-1:]
+        return host
+
+    def test_text_from_kde_out_of_sight_brings_up_a_card_to_hold_the_page(self):
+        app = self.make()
+        made = Window(sending=False)
+        made.visible = False
+        made.set_visible = lambda visible: made.calls.append(("set_visible", visible))
+
+        def make_window(found_target):
+            app.replies[(found_target.account, found_target.chat)] = made
+            return made
+        app._reply_window = make_window
+        app.on_reply(target(), "", "On my way", False)
+        self.assertEqual(app.called("_reply_window"), [], "not before the page is asked")
+        host = self.kde_host(app)
+        self.assertIs(host(), made)
+        self.assertEqual(made.called("show_inline"), [("On my way",)])
+        self.assertEqual(made.called("set_visible"), [(True,)])  # shown, not presented: no focus asked for
+        self.assertEqual((made.called("present"), made.called("present_again")), ([], []))
+        made.sending = True  # as show_inline left it
+        with redirect_stdout(io.StringIO()):
+            app.account.sent[0][3]("sent")
+        # Its answer is the card's, as for Send: it goes once sent, and says why when not.
+        self.assertEqual(made.called("inline_answered"), [("sent",)])
+        self.assertEqual(made.called("inline_failed"), [])
+
+    def test_text_from_kde_with_a_card_up_already_lends_to_it(self):
+        app = self.make()
+        made = Window()
+        app._reply_window = lambda t: made
+        app.on_reply(target(), "", "On my way", False)
+        app.replies[("main", PERSON)] = made  # Reply pressed before the page was asked
+        self.assertIs(self.kde_host(app)(), made)
+        self.assertEqual(made.called("show_inline"), [])
+        with redirect_stdout(io.StringIO()):
+            app.account.sent[0][3]("draft")
+        self.assertEqual(made.called("inline_failed"), [("On my way", "draft")])  # as before
+
+    def test_text_from_kde_with_a_failed_card_out_of_sight_shows_it_to_hold_the_page(self):
+        # Its reply failed out of sight after these words were asked for: shown again (its notice
+        # goes) rather than leaving the page out of sight, and it shows this answer as before.
+        app = self.make()
+        made = Window()
+        made.visible = False
+        made.set_visible = lambda visible: (made.calls.append(("set_visible", visible)),
+                                            setattr(made, "visible", visible))
+        app._reply_window = lambda t: made
+        app.on_reply(target(), "", "On my way", False)
+        app.replies[("main", PERSON)] = made
+        self.assertIs(self.kde_host(app)(), made)
+        self.assertEqual((made.called("untell"), made.called("set_visible")), ([()], [(True,)]))
+        self.assertEqual(made.called("show_inline"), [])
+        with redirect_stdout(io.StringIO()):
+            app.account.sent[0][3]("draft")
+        self.assertEqual(made.called("inline_failed"), [("On my way", "draft")])
+        busy = Window(sending=True)  # closed while its own reply goes: left as it is
+        busy.visible = False
+        del app.replies[("main", PERSON)]
+        app.on_reply(target(), "", "Again", False)
+        self.assertEqual(len(app.account.sent), 2)
+        app.replies[("main", PERSON)] = busy
+        self.assertIs(self.kde_host(app)(), busy)
+        self.assertEqual(busy.called("set_visible"), [])
+
+    def test_text_from_kde_seen_or_unlent_goes_as_before(self):
+        app = self.make()
+        made = Window()
+        app._reply_window = lambda t: made
+        app.on_reply(target(), "", "On my way", False)  # the page on screen: no host asked for
+        with redirect_stdout(io.StringIO()):
+            app.account.sent[0][3]("busy")
+        self.assertEqual(made.called("inline_answered"), [])
+        self.assertEqual(made.called("inline_failed"), [("On my way", "busy")])
 
     def test_reply_turned_off_opens_the_chat(self):
         app = self.make(notify_reply=False)

@@ -136,7 +136,9 @@ press Send:
 1. WhatsApp's own handler for its notification opens the chat by its id (unless that chat is open
    already).
 2. The bridge checks the open chat is that chat, by the chat id in its messages' keys rather than
-   by its name, and that its message box is empty: words you left there aren't touched.
+   by its name, and that its message box is empty: words you left there aren't touched. It waits
+   for those messages as long as the reply may take, less the time typing and Send need: when the
+   message isn't the chat's latest, WhatsApp can take some seconds to load the ones around it.
 3. Your words go into the box through the page's own editing commands, a line at a time, and must
    land as you typed them (WhatsApp's own swap of `:-)` for an emoji aside).
 4. WhatsApp's Send button is pressed once, not the Enter key, and the reply counts as sent when
@@ -151,13 +153,26 @@ another tab left open over the chat list with nothing typed in it just closes, a
 notification click closes it. If Send was pressed but the reply wasn't seen to go, the reply window
 says so and doesn't send again.
 
+WhatsApp only draws a chat and its messages while its page is on screen. So while Natter Den's
+window is closed, or shows another account, Natter Den moves WhatsApp's page under the reply window
+for as long as the reply runs: unseen, out of reach and at the size it had in the window, so WhatsApp
+draws the chat and its messages as it would there. The page goes back as soon as the reply ends,
+the reply window closes, Natter Den locks or its window opens on that account. A reply typed in a KDE notification
+brings the reply window up for it, showing the words being sent. With the page on screen, WhatsApp
+may show you as online and mark the chat as read, as replying in WhatsApp itself would.
+
 While a reply is under way nothing else acts on that page (opening chats, links, files and fresh
 pages wait), and a hidden window's page isn't throttled meanwhile. A locked Natter Den starts no
 send: Reply asks for the passcode first, words typed in a KDE notification while it's locked wait in
 the reply window until you press Send, and a reply window the lock closes with words in it comes
 back after the passcode. Natter Den's log says how each reply ended (`natter: reply: sent`), not who
-to or what. A notification's id and its Reply and Mute actions name no chat, only a random
-reference, as desktops may keep them.
+to or what. When the chat couldn't be checked (`mismatch (no-ids)`, or `gone` or `not-ready` once
+WhatsApp's notification was clicked), the line ends with what the page was like, in brackets: whether
+WhatsApp's page counted itself visible and was drawing, whether it was on screen and lent to the
+reply window, whether the chat, its header, footer and message box were there, the page's size in
+hundreds of pixels, how many message keys and rows the chat held, and the shape of its first key
+(each run of digits as 9, of letters as a). Never a name, words, an id or their lengths. A notification's id and its Reply
+and Mute actions name no chat, only a random reference, as desktops may keep them.
 
 Where the notification server offers KDE's inline reply, Natter Den offers the field only when the
 notification shows who wrote, and takes the text only from the server's own bus name, once per

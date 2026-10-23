@@ -18,6 +18,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gtk, Pango, WebKit
 from . import DEFAULT_APP_ID, NAME
 from . import clipboard, lock as applock, themes
 from .account import Account
+from .loan import PageLoan, page_size
 from .prefs import shown_folder
 
 # The header bar is GNOME's own, unstyled: its buttons and window controls are the size and
@@ -328,11 +329,13 @@ class Window(Adw.ApplicationWindow):
         self.app = app
         self.pages: dict[str, Adw.ViewStackPage] = {}
         self._refused_at: dict[str, float] = {}  # when each kind's last refused_toast showed
+        # Pages lent to reply cards while out of sight (lend_page), by account id.
+        self.loans: dict[str, PageLoan] = {}
 
         self.stack = Adw.ViewStack(vexpand=True)
         self.stack.connect("notify::visible-child",
-                           lambda *_: (app.on_page_changed(), self._show_call(), self._show_subtitle(),
-                                       self._show_reloading(), self._behind_lock()))
+                           lambda *_: (self.give_back_shown(), app.on_page_changed(), self._show_call(),
+                                       self._show_subtitle(), self._show_reloading(), self._behind_lock()))
         self.switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
         self.switcher_bar = Adw.ViewSwitcherBar(stack=self.stack)
         self.title = Adw.WindowTitle(title=NAME)
@@ -408,7 +411,9 @@ class Window(Adw.ApplicationWindow):
         self._drops()
         self.connect("close-request", self._on_close)
         self.connect("notify::is-active", lambda *_: app.on_focus_changed(self.is_active()))
-        self.connect("notify::visible", lambda *_: self._behind_lock())
+        # Shown some way other than app.present_window, which gives the shown page back first: back
+        # now, still before anything is drawn.
+        self.connect("notify::visible", lambda *_: (self.get_visible() and self.give_back_shown(), self._behind_lock()))
 
         snapshot = os.environ.get("NATTER_SNAPSHOT")
         if snapshot:
@@ -613,6 +618,7 @@ class Window(Adw.ApplicationWindow):
         self._show_switcher()
 
     def remove_account(self, account: Account) -> None:
+        self.give_back_pages(account)
         page = self.pages.pop(account.id, None)
         if page is not None:
             page.get_child().forget()
@@ -646,6 +652,40 @@ class Window(Adw.ApplicationWindow):
     def account(self) -> Optional[Account]:
         child = self.stack.get_visible_child()
         return child.account if isinstance(child, AccountPage) else None
+
+    # ---- Pages lent to reply cards (loan.py) -------------------------------------------------
+
+    def lend_page(self, account: Account, card) -> Optional[PageLoan]:
+        """`account`'s page into the reply card `card` for a reply (app.lend_page), at the size it
+        had here. None if it isn't in its place, or is lent already."""
+        stack_page = self.pages.get(account.id)
+        if stack_page is None or account.id in self.loans:
+            return None
+        view = account.view
+        settings = self.app.settings
+        width, height = self.get_default_size()
+        size = page_size((view.get_width(), view.get_height()),
+                         (width, height) if width > 0 and height > 0 else (settings["width"], settings["height"]))
+        loan = PageLoan(view, stack_page.get_child(), card, size,
+                        ended=lambda done: self.loans.get(account.id) is done and self.loans.pop(account.id))
+        if not loan.lend():
+            return None
+        self.loans[account.id] = loan
+        return loan
+
+    def give_back_pages(self, account: Optional[Account] = None) -> None:
+        """Each lent page back in its place (`account`'s alone, if given): before the window or
+        that page is shown (give_back_shown), at the lock, when an account goes, when quitting."""
+        for account_id, loan in list(self.loans.items()):
+            if account is None or account.id == account_id:
+                loan.give_back()
+
+    def give_back_shown(self) -> None:
+        """The shown tab's page back in it, should it be lent: when the tab or the window is shown,
+        before anything is drawn. Other accounts' pages stay with their replies."""
+        account = self.account
+        if account is not None and account.id in self.loans:
+            self.give_back_pages(account)
 
     def show_account(self, account: Account) -> None:
         if account.id in self.pages:

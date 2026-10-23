@@ -63,6 +63,11 @@ REPLY_BUDGET_MS = 25000  # the page's own time to reach the chat and press Send;
 REPLY_GUARD = 45
 REPLY_LET_GO = 120
 REPLY_QUEUE_WAIT = 60  # seconds a reply may wait behind another before it's answered "busy", untouched
+# A page never laid out (Natter started hidden), lent to a reply card (loan.py), has the card's size
+# until GTK first lays it out at the lent one: the reply waits for that, looking every LAYOUT_TICK
+# ms, LAYOUT_WAIT ms at most, so WhatsApp never opens the chat in a card-sized page.
+REPLY_LAYOUT_TICK = 25
+REPLY_LAYOUT_WAIT = 2000
 REPLY_HELD = 8  # page actions kept for after a reply (_held), the latest
 # WhatsApp's ids for people and groups, as its notifications' tags carry them: not channels,
 # status, calls or anything else (bridge.js CHAT_ID).
@@ -79,7 +84,20 @@ REPLY_RESULTS = frozenset({"sent", "locked", "calling", "busy", "draft", "cant-s
 PAGE_REPLY_RESULTS = REPLY_RESULTS - {"locked", "needs-link", "removed", "unknown"}  # what the bridge answers
 REPLY_SCRIPT = """if (!window.__natter || !window.__natter.reply) return {result: "not-ready", why: "no-bridge"};
 const result = await window.__natter.reply(request);
-return {result, why: request.why || ""};"""
+return {result, why: request.why || "", diag: request.diag || null};"""
+# What the bridge may say of the page when a reply found no chat to check (bridge.js diagnose), for
+# the log: whether WhatsApp drew it, and what the open chat held, by counts and the shape of one
+# message key (each run of digits as 9, of letters as a). Never a name, words or an id. Natter adds
+# whether the page was on screen to WebKit (mapped) and lent to a reply card (loan.py).
+REPLY_DIAG_COUNT = 999  # counts are capped at this
+REPLY_DIAG_SIZE = 9900  # sizes are in hundreds of pixels, up to this
+REPLY_DIAG_SHAPE = re.compile(r"[9a_@.:?-]{0,40}")
+REPLY_DIAG = {
+    "visibilityState": ("visible", "hidden", "prerender", "unloaded"),
+    "rafFired": bool, "main": bool, "header": bool, "footer": bool, "composer": bool,
+    "innerWidth": "size", "innerHeight": "size", "keys": "count", "chatKeys": "count", "rows": "count",
+    "shape": "shape",
+}
 
 # After a crash the page reloads after 1, 5, 30, then 120 s; a crash more than ten minutes
 # after the one before counts as the first again. Three within two minutes is a crash loop:
@@ -264,6 +282,47 @@ def reply_answer(value) -> tuple[str, str]:
     return value["result"], why if isinstance(why, str) and re.fullmatch(r"[a-z-]{1,24}", why) else ""
 
 
+def reply_diag(value) -> Optional[dict]:
+    """The bridge's account of the page with its answer (REPLY_SCRIPT), checked: only the fields of
+    REPLY_DIAG, each as it may be there. Anything else, a name or words or an id in it, and it's
+    none at all."""
+    diag = value.get("diag") if isinstance(value, dict) else None
+    if not isinstance(diag, dict) or not diag or not set(diag) <= set(REPLY_DIAG):
+        return None
+    for key, item in diag.items():
+        kind = REPLY_DIAG[key]
+        if kind is bool:
+            good = isinstance(item, bool)
+        elif kind == "shape":
+            good = isinstance(item, str) and REPLY_DIAG_SHAPE.fullmatch(item) is not None
+        elif isinstance(kind, tuple):
+            good = isinstance(item, str) and item in kind
+        else:  # a count, or a size in hundreds
+            most = REPLY_DIAG_COUNT if kind == "count" else REPLY_DIAG_SIZE
+            good = type(item) is int and 0 <= item <= most and (kind == "count" or item % 100 == 0)
+        if not good:
+            return None
+    return dict(diag)
+
+
+def diag_line(diag: dict) -> str:
+    """reply_diag's account, with Natter's mapped and lent, as the log says it: in brackets."""
+    words = []
+    for key, name in (("visibilityState", "page"), ("rafFired", "frames"), ("mapped", "mapped"), ("lent", "lent"),
+                      ("main", "chat"), ("header", "header"), ("footer", "footer"), ("composer", "box")):
+        if key in diag:
+            value = diag[key]
+            words.append(f"{name} {value}" if isinstance(value, str) else f"{name} {'yes' if value else 'no'}")
+    if "innerWidth" in diag or "innerHeight" in diag:
+        words.append(f"size {diag.get('innerWidth', '?')}x{diag.get('innerHeight', '?')}")
+    for key, name in (("keys", "keys"), ("chatKeys", "chat keys"), ("rows", "rows")):
+        if key in diag:
+            words.append(f"{name} {diag[key]}")
+    if "shape" in diag:
+        words.append(f"key {diag['shape'] or 'none'}")
+    return "[" + ", ".join(words) + "]"
+
+
 @dataclass(eq=False)
 class _Reply:
     """One reply asked for (Account.send_reply), from the queue to its answer."""
@@ -275,6 +334,12 @@ class _Reply:
     timer: int = 0  # waiting in the queue (REPLY_QUEUE_WAIT), then in the page (REPLY_GUARD, REPLY_LET_GO)
     in_page: bool = False  # the page has it and hasn't answered
     answered: bool = False
+    # The page lent to a reply card while it runs out of sight (app.lend_page, loan.py): what lends
+    # it, the loan while it's out, and whether it was lent.
+    lend: Optional[Callable[[], object]] = None
+    loan: object = None
+    lent: bool = False
+    layout_timer: int = 0  # waiting for the lent page to be laid out at its size (REPLY_LAYOUT_WAIT)
 
 
 def reload_delay(crashes: list[float]) -> Optional[int]:
@@ -659,22 +724,27 @@ class Account(GObject.Object):
     # One reply is one act of the person's, so one send through WhatsApp's own page, the way
     # their hands would do it (bridge.js reply): never retried, never two at once in a page,
     # never begun while Natter is locked or a call is on. The words go to the page as arguments,
-    # never in a script, and Natter's log has the outcome only: no names, ids or words.
+    # never in a script, and Natter's log has the outcome only (and, when no chat could be checked,
+    # what the page was like: reply_diag): no names, ids or words. Out of sight, the page is lent to
+    # a reply card while it runs (loan.py).
 
     @property
     def replying(self) -> int:
         """Replies the page has and hasn't answered. Meanwhile nothing else acts on the page (_held)."""
         return self._in_page
 
-    def send_reply(self, page_id: int, chat_id: str, text: str, done: Callable[[str], None]) -> None:
+    def send_reply(self, page_id: int, chat_id: str, text: str, done: Callable[[str], None],
+                   lend: Optional[Callable[[], object]] = None) -> None:
         """Send `text` to WhatsApp's chat `chat_id`, the one the page's notification `page_id`
         came from: WhatsApp's handler for that notification opens it (unless it's open already),
         and only if the chat that opens has that id do the words go into its message box, only
         if the box was empty, and Send is pressed once. `done(result)` later, once, with one of
         REPLY_RESULTS. One at a time in the page, in the order asked; the same words for the same
         chat asked for again while the first is still going are "busy" (one act, one send).
+        `lend()`, as the page is asked, if it's out of sight: lends it to a reply card until the
+        answer (app.lend_page), and gives the loan, or None.
         """
-        job = _Reply(page_id, chat_id, reply_text(text), done)
+        job = _Reply(page_id, chat_id, reply_text(text), done, lend=lend)
         refused = self._reply_refusal()
         if self.removed:
             self._answer(job, "removed")
@@ -733,17 +803,44 @@ class Account(GObject.Object):
         self._apply_throttle()
         self.app.reclaimer.stop()  # nothing of the page's goes to swap under it
         job.timer = GLib.timeout_add_seconds(REPLY_GUARD, self._reply_guard, job)
+        # Whether the person can see the page, as it was before any loan: a card isn't that.
+        visible = self.app.page_seen(self)
+        if job.lend is not None and not self.view.get_mapped():
+            job.loan = job.lend()
+            job.lent = job.loan is not None
         request = {"pageId": job.page_id, "chatId": job.chat_id, "text": job.text, "budgetMs": REPLY_BUDGET_MS,
-                   "visible": self.view.get_mapped()}
-        self.run(REPLY_SCRIPT, {"request": request}, lambda value: self._reply_answered(job, value))
+                   "visible": visible}
+        self._when_laid_out(job, lambda: self.run(REPLY_SCRIPT, {"request": request},
+                                                  lambda value: self._reply_answered(job, value)), REPLY_LAYOUT_WAIT)
+
+    def _when_laid_out(self, job: _Reply, start: Callable[[], None], left: int) -> bool:
+        """`start()` once the page lent for `job` is laid out at its size (REPLY_LAYOUT_WAIT), at
+        once if it isn't lent or already is, or once the loan is over; never once `job` is answered."""
+        job.layout_timer = 0
+        if job.answered:
+            return GLib.SOURCE_REMOVE
+        if self.removed:  # gone meanwhile: nothing reached the page
+            self._leave_page(job)
+            self._end_turn(job, "removed")
+            return GLib.SOURCE_REMOVE
+        loan = job.loan
+        if loan is None or not loan.lent or loan.laid_out() or left <= 0:
+            start()
+        else:
+            job.layout_timer = GLib.timeout_add(REPLY_LAYOUT_TICK, self._when_laid_out, job, start,
+                                                left - REPLY_LAYOUT_TICK)
+        return GLib.SOURCE_REMOVE
 
     def _reply_answered(self, job: _Reply, value) -> None:
         result, why = reply_answer(value)
+        diag = reply_diag(value)
+        if diag is not None:
+            diag.update(mapped=bool(self.view.get_mapped()), lent=job.lent)
         if job.answered:  # after the guard: Natter has said "unknown" already
-            print(f"natter: reply: {result}" + (f" ({why})" if why else "") + ", answered after the wait ran out",
-                  flush=True)
+            print(f"natter: reply: {result}" + (f" ({why})" if why else "") + (f" {diag_line(diag)}" if diag else "")
+                  + ", answered after the wait ran out", flush=True)
         self._leave_page(job)
-        self._end_turn(job, result, why)
+        self._end_turn(job, result, why, diag)
 
     def _reply_guard(self, job: _Reply) -> bool:
         """The page hasn't answered in REPLY_GUARD: "unknown" (it may have sent). The page keeps it
@@ -766,22 +863,32 @@ class Account(GObject.Object):
             self._in_page -= 1
             self._apply_throttle()
 
-    def _end_turn(self, job: _Reply, result: str, why: str = "") -> None:
+    def _end_turn(self, job: _Reply, result: str, why: str = "", diag: Optional[dict] = None) -> None:
         """`job` is over (answered `result` unless it was already): the next reply's turn, and
         then, with none in the page, what was held for it."""
-        self._answer(job, result, why)
+        self._answer(job, result, why, diag)
         if self._reply is job:
             self._reply = None
         self._next_reply()
         if not self._in_page:
             self._release_held()
 
-    def _answer(self, job: _Reply, result: str, why: str = "") -> None:
+    def _answer(self, job: _Reply, result: str, why: str = "", diag: Optional[dict] = None) -> None:
+        if job.layout_timer:  # answered before the page was asked (the guard): never asked now
+            GLib.source_remove(job.layout_timer)
+            job.layout_timer = 0
+        self._give_back(job)  # answered, at the guard too: the page goes back to its place
         if job.answered:
             return
         job.answered = True
-        print(f"natter: reply: {result}" + (f" ({why})" if why else ""), flush=True)
+        print(f"natter: reply: {result}" + (f" ({why})" if why else "") + (f" {diag_line(diag)}" if diag else ""),
+              flush=True)
         GLib.idle_add(lambda: job.done(result) and False)
+
+    def _give_back(self, job: Optional[_Reply]) -> None:
+        if job is not None and job.loan is not None:
+            loan, job.loan = job.loan, None
+            loan.give_back()
 
     def _held(self, run: Callable[[], None]) -> bool:
         """While the page has a reply, what else would act on it (open a chat, a link, files, a
@@ -1121,6 +1228,7 @@ class Account(GObject.Object):
             self._reload_timer = 0
         self._watch_page(0, None)
         self._end_link()
+        self._give_back(self._reply)
         self._drop_replies()
         self._drop_pending()
         self._fallback.clear()
