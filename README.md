@@ -181,6 +181,16 @@ run on Ada 26.04 (based on Ubuntu) and on CachyOS (based on Arch) with KDE Plasm
 - A notification's id and its Reply and Mute actions carry a random reference, not the chat's
   name.
 
+## Reporting a problem
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Officialbabs/natter/master/tools/report.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Officialbabs/natter/master/tools/report.sh | sh -s -- --watch 10
+```
+
+The second also watches Natter Den for 10 minutes while you make the problem happen. Each writes
+`~/natter-report-<date>-<time>.txt`, which stays on your computer until you send it.
+
 ## Tests
 
 `python3 -m unittest discover -s tests`; [docs/development.md](docs/development.md) has more.
