@@ -405,10 +405,12 @@ sed -e "s|@EXEC@|$(sed_escape "$(shell_quote "$LAUNCHER")")|" "$HERE/data/$APP_I
 
 retire_old
 refresh_caches
-# Ada's background allow list names apps by id: an entry for the old one no longer counts.
+# Ada's background allow list names apps by id: an entry for the old one no longer counts. Only
+# AllowBackground: the file has other lists (RestrictBackground), where the new id mustn't go.
 LIFECYCLE="$CONFIG/os-ai/lifecycle.ini"
-if [ -f "$LIFECYCLE" ] && grep -qF "$OLD_APP_ID" "$LIFECYCLE"; then
-    echo "Note: $LIFECYCLE names $OLD_APP_ID. Replace it with $APP_ID there, so $APP_NAME keeps receiving messages while hidden."
+if [ -f "$LIFECYCLE" ] && grep -E '^[[:space:]]*AllowBackground[[:space:]]*=' "$LIFECYCLE" | grep -qF "$OLD_APP_ID"; then
+    echo "Note: AllowBackground in $LIFECYCLE names $OLD_APP_ID. Replace it with $APP_ID there,"
+    echo "so $APP_NAME keeps receiving messages while hidden."
 fi
 
 # whatsapp:// links: take them only if no other app had them (ZapZap, say) or the old Natter
