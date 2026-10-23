@@ -29,8 +29,15 @@ from WhatsApp's page, so a search never starts WhatsApp. The provider file says
 (If something does start it over D-Bus anyway, Natter Den answers from disk and leaves again once
 the searching stops; WhatsApp only starts when a result is opened.)
 
-If Ada's search API takes another shape, Natter Den can answer that too. The search itself is in
-`natter/search.py`.
+Ada's search (Super, then type) shows these under "Results from apps" since Ada's 22 October
+2026 update; Settings → Keyboard switches it, per app. Opening a result needs one thing from Ada:
+on Wayland an app can't bring its own window forward without an activation token, and
+`ActivateResult` carries none. So Ada's launcher brings the app forward itself after
+`ActivateResult` and `LaunchSearch`, the way its notification clicks do: the app's latest window,
+or, with none on screen, `Apps.launch` of the provider's desktop id (".desktop" included), which
+reaches the running Natter Den with a token. The change to Ada's `Launcher.qml` is a small
+`bringForward(provider)` after both calls; until it's in Ada's own source, a result opens the chat
+without bringing the window forward. The search itself is in `natter/search.py`.
 
 ## 2. Lifecycle (ada-lifecycled)
 

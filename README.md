@@ -105,7 +105,7 @@ desktop:
 | Tray icon with unread count and menu | with the AppIndicator extension (on by default in Ubuntu) | ✓ | ✓ | ✓ Status Tray plugin | ✓ Waybar's tray; swaybar's shows the icon and opens Natter Den on a click, but has no menu |
 | Unread badge on the dock icon | Ubuntu Dock, Dash to Dock | ✓ | ✓ | – | – |
 | Recent chats in the dock's right-click menu | ✓ | ✓ | ✓ | – | – |
-| Chats in desktop search | ✓ Activities search, while Natter Den runs | – | ready ([docs/ada.md](docs/ada.md)) | – | – |
+| Chats in desktop search | ✓ Activities search, while Natter Den runs | – | ✓ Super search, while Natter Den runs ([docs/ada.md](docs/ada.md)) | – | – |
 | Start hidden at login | ✓ | ✓ | ✓ | ✓ | if your session runs XDG autostart (`dex -a`, systemd's autostart generator) |
 | Window comes forward from a notification | ✓ | ✓ | ✓ | ✓ | if the daemon passes an activation token |
 | One process group, memory back while hidden | ✓ | ✓ | ✓ | ✓ with a systemd user session | ✓ with a systemd user session |
