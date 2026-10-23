@@ -143,11 +143,10 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>Fixes for replying from notifications and for call sound.</p>"
+RELEASE_NOTES = ("<p>Fixes for replying from notifications.</p>"
                  "<ul>"
-                 "<li>Replying from a notification works with WhatsApp's current page, also with the window closed (still experimental)</li>"
-                 "<li>Fewer clicks in call sound after a silence, with WebKitGTK before 2.54.2 and GStreamer 1.28</li>"
-                 "<li>A call keeps going through short reconnections, with less background work while it runs</li>"
+                 "<li>Replies from a notification are confirmed by more of WhatsApp's current page: the chat list's open chat, the notified message without WhatsApp's old markup, and the chat's picture</li>"
+                 "<li>The page lent to the reply card is drawn, so WhatsApp keeps working while a reply is sent</li>"
                  "</ul>")
 
 

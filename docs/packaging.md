@@ -88,10 +88,10 @@ On Fedora Atomic, `rpm-ostree install` can layer Fedora's packages instead (they
 a restart); the Flatpak is the other way there, and on Bazzite and SteamOS.
 
 Then download the latest release and install it. Its tag is the one marked *Latest* on the
-[Releases page](https://github.com/Officialbabs/natter/releases); put it in place of `v0.1.1` below:
+[Releases page](https://github.com/Officialbabs/natter/releases); put it in place of `v0.1.2` below:
 
 ```sh
-tag=v0.1.1   # the latest release's tag
+tag=v0.1.2   # the latest release's tag
 mkdir -p ~/.local/lib/natter/source && cd ~/.local/lib/natter/source
 curl -fsSL "https://github.com/Officialbabs/natter/archive/refs/tags/$tag.tar.gz" | tar -xz --strip-components=1
 ./install.sh   # adds Natter Den to your apps and `natter` to ~/.local/bin

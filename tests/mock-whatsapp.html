@@ -141,6 +141,7 @@
       const row = document.createElement("div");
       row.setAttribute("role", "listitem");
       row.style.transform = `translateY(${i * 64}px)`;
+      row.setAttribute("aria-selected", String(name === openName));  // the open chat's, as WhatsApp marks it
       row.innerHTML = `<div class="avatar"></div><div><div data-testid="cell-frame-title"><span dir="auto" title="${name}">${name}</span></div>
         <div class="preview"><span title="secret last message from ${name}">secret last message</span></div></div>`;
       row.addEventListener("mousedown", () => open(name));
@@ -206,6 +207,9 @@
       header(name);
       messages(name);
       openName = name;
+      document.querySelectorAll('#grid [role="listitem"]').forEach((row) => {
+        row.setAttribute("aria-selected", String(row.querySelector("span[title]").getAttribute("title") === name));
+      });
       composer().textContent = drafts[name] || "";
       slot();
     }, 120);

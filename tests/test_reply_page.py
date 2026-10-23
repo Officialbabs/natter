@@ -753,6 +753,30 @@ class ReplyTest(unittest.TestCase):
         self.assertIn("values (none)", diag_line(dict(self.SIGNS, values=[])))
         self.assertIn("name at none,", diag_line(dict(self.SIGNS, nameAt=-1)))
 
+    LIST = {"listed": False, "selected": 1, "selectedName": True, "dirClasses": False, "messageAnywhere": True,
+            "messageWords": True, "iconKind": "data", "headerImgKind": "wa"}
+
+    def test_the_diag_takes_the_list_the_classes_and_the_pictures(self):
+        good = dict(self.DIAG, **self.SIGNS, **self.LIST)
+        self.assertEqual(reply_diag({"diag": good}), good)
+        for kind in natter_account.REPLY_DIAG_PICTURE:
+            self.assertIsNotNone(reply_diag({"diag": dict(good, iconKind=kind, headerImgKind=kind)}), kind)
+        refused = [
+            {"listed": "yes"}, {"listed": 1}, {"selected": -1}, {"selected": 1000}, {"selected": True},
+            {"selected": "1"}, {"selectedName": "Mum"}, {"dirClasses": None}, {"messageAnywhere": "Did you eat?"},
+            {"messageWords": 0}, {"iconKind": "https://pps.whatsapp.net/v/mum.jpg"}, {"iconKind": "ftp"},
+            {"iconKind": True}, {"headerImgKind": "blob:file:///mum"}, {"headerImgKind": ""},
+        ]
+        for diag in refused:
+            self.assertIsNone(reply_diag({"diag": dict(good, **diag)}), diag)
+
+    def test_the_diag_line_with_the_list_the_classes_and_the_pictures(self):
+        line = diag_line(dict(self.SIGNS, **self.LIST))
+        self.assertIn("name yes, opened no, message no, picture no, listed no, notified body yes, notified picture yes, "
+                      "selected 1, selected name yes, direction classes no, message anywhere yes, message words yes, "
+                      "notified picture kind data, header picture kind wa, name at 2,", line)
+        self.assertEqual(diag_line({"listed": True}), "[listed yes]")
+
     def test_the_diag_line_says_no_names(self):
         line = diag_line(dict(self.DIAG, shape="aaaaa_99999@a.aa_9aa9", mapped=True, lent=False))
         self.assertTrue(line.startswith("[page hidden, frames no, mapped yes, lent no, "), line)
@@ -1367,6 +1391,57 @@ def row(key, *parts, sender=None, styled=None, way="in", said=None):
             *inner, {"tag": "span", "attrs": {"class": "time"}, "children": [{"text": "10:42"}]}]}]}
 
 
+def live_row(key, *parts, sender=None, joined=False, more=False, way=None):
+    """A message's row as today's live page may draw it: atomic class names, no message-in or
+    message-out (`way`: with that one), data-testid and tabindex on the keyed element, its words in a
+    span[dir] (emoji as pictures), a group's sender's name above them, and its time. `joined`: the
+    sender's name and the time drawn in the words' own span. `more`: a long message cut short, with
+    WhatsApp's "Read more" after it."""
+    text = words(*parts)
+    time = {"tag": "span", "attrs": {"class": "x1c4vz4f x2lah0s"}, "children": [{"text": "10:42"}]}
+    label = [{"tag": "span", "attrs": {"class": "x1lliihq"}, "children": [{"text": sender}]}] if sender else []
+    if joined:
+        inner = [{"tag": "span", "attrs": {"dir": "ltr", "class": "x1iyjqo2 _ao3e"}, "children": label + text + [time]}]
+    else:
+        inner = ([{"tag": "div", "attrs": {"class": "x78zum5"}, "children": label}] if label else []) + [
+            {"tag": "div", "attrs": {"class": "x9f619"}, "children": [
+                {"tag": "span", "attrs": {"dir": "ltr", "class": "x1iyjqo2 _ao3e"},
+                 "children": [{"tag": "span", "attrs": {}, "children": text}]}]}]
+        if more:
+            inner.append({"tag": "div", "attrs": {"role": "button", "class": "x1ypdohk"}, "children": words("Read more")})
+        inner.append({"tag": "div", "attrs": {"class": "x13yyeie"}, "children": [time]})
+    classes = "x9f619 xjbqb8w" + (f" message-{way}" if way else "")
+    return {"tag": "div", "attrs": {"role": "row", "class": "x1n2onr6", "tabindex": "-1"}, "children": [
+        {"tag": "div", "attrs": {"data-id": key, "class": classes, "data-testid": "msg-container", "tabindex": "-1"},
+         "children": inner}]}
+
+
+def list_row(i, name, marked=False, on_row=False):
+    """A chat in the list as the live page draws it: a listitem at its place, a row in it marked
+    aria-selected (or the listitem itself, `on_row`), and the name in a titled span."""
+    selected = {"aria-selected": "true" if marked else "false"}
+    return {"tag": "div", "attrs": {"role": "listitem", "style": f"transform: translateY({i * 72}px)",
+                                    **(selected if on_row else {})}, "children": [
+        {"tag": "div", "attrs": {"role": "row", "tabindex": "-1", **({} if on_row else selected)}, "children": [
+            {"tag": "div", "attrs": {"data-testid": "cell-frame-title"}, "children": [
+                {"tag": "span", "attrs": {"dir": "auto", "title": name}, "children": words(name)}]}]}]}
+
+
+def chat_list(*names, chip=0, search="", on_row=False, start=0):
+    """#side with the chat list: each name a chat, the one starting with "*" marked as open; its search
+    box (`search` typed), and its filter chips, the `chip`th on. `start`: the place of the first row
+    drawn (the list scrolled down)."""
+    rows = [list_row(start + i, name.lstrip("*"), name.startswith("*"), on_row) for i, name in enumerate(names)]
+    chips = [{"tag": "button", "attrs": {"role": "tab", "aria-selected": str(i == chip).lower()}, "children": words(word)}
+             for i, word in enumerate(("All", "Unread", "Groups"))]
+    return {"tag": "div", "attrs": {"id": "side"}, "children": [
+        {"tag": "div", "attrs": {"id": "search", "contenteditable": "true", "role": "textbox"},
+         "children": words(search) if search else []},
+        {"tag": "div", "attrs": {"role": "tablist"}, "children": chips},
+        {"tag": "div", "attrs": {"id": "pane-side"}, "children": [
+            {"tag": "div", "attrs": {"id": "grid", "role": "grid"}, "children": rows}]}]}
+
+
 def header(title, picture="", title_attr=True, emoji=None):
     """The open chat's header as the mock draws it: its picture, its name (the name's emoji as a
     picture, `emoji`), and WhatsApp's call buttons."""
@@ -1411,10 +1486,11 @@ class SameChatTest(unittest.TestCase):
         self.assertIsNone(exception, exception and exception.get_message())
         return value
 
-    def same(self, main, title="Mum", body="", icon="", before=None, closed=False):
+    def same(self, main, title="Mum", body="", icon="", before=None, closed=False, listing=None):
         """sameChat on `main` (a tree) for a notification; before: None (no click), or the chat open
-        before the click: "none" (no chat) or its title. closed: the notification clicked was closed."""
-        self.run_js(f"load({json.dumps({'tag': 'div', 'attrs': {'id': 'app'}, 'children': [main]})})")
+        before the click: "none" (no chat) or its title. closed: the notification clicked was closed.
+        listing: the chat list beside it (chat_list), or none."""
+        self.run_js(f"load({json.dumps({'tag': 'div', 'attrs': {'id': 'app'}, 'children': [listing, main] if listing else [main]})})")
         names = [{"name": before, "at": 0}] if before and before != "none" else []
         clicked = "null" if before is None else ("{main: %s, names: %s, closed: %s}" % (
             "null" if before == "none" else "{}", json.dumps(names), json.dumps(closed)))
@@ -1556,7 +1632,9 @@ class SameChatTest(unittest.TestCase):
         for icon in ("blob:file:///mum", "https://pps.whatsapp.net/v/t61/mum.jpg?oh=1&oe=2"):
             main = chat_main("Mum", [row(bare(1), "See you")], picture=icon)
             self.assertEqual(self.same(main, body="Did you eat?", icon=icon), "name+avatar", icon)
-            self.assertEqual(self.same(main, body="Did you eat?", icon=icon + "x"), "", icon)
+            self.assertEqual(self.same(main, body="Did you eat?", icon=icon.replace("mum", "dad")), "", icon)
+        self.assertEqual(self.same(chat_main("Mum", [row(bare(1), "See you")], picture="blob:file:///mum"),
+                                   body="Did you eat?", icon="blob:file:///mumx"), "")  # a blob: one whole
         # Stand-ins that every chat without a picture may have, and pictures from elsewhere.
         for stand_in in ("data:image/png;base64,iVBORw0KGgo=", "https://static.whatsapp.net/rsrc.php/default.png",
                          "https://example.com/mum.jpg", "https://pps.whatsapp.net.example.com/mum.jpg",
@@ -1577,6 +1655,138 @@ class SameChatTest(unittest.TestCase):
         main = chat_main("Mum", [row(bare(1), "Did you eat?")], picture="blob:file:///mum")
         self.assertEqual(self.same(main, body="Did you eat?", icon="blob:file:///mum", before="none"), "name+body")
         self.assertEqual(self.same(main, body="Hello?", icon="blob:file:///mum", before="none"), "name+avatar")
+
+    # ---- The list marking the chat open (listed)
+
+    def test_the_list_marking_the_chat_open(self):
+        # Clicked, its notification still shown, and the chat open the only one of its name in the
+        # list and the one the list marks as open: told by that, with no message or picture to tell it by.
+        main = chat_main("Mum", [row(bare(1), "See you")])
+        clicked = {"body": "Did you eat?", "before": "Mum"}
+        self.assertEqual(self.same(main, listing=chat_list("*Mum", "Work Team"), **clicked), "name+listed")
+        self.assertEqual(self.same(main, listing=chat_list("Work Team", "*Mum", on_row=True), **clicked), "name+listed")
+        self.assertEqual(self.same(main, listing=chat_list("*Mum\u200e"), **clicked), "name+listed")  # as names compare
+        self.assertEqual(self.same(main, listing=chat_list("A", "B", "C", "*Mum", "D"), **clicked), "name+listed")
+        # The message still said first, when it's there too.
+        there = chat_main("Mum", [row(bare(1), "Did you eat?")])
+        self.assertEqual(self.same(there, listing=chat_list("*Mum"), **clicked), "name+body")
+
+    def test_the_list_isnt_enough_when(self):
+        main = chat_main("Mum", [row(bare(1), "See you")])
+        clicked = {"body": "Did you eat?", "before": "Mum"}
+        for listing, why in ((chat_list("*Mum", "Mum"), "two of the name"),
+                             (chat_list("Mum", "*Mum"), "two of the name, the other unmarked"),
+                             (chat_list("*Mum", "Work Team", chip=1), "a filter chip on"),
+                             (chat_list("*Mum", "Work Team", search="Mu"), "a search typed"),
+                             (chat_list("Mum", "*Work Team"), "a chat of the name open, another marked"),
+                             (chat_list("Mum", "Work Team"), "none marked"),
+                             (chat_list("*Mum", "*Work Team"), "two marked"),
+                             (chat_list("*Work Team"), "the name not in the list"),
+                             (chat_list("A", "B", "C", "D", "*Mum"), "the chat below the list's first four"),
+                             (chat_list("A", "*Mum", "B", start=1), "the list's top not drawn"),
+                             (None, "no list")):
+            self.assertEqual(self.same(main, listing=listing, **clicked), "", why)
+        good = chat_list("*Mum", "Work Team")
+        self.assertEqual(self.same(main, listing=good, body="Did you eat?"), "")  # not clicked
+        self.assertEqual(self.same(main, listing=good, closed=True, **clicked), "")  # closed: may open nothing
+        self.assertEqual(self.same(main, listing=good, title="Dad", body="Did you eat?", before="Mum"), "")
+        self.assertEqual(self.same(main, listing=chat_list("*Dad"), title="Dad", body="Did you eat?", before="Mum"), "")
+
+    # ---- The message where WhatsApp marks no row with which way it went
+
+    def test_a_message_without_which_way_it_went(self):
+        # As the live page now draws them: any of the latest rows, while the list shows all the chats
+        # and one of the name (it needn't mark the chat open).
+        main = chat_main("Mum", [live_row(bare(1), "Did you eat?"), live_row(bare(2), "See you")])
+        sole = chat_list("Mum", "Work Team")
+        self.assertEqual(self.same(main, body="Did you eat?", listing=sole, before="Mum"), "name+body")
+        # Not for a notification closed, or not clicked: the click may open nothing, and the words
+        # may be the person's own.
+        self.assertEqual(self.same(main, body="Did you eat?", listing=sole), "")
+        self.assertEqual(self.same(main, body="Did you eat?", listing=sole, before="Mum", closed=True), "")
+        self.assertEqual(self.same(main, body="Did you sleep?", listing=sole, before="Mum"), "")
+        for listing, why in ((None, "no list"), (chat_list("Mum", "Mum"), "two of the name"),
+                             (chat_list("Mum", chip=1), "a filter chip on"), (chat_list("Mum", search="Mu"), "a search"),
+                             (chat_list("Work Team"), "the name not in the list"),
+                             (chat_list("A", "B", "C", "D", "Mum"), "the chat below the list's first four"),
+                             (chat_list("A", "Mum", start=1), "the list's top not drawn")):
+            self.assertEqual(self.same(main, body="Did you eat?", listing=listing, before="Mum"), "", why)
+        # Where WhatsApp's classes are there, as before: only a message that came in.
+        for rows in ([live_row(bare(1), "Did you eat?"), live_row(bare(2), "See you", way="in")],
+                     [live_row(bare(1), "Did you eat?", way="out")]):
+            self.assertEqual(self.same(chat_main("Mum", rows), body="Did you eat?", listing=sole, before="Mum"), "")
+        self.assertEqual(self.same(chat_main("Mum", [live_row(bare(1), "Did you eat?", way="in")]), body="Did you eat?",
+                                   listing=sole, before="Mum"), "name+body")
+
+    def test_its_words_as_the_live_page_draws_them(self):
+        sole = chat_list("Mum", "Football Sunday")
+
+        def same(rows, body, title="Mum", before=None, **named):
+            return self.same(chat_main(title, rows), title=title, body=body, listing=sole, before=before or title, **named)
+        # The time drawn in the words' own span, emoji as pictures (by alt, or data-plain-text).
+        self.assertEqual(same([live_row(bare(1), "Did you eat?", joined=True)], "Did you eat?"), "name+body")
+        self.assertEqual(same([live_row(bare(1), "Yes mum ", ("img", "\U0001F44D"), joined=True)], "Yes mum \U0001F44D"),
+                         "name+body")
+        plain = live_row(bare(1), "Love you ", ("img", "\u2764"))
+        emoji = plain["children"][0]["children"][0]["children"][0]["children"][0]["children"][1]
+        emoji["attrs"]["data-plain-text"] = emoji["attrs"].pop("alt")
+        self.assertEqual(same([plain], "Love you \u2764"), "name+body")
+        # Only the row's own time is set aside: words that end with another are still words.
+        self.assertEqual(same([live_row(bare(1), "Meet at 10:30", joined=True)], "Meet at 10:30"), "name+body")
+        self.assertEqual(same([live_row(bare(1), "Meet at 10:30", joined=True)], "Meet at", before="Mum"), "")
+        # A group's sender's name in the same span, before the words.
+        group = [live_row(bare(1), "See you at 5", sender="Ana", joined=True)]
+        self.assertEqual(same(group, "Bo: See you at 5", title="Football Sunday"), "name+body")
+        self.assertEqual(same(group, "Ana: ok", title="Football Sunday"), "")  # other words
+        self.assertEqual(same([live_row(bare(1), "ok", sender="Ana", joined=True)], "Ana: ok", title="Football Sunday"),
+                         "name+body")  # the sender's own label: short words will do
+        # Closed (strict), with WhatsApp's classes: the sender too.
+        group = [live_row(bare(1), "See you at 5", sender="Ana", joined=True, way="in")]
+        for body, told in (("Ana: See you at 5", "name+body"), ("Bo: See you at 5", "")):
+            self.assertEqual(same(group, body, title="Football Sunday", closed=True), told, body)
+        # Words that end with the body, with no element of their own before it: not it.
+        self.assertEqual(same([live_row(bare(1), "Look ok", joined=True)], "ok", before="Mum"), "")
+        self.assertEqual(same([live_row(bare(1), "Look ok")], "ok", before="Mum"), "")
+        # A word of the message set apart (bold, a link, an @mention) isn't a sender's label: short
+        # words after it are not the body; four letters or more are.
+        for tag, first in (("strong", "Look"), ("a", "web.site"), ("span", "@Sam")):
+            def apart(rest):
+                tree = live_row(bare(1), rest, joined=True)
+                tree["children"][0]["children"][0]["children"].insert(0, {"tag": tag, "attrs": {}, "children": words(first)})
+                return [tree]
+            self.assertEqual(same(apart(" ok"), "ok"), "", tag)
+            self.assertEqual(same(apart(" see you"), "see you"), "name+body", tag)
+        # A long message WhatsApp shows cut short, with "Read more": enough of it.
+        long = "This is a long message about dinner tonight and what we should all bring along"
+        self.assertEqual(same([live_row(bare(1), long[:44] + "…", more=True)], long), "name+body")
+        self.assertEqual(same([live_row(bare(1), long[:44], more=True)], long), "name+body")
+        self.assertEqual(same([live_row(bare(1), long[:14] + "…", more=True)], long, before="Mum"), "")  # too little
+        self.assertEqual(same([live_row(bare(1), long[:44] + "…", more=True)], long.replace("dinner", "lunch")), "")
+
+    # ---- The picture by its path
+
+    def test_the_picture_by_its_path(self):
+        picture = "https://pps.whatsapp.net/v/t61.24694-24/1234_5678_n.jpg?ccb=11-4&oh=01_A&oe=6720&_nc_sid=e6ed6c"
+        main = chat_main("Mum", [row(bare(1), "See you")], picture=picture)
+        for icon in ("https://pps.whatsapp.net/v/t61.24694-24/1234_5678_n.jpg?stp=dst-jpg_s96x96&oh=01_B&oe=6721",
+                     "https://PPS.whatsapp.net/v/t61.24694-24/1234_5678_n.jpg", picture + "#x"):
+            self.assertEqual(self.same(main, body="Did you eat?", icon=icon), "name+avatar", icon)
+        for icon in ("https://pps.whatsapp.net/v/t61.24694-24/9999_5678_n.jpg?ccb=11-4&oh=01_A&oe=6720",
+                     "https://pps.whatsapp.net/v/t61.24694-24/1234_5678_N.jpg", "https://pps.whatsapp.net/",
+                     "https://mmg.whatsapp.net/v/t61.24694-24/1234_5678_n.jpg", "http://pps.whatsapp.net/v/t61.24694-24/1234_5678_n.jpg",
+                     "https://x@pps.whatsapp.net/v/t61.24694-24/1234_5678_n.jpg", "blob:" + picture):
+            self.assertEqual(self.same(main, body="Did you eat?", icon=icon), "", icon)
+        # WhatsApp's static host, a stand-in many chats may have: never, at any address.
+        stand_in = "https://static.whatsapp.net/rsrc.php/v4/default.png?x=1"
+        main = chat_main("Mum", [row(bare(1), "See you")], picture=stand_in)
+        self.assertEqual(self.same(main, body="Did you eat?", icon=stand_in.replace("x=1", "x=2")), "")
+
+    def test_kinds_of_picture_address(self):
+        for address, kind in (("data:image/png;base64,iVBO", "data"), ("blob:https://web.whatsapp.com/1-2", "blob"),
+                              ("https://pps.whatsapp.net/v/x.jpg?oh=1", "wa"), ("https://static.whatsapp.net/a.png", "wa"),
+                              ("https://example.com/a.jpg", "https-other"), ("https://whatsapp.net.example.com/a", "https-other"),
+                              ("http://pps.whatsapp.net/a.jpg", "https-other"), ("", "none"), (None, "none")):
+            self.assertEqual(self.run_js(f"pictureKind({json.dumps(address)})").to_string(), kind, address)
 
     def test_sent_seen(self):
         def seen(keys_before, keys_after, box="", words="x", way="out"):
@@ -1629,7 +1839,7 @@ class SameChatTest(unittest.TestCase):
         self.assertEqual(diag["values"], ["data-chat=9@a.a", "data-id=a_9@a.a_9a9a9"])
         self.assertEqual(reply_diag({"diag": diag}), diag)
         for value in json.dumps(diag), diag_line(diag):
-            for secret in ("Mum", "eat", "447700900104", "4917612345678", "3EB0", "blob"):
+            for secret in ("Mum", "eat", "447700900104", "4917612345678", "3EB0", "blob:", "file:", "mum"):
                 self.assertNotIn(secret, value)
 
 
@@ -1922,12 +2132,10 @@ class ReplyWaitTest(unittest.TestCase):
         if empties:
             self.run_js('onPress = () => { find("main").querySelector("footer [contenteditable]").childNodes = []; }')
 
-    def list_rows(self, *names):
-        """The chat list's rows, as the live page draws them: each name in a titled span."""
-        rows = [{"tag": "div", "attrs": {"role": "listitem", "style": f"transform: translateY({i * 72}px)"},
-                 "children": [{"tag": "div", "attrs": {"data-testid": "cell-frame-title"}, "children": [
-                     {"tag": "span", "attrs": {"dir": "auto", "title": name}, "children": words(name)}]}]}
-                for i, name in enumerate(names)]
+    def list_rows(self, *names, start=0):
+        """The chat list's rows, as the live page draws them (list_row): each name in a titled span,
+        the one starting with "*" marked as the chat open; the first at place `start`."""
+        rows = [list_row(start + i, name.lstrip("*"), name.startswith("*")) for i, name in enumerate(names)]
         self.run_js(f'add(find("pane").querySelector("#grid"), {json.dumps(rows)})')
 
     def assert_private(self, diag):
@@ -2021,6 +2229,129 @@ class ReplyWaitTest(unittest.TestCase):
                          f'add(find("main").querySelector("#send-slot"), [{json.dumps(self.SEND)}]); mutate();')
         self.assertEqual(self.run_reply()[:2], ("left-as-draft", "moved"))
         self.assertEqual(self.run_js("pressed").to_int32(), 0)
+
+    # ---- The owner's live page (0.1.1): no direction classes, the click opening nothing new ------
+
+    def test_the_owners_live_case(self):
+        # The right chat open in the main window, its row marked in the list, its messages without
+        # message-in or message-out, and WhatsApp's click opening nothing new (it was open): sent, by
+        # the notified message where it shows, and by the list where it doesn't.
+        for rows, how in (([live_row(bare(1), "Hi"), live_row(bare(2), "Did you eat?")], "name+body"),
+                          ([live_row(bare(1), "Hi"), live_row(bare(2), "\U0001F4F7 Photo")], "name+listed")):
+            self.setUp()
+            self.list_rows("Work Team", "*Mum", "Football Sunday")
+            self.header("Mum", picture="https://pps.whatsapp.net/v/t61/mum.jpg?oh=1")
+            for tree in rows:
+                self.add_row(tree)
+            self.send_button()
+            said = dict(self.MUM, icon="data:image/png;base64,iVBORw0KGgo=")
+            self.assertEqual(self.run_reply(said)[:2], ("sent", how), how)
+            self.assertEqual((self.run_js("clicked").to_int32(), self.run_js("pressed").to_int32()), (1, 1), how)
+
+    def test_the_message_alone_without_direction_classes(self):
+        # No row marked in the list: the message, with one chat of the name in it, is enough.
+        self.list_rows("Mum", "Work Team")
+        self.header("Mum")
+        self.add_row(live_row(bare(1), "Did you eat?"))
+        self.send_button()
+        self.assertEqual(self.run_reply()[:2], ("sent", "name+body"))
+
+    def assert_refused(self, found, why="unconfirmed"):
+        diag = self.assert_mismatch(found, why)
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+        self.assert_private(diag)
+        return diag
+
+    def test_listed_traps(self):
+        # Each with the chat of that name open, the click opening nothing new, and no message or
+        # picture to tell it by but the list (and, without direction classes, the words).
+        def trap(*names, body="Did you eat?", script="", close=False, start=0):
+            self.setUp()
+            self.list_rows(*names, start=start)
+            self.header("Mum")
+            self.add_row(live_row(bare(1), "Did you eat?"))
+            self.send_button()
+            if script:
+                self.run_js(script)
+            said = dict(self.MUM, body=body)
+            return self.close_it(said) if close else self.run_reply(said)
+        # Two of the name in the list, one marked: neither the list nor the words.
+        diag = self.assert_refused(trap("*Mum", "Mum"))
+        self.assertEqual({key: diag[key] for key in ("name", "navigated", "body", "avatar", "listed", "selected",
+                                                     "selectedName", "dirClasses", "messageAnywhere", "messageWords")},
+                         {"name": True, "navigated": False, "body": False, "avatar": False, "listed": False,
+                          "selected": 1, "selectedName": True, "dirClasses": False, "messageAnywhere": True,
+                          "messageWords": True})
+        # A filter chip on, or a search typed.
+        diag = self.assert_refused(trap("*Mum", "Work Team", script='find("side").querySelectorAll(\'[role="tab"]\')'
+                                        '.forEach((chip, i) => { chip.attributes["aria-selected"] = String(i === 1); })'))
+        self.assertEqual((diag["listed"], diag["selected"], diag["selectedName"]), (False, 1, True))
+        self.assert_refused(trap("*Mum", "Work Team", script='add(find("search"), [{text: "Mu"}])'))
+        # A notification closed before the reply was asked: no list (it may open nothing), and the
+        # words only as a closed one's (here, other words).
+        diag = self.assert_refused(trap("*Mum", "Work Team", body="Are you home yet?", close=True))
+        self.assertEqual((diag["listed"], diag["selectedName"], diag["messageAnywhere"]), (False, True, False))
+        # A chat of the name open, but another row marked as open, or none.
+        diag = self.assert_refused(trap("Mum", "*Work Team", body="Are you home yet?"))
+        self.assertEqual((diag["listed"], diag["selected"], diag["selectedName"]), (False, 1, False))
+        diag = self.assert_refused(trap("Mum", "Work Team", body="Are you home yet?"))
+        self.assertEqual((diag["listed"], diag["selected"]), (False, 0))
+        # Two rows marked.
+        self.assert_refused(trap("*Mum", "*Work Team", body="Are you home yet?"))
+        # Without direction classes, the words with two of the name in the list: no.
+        diag = self.assert_refused(trap("Mum", "Work Team", "Mum"))
+        self.assertEqual((diag["body"], diag["messageAnywhere"], diag["dirClasses"]), (False, True, False))
+        # The list scrolled down to an old chat of the name, open and marked, the list's top not drawn:
+        # another of the name, just written to, may be up there. Neither the list nor the words.
+        diag = self.assert_refused(trap("Work Team", "*Mum", "Football Sunday", start=30))
+        self.assertEqual((diag["listed"], diag["body"], diag["selected"], diag["selectedName"], diag["messageAnywhere"]),
+                         (False, False, 1, True, True))
+        # The top drawn, but the chat far below it: not one just written to.
+        self.assert_refused(trap("A", "B", "C", "D", "E", "*Mum", body="Are you home yet?"))
+        self.assert_refused(trap("A", "B", "C", "D", "E", "Mum"))
+
+    def test_listed_told_again_just_before_send(self):
+        # Told by the list: just before Send the list must still mark it. Another row marked by then
+        # (another chat open in its place), and Send isn't pressed.
+        self.list_rows("*Mum", "Work Team")
+        self.header("Mum")
+        self.add_row(live_row(bare(1), "See you"))
+        self.later(3000, f'add(find("main").querySelector("#send-slot"), [{json.dumps(self.SEND)}]); '
+                         'find("pane").querySelectorAll(\'[role="row"]\').forEach((row, at) => { '
+                         'row.attributes["aria-selected"] = String(at === 1); }); mutate();')
+        self.assertEqual(self.run_reply()[:2], ("left-as-draft", "moved"))
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+        # The list still marking it: sent.
+        self.setUp()
+        self.list_rows("*Mum", "Work Team")
+        self.header("Mum")
+        self.add_row(live_row(bare(1), "See you"))
+        self.later(3000, f'add(find("main").querySelector("#send-slot"), [{json.dumps(self.SEND)}]); mutate();')
+        self.run_js('onPress = () => { find("main").querySelector("footer [contenteditable]").childNodes = []; }')
+        self.assertEqual(self.run_reply()[:2], ("sent", "name+listed"))
+
+    def test_the_words_without_direction_classes_told_again_just_before_send(self):
+        # Told by the words, with one of the name in the list: a second of the name drawn by then
+        # (the list scrolled), and Send isn't pressed.
+        self.list_rows("Mum", "Work Team")
+        self.header("Mum")
+        self.add_row(live_row(bare(1), "Did you eat?"))
+        self.later(3000, f'add(find("main").querySelector("#send-slot"), [{json.dumps(self.SEND)}]); '
+                         f'add(find("pane").querySelector("#grid"), [{json.dumps(list_row(2, "Mum"))}]); mutate();')
+        self.assertEqual(self.run_reply()[:2], ("left-as-draft", "moved"))
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+
+    def test_the_kinds_of_the_pictures(self):
+        # The log says what kind of address each picture had, never the address.
+        self.list_rows("*Mum")
+        self.header("Mum", picture="https://pps.whatsapp.net/v/t61/mum.jpg?oh=1")
+        self.add_row(row(bare(1), "See you"))
+        diag = self.assert_refused(self.close_it(dict(self.MUM, icon="data:image/png;base64,iVBORw0KGgo=")))
+        self.assertEqual((diag["iconKind"], diag["headerImgKind"], diag["avatar"], diag["dirClasses"]),
+                         ("data", "wa", False, True))
+        for value in json.dumps(diag), diag_line(diag):
+            for secret in ("pps", "whatsapp.net", "iVBOR", "base64"):
+                self.assertNotIn(secret, value)
 
     # ---- After the check: what the log has of the footer ----------------------------------------
 

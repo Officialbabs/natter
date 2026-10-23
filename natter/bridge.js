@@ -328,6 +328,7 @@
     "pane": ["#pane-side"],                                // the chat list
     "row": ['[role="listitem"]', '[role="row"]'],          // one chat in the list
     "row-name": ['[data-testid="cell-frame-title"] span[title]', "span[title]"],  // in a row
+    "row-selected": ['[aria-selected="true"]'],            // the open chat's mark, on its row or in it
     "side": ["#side"],                                     // the panel with the list and search
     "search": ['#side [contenteditable="true"][role="textbox"]', '#side [contenteditable="true"]',
                '#side input[type="text"], #side input[type="search"], #side input[role="textbox"]'],
@@ -401,7 +402,8 @@
     return Number.isFinite(position) ? Math.max(0, position) : fallback;
   }
 
-  function chatRows() {
+  // The list's rows with a name, as drawn: [name, row, its translateY, its place in the page].
+  function namedRows() {
     const list = find("pane");
     if (!list) return [];
     const found = [];
@@ -410,6 +412,15 @@
       const name = nameOf(row);
       if (name) found.push([name, row, offsetOf(row), i]);
     });
+    return found;
+  }
+
+  // Whether the list marks `row` as the open chat's (WhatsApp's aria-selected, on the row or in it).
+  const selectedRow = (row) => WHERE["row-selected"].some((selector) => row.matches(selector)
+    || Boolean(row.querySelector(selector)));
+
+  function chatRows() {
+    const found = namedRows();
     const height = rowHeight(found.map((entry) => entry[2]));
     const rows = found.map(([name, row, offset, i]) => [name, positionOf(row, offset, height, i)]);
     return rows.sort((a, b) => a[1] - b[1]).slice(0, 200);
@@ -1016,14 +1027,15 @@
   // ---- The chat told without its id
   // With keys that name no chat, the chat that opened is told by its name in the header, which must
   // be the notification's title, and at least one more sign that it's the chat notified: the
-  // notified message among its latest rows, the header's picture the notification's, or the reply's
-  // own click having opened it (from no chat, or from one with another name). A name alone never:
-  // two chats can have the same one. Nor is a chat taken on its message while its notification can
-  // be clicked: the click (WhatsApp's open by id) comes first. One WhatsApp closed may not open its
-  // chat when clicked, so its message is held to more (`strict`): longer words, and a group's
-  // sender's too. And a chat the click didn't open is never taken while the chat list shows two of
-  // that name, or shows only some chats (namesakes): the click may open nothing, or the other one
-  // only later.
+  // notified message among its latest rows, the header's picture the notification's, the reply's own
+  // click having opened it (from no chat, or from one with another name), or the chat list marking it
+  // as the chat open, the only one of that name there and near its top, once a notification still
+  // shown was clicked (listed). A name alone never: two chats can have the same one. Nor is a chat taken on its message
+  // while its notification can be clicked: the click (WhatsApp's open by id) comes first. One
+  // WhatsApp closed may not open its chat when clicked, so its message is held to more (`strict`):
+  // longer words, and a group's sender's too. And a chat the click didn't open is never taken while
+  // the chat list shows two of that name, or shows only some chats (namesakes): the click may open
+  // nothing, or the other one only later.
 
   const LAST_ROWS = 12;  // the latest rows of the open chat, where the notified message is looked for
 
@@ -1053,7 +1065,7 @@
   }
 
   // What a notification's body may be found as in its chat: the body, and in a group the words
-  // after "<sender>: " (`strict`: with the sender's name in the same row). One cut short ("…")
+  // after "<sender>: " (`strict`: with the sender's name in the same row; `label`: that name, flat). One cut short ("…")
   // stands for how the message starts. Under two characters (one emoji, say), or generic: nothing,
   // and a generic body nothing at all. `strict`: under four letters or digits (twelve for one cut
   // short), nothing either: "ok" or "Yes" could be any chat's.
@@ -1061,16 +1073,19 @@
     const text = String(body || "");
     if (generic(text)) return [];
     const found = [];
-    const add = (part, sender) => {
+    const add = (part, sender, label) => {
       let words = flat(part);
       const start = words.endsWith("…");
       if (start) words = words.slice(0, -1);
       const enough = strict ? (words.match(/[\p{L}\p{N}]/gu) || []).length >= (start ? 12 : 4) : [...words].length >= 2;
-      if (enough && !generic(part)) found.push({ words, start, sender });
+      if (enough && !generic(part)) found.push({ words, start, sender, label });
     };
-    add(text, "");
+    add(text, "", "");
     const colon = text.indexOf(": ");
-    if (colon > 0) add(text.slice(colon + 2), strict ? flat(text.slice(0, colon)) : "");
+    if (colon > 0) {
+      const label = flat(text.slice(0, colon));
+      add(text.slice(colon + 2), strict ? label : "", label);
+    }
     return found;
   }
 
@@ -1079,7 +1094,7 @@
   function eachText(element, visit) {
     const text = [...element.childNodes].map((node) => {
       if (node.nodeType === Node.TEXT_NODE) return node.textContent;
-      if (node.tagName === "IMG") return node.getAttribute("alt") || "";
+      if (node.tagName === "IMG") return node.getAttribute("alt") || node.getAttribute("data-plain-text") || "";
       return node.nodeType === Node.ELEMENT_NODE && !isIcon(node) ? eachText(node, visit) : "";
     }).join("");
     visit(text);
@@ -1099,6 +1114,9 @@
     return texts;
   }
 
+  // Whether WhatsApp marks which way `main`'s messages went (message-in, message-out) at all. Without
+  // those classes a message that came in can't be told from the person's own (hasMessage).
+  const directed = (main) => Boolean(main.querySelector(".message-in, .message-out"));
   // Whether the person sent the message in `row` (WhatsApp's class for one's own), not received it.
   const ownRow = (row) => Boolean(row.querySelector(".message-out")) && !row.querySelector(".message-in");
   // Whether `row` holds a message that came in (WhatsApp's class for one).
@@ -1149,18 +1167,63 @@
     return false;
   }
 
-  // Whether the notified message shows in `main`: something in one of its latest rows that came in
-  // (inRow: not the person's own, nor any row at all should WhatsApp's classes change), with just
-  // its words (or, for a body cut short, starting with them), and with `strict` a group's sender's
-  // name there too, or on the row that starts its run (bodies, sentBy).
-  function hasMessage(main, body, strict) {
-    const wanted = bodies(body, strict);
-    return wanted.length > 0 && latestRows(main).some((row) => {
-      if (!inRow(row)) return false;
-      const texts = textsIn(row);
-      return wanted.some((want) => texts.some((words) => (want.start ? words.startsWith(want.words) : words === want.words))
-        && (!want.sender || sentBy(main, row, want.sender)));
+  // A time as WhatsApp draws one by each message (flat): "10:42", "9.05pm".
+  const TIME = /^\d{1,2}[:.]\d{2}(?:[ap]\.?m\.?)?$/i;
+  const letters = (words) => (words.match(/[\p{L}\p{N}]/gu) || []).length;
+  // A long message WhatsApp shows cut short ("Read more"): this many letters or digits of it at least.
+  const CUT_LETTERS = 24;
+
+  // Whether `row` shows `want` (one of bodies'), by the normalised rule: an element there with just
+  // its words (for a body cut short, starting with them), the row's time drawn in after them aside;
+  // the row's words as a whole, its time aside, being an element's words (a sender's label) and then
+  // those; or a long message WhatsApp shows cut short, CUT_LETTERS of it at least, that they start with.
+  // A label that isn't the notified sender's may be a word of the message set apart (bold, a link, an
+  // @mention): the words after it must then have four letters or digits at least.
+  function holds(row, want) {
+    const texts = textsIn(row);
+    // The row's time: the words of the last element in it that has only a time.
+    const time = texts.filter((words) => TIME.test(words)).pop() || "";
+    const untimed = (words) => (time && words.endsWith(time) ? words.slice(0, -time.length) : words);
+    const same = (words) => (want.start ? words.startsWith(want.words) : words === want.words);
+    if (texts.some((words) => same(words) || same(untimed(words)))) return true;
+    const whole = untimed(texts[texts.length - 1] || "");
+    const after = (label) => whole.slice(label.length);
+    if (texts.some((label) => label && label !== whole && whole.startsWith(label) && same(after(label))
+        && (label === want.label || letters(after(label)) >= 4))) {
+      return true;
+    }
+    return !want.start && texts.some((words) => {
+      const shown = untimed(words).replace(/(…|\.\.\.)$/u, "");
+      return shown !== want.words && want.words.startsWith(shown) && letters(shown) >= CUT_LETTERS;
     });
+  }
+
+  // Whether the notified message shows in `main`: something in one of its latest rows that came in
+  // (inRow: not the person's own), with its words (holds), and with `strict` a group's sender's name
+  // there too, or on the row that starts its run (bodies, sentBy). Where WhatsApp marks no row with
+  // which way it went (directed), any of those rows, but only as `sole()` allows (chatSigns): the
+  // words might be the person's own.
+  function hasMessage(main, body, strict, sole = () => false) {
+    const wanted = bodies(body, strict);
+    if (!wanted.length) return false;
+    const marked = directed(main);
+    if (!marked && !sole()) return false;
+    return latestRows(main).some((row) => (!marked || inRow(row))
+      && wanted.some((want) => holds(row, want) && (!want.sender || sentBy(main, row, want.sender))));
+  }
+
+  // For the log: whether the notified body is in any of the latest rows by the normalised rule
+  // (holds), whichever way they went, and whether it's within any of their words as a whole at all.
+  function messageFacts(main, body) {
+    const wanted = bodies(body, false);
+    const rows = latestRows(main);
+    return {
+      messageAnywhere: rows.some((row) => wanted.some((want) => holds(row, want))),
+      messageWords: rows.some((row) => {
+        const whole = textsIn(row).pop() || "";
+        return wanted.some((want) => whole.includes(want.words));
+      }),
+    };
   }
 
   // Whether `icon` may be told a chat by: a blob: picture or one from WhatsApp's picture hosts. Not
@@ -1173,12 +1236,39 @@
     return /^[a-z0-9.-]+\.whatsapp\.net$/.test(name) && name !== "static.whatsapp.net";
   }
 
-  // Whether `main`'s header shows the notification's picture, at the same address.
+  // A picture's address as pictures are told apart: a blob: one whole, and one on WhatsApp's picture
+  // hosts by its host and path, as the same picture comes with other query strings (its signature,
+  // expiry, size). "" for one that can't tell a chat (pictureAddress).
+  function pictureKey(address) {
+    const text = String(address || "");
+    if (!pictureAddress(text)) return "";
+    if (/^blob:/i.test(text)) return text;
+    const parts = /^https:\/\/([^/?#]*)([^?#]*)/i.exec(text);
+    return `https://${parts[1].toLowerCase()}${parts[2] || "/"}`;
+  }
+
+  // What kind of address a picture has, for the log: data, blob, wa (https, on *.whatsapp.net),
+  // https-other (any other address) or none. Never the address.
+  function pictureKind(address) {
+    const text = String(address || "");
+    if (!text) return "none";
+    if (/^data:/i.test(text)) return "data";
+    if (/^blob:/i.test(text)) return "blob";
+    const host = /^https:\/\/([^/?#]*)/i.exec(text);
+    return host && /^([a-z0-9-]+\.)*whatsapp\.net$/i.test(host[1]) ? "wa" : "https-other";
+  }
+
+  // The pictures in a header, not those in the chat's name (its emoji are pictures too).
+  function headerPictures(header) {
+    const title = find("header-name", header);
+    return [...header.querySelectorAll("img")].filter((img) => !(title && title.contains(img)));
+  }
+
+  // Whether `main`'s header shows the notification's picture, by its address (pictureKey).
   function samePicture(main, icon) {
     const header = find("header", main);
-    if (!header || !pictureAddress(String(icon || ""))) return false;
-    const title = find("header-name", header);  // its emoji are pictures too
-    return [...header.querySelectorAll("img")].some((img) => !(title && title.contains(img)) && img.getAttribute("src") === icon);
+    const key = pictureKey(icon);
+    return Boolean(header && key) && headerPictures(header).some((img) => pictureKey(img.getAttribute("src")) === key);
   }
 
   // Which of the header's names (namesOf) is `title`, or undefined.
@@ -1189,24 +1279,32 @@
   // closed: whether the notification clicked had been closed}), or null for no click.
   function chatSigns(main, notification, before) {
     const name = Boolean(nameAmong(namesOf(find("header", main)), notification.title));
+    // The words in rows not marked with which way they went: only for a notification still shown
+    // as of when the reply was asked and clicked, with its chat near the list's top (topRow).
+    const sole = () => Boolean(before) && !before.closed && Boolean(topRow(notification.title));
     return {
       name,
       // The click opened it: from no chat, or from one with names, none of them this one.
       navigated: Boolean(before) && name && (!before.main
         || (before.names.length > 0 && !nameAmong(before.names, notification.title))),
-      body: hasMessage(main, notification.body, !before || before.closed),
+      body: hasMessage(main, notification.body, !before || before.closed, sole),
       avatar: samePicture(main, notification.icon),
+      // The list marks it as the chat open, the only one of that name there, once a notification
+      // still shown as of when the reply was asked was clicked (WhatsApp's open by its id).
+      listed: Boolean(before) && !before.closed && name && listedAlone(notification.title),
     };
   }
 
   // Whether the chat open in `main` is `notification`'s, told without its id: by its name, and the
-  // notified message there, its picture, or the reply's click having opened it (`before`, as for
-  // chatSigns). Which, for Natter's log ("name+body"); "" if it isn't, or can't be told.
+  // notified message there, its picture, the reply's click having opened it, or the list marking it
+  // as the chat open (`before`, as for chatSigns). Which, for Natter's log ("name+body"); "" if it
+  // isn't, or can't be told.
   function sameChat(main, notification, before) {
     if (!main || !notification) return "";
     const signs = chatSigns(main, notification, before);
     if (!signs.name) return "";
-    return signs.body ? "name+body" : signs.avatar ? "name+avatar" : signs.navigated ? "name+click" : "";
+    return signs.body ? "name+body" : signs.avatar ? "name+avatar" : signs.navigated ? "name+click"
+      : signs.listed ? "name+listed" : "";
   }
 
   // How many chats in the list (chatRows, those WhatsApp has drawn) have the name `title`. Two or
@@ -1216,6 +1314,40 @@
   function namesakes(title) {
     if (searching() || filtered()) return null;
     return chatRows().filter(([name]) => sameName(name, title)).length;
+  }
+
+  // The rows the chat list marks as the open chat's (selectedRow): how many, and whether there's
+  // just one and it has the name `title`.
+  function listMark(title) {
+    const marked = namedRows().filter(([, row]) => selectedRow(row));
+    return { selected: marked.length, selectedName: marked.length === 1 && sameName(marked[0][0], title) };
+  }
+
+  // The places at the top of the list where a chat just written to sits: up to three pinned
+  // chats, then the latest.
+  const TOP_ROWS = 4;
+
+  // The list's one row of the name `title`, when the list shows all the chats (namesakes) from its
+  // top and has that row among its first TOP_ROWS; else null. The notified chat has just had a
+  // message, so it sits up there: one of the same name drawn there would be counted, and one not
+  // drawn (the list scrolled down) is never left out. Archived chats aren't in the list at all.
+  function topRow(title) {
+    if (namesakes(title) !== 1) return null;
+    const rows = namedRows();
+    const height = rowHeight(rows.map((entry) => entry[2]));
+    // A row's place by its aria-rowindex or translateY only, NaN if neither tells it.
+    const place = ([, row, offset]) => positionOf(row, offset, height, offset === 0 ? 0 : NaN);
+    const named = rows.filter(([name]) => sameName(name, title));
+    if (named.length !== 1 || !rows.some((entry) => place(entry) === 0)) return null;
+    return place(named[0]) < TOP_ROWS ? named[0][1] : null;
+  }
+
+  // Whether the list, showing all the chats from its top, has one row of the name `title` near the
+  // top (topRow), and marks that row, and only it, as the chat open.
+  function listedAlone(title) {
+    const row = topRow(title);
+    const marked = namedRows().filter(([, other]) => selectedRow(other));
+    return Boolean(row) && marked.length === 1 && marked[0][1] === row;
   }
 
   // ---- What the log may say of the page
@@ -1276,6 +1408,7 @@
     }
     const footer = main && find("footer", main);
     const box = main && composerIn(main);
+    const picture = header && headerPictures(header)[0];
     const facts = {
       visibilityState: document.visibilityState, innerWidth: size(innerWidth), innerHeight: size(innerHeight),
       main: Boolean(main), header: Boolean(header), footer: Boolean(footer),
@@ -1289,6 +1422,10 @@
       quote: Boolean(box && besideTheBox(main, box)), preview: previewOpen(),
       chatKeys: count(keys.filter((key) => /^(true|false)_/.test(key)).length),
       rows: count(main ? main.querySelectorAll('[role="row"]').length : 0), shape: keys.length ? shapeOf(keys[0]) : "",
+      // Whether WhatsApp marks which way messages went (directed), and the kind of the header's
+      // picture's address (pictureKind).
+      dirClasses: Boolean(main) && directed(main),
+      headerImgKind: pictureKind(picture ? picture.getAttribute("src") : ""),
       mainAttrs: attributeNames(main), headerAttrs: attributeNames(header), keyAttrs: attributeNames(first),
       rowAttrs: diagNames(around.flatMap((element) => element.getAttributeNames())),
       values: [...new Set(values)].sort().slice(0, DIAG_VALUES),
@@ -1296,7 +1433,14 @@
     if (notification) {
       const data = notification.data;
       Object.assign(facts, main ? chatSigns(main, notification, before)
-        : { name: false, navigated: false, body: false, avatar: false });
+        : { name: false, navigated: false, body: false, avatar: false, listed: false });
+      // How many rows the list marks as the chat open, and whether the one has the name; the body
+      // anywhere in the latest rows, or within their words at all; the kind of the notification's
+      // picture's address.
+      const mark = listMark(notification.title);
+      Object.assign(facts, { selected: count(mark.selected), selectedName: mark.selectedName },
+                    main ? messageFacts(main, notification.body) : { messageAnywhere: false, messageWords: false },
+                    { iconKind: pictureKind(notification.icon) });
       // Where in the header the name was: which of WHERE's places for it (-1, none), and whether
       // it was the first name there (titleOf's).
       const names = namesOf(header);

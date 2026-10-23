@@ -81,6 +81,15 @@
   </content_rating>
 
   <releases>
+    <release version="0.1.2" date="2026-10-23">
+      <description>
+        <p>Fixes for replying from notifications.</p>
+        <ul>
+          <li>Replies from a notification are confirmed by more of WhatsApp's current page: the chat list's open chat, the notified message without WhatsApp's old markup, and the chat's picture</li>
+          <li>The page lent to the reply card is drawn, so WhatsApp keeps working while a reply is sent</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.1" date="2026-10-23">
       <description>
         <p>Fixes for replying from notifications and for call sound.</p>

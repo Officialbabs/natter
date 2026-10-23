@@ -17,6 +17,7 @@ Natter Den's log names any it didn't find (`natter: <account>: WhatsApp's page h
 | Landmark | What leans on it |
 |---|---|
 | `#pane-side` and its rows (`[role="listitem"]`, `[role="row"]`) | the chat list, Ctrl+K, the dock menu, desktop search, and replies (two chats of the same name in it) |
+| the open chat's row marked `[aria-selected="true"]` (on a `#pane-side` row or in it), and the rows' places (`aria-rowindex` or `translateY`) | replies telling an open chat by the list marking it, near the list's top (`name+listed`) |
 | `[data-testid="cell-frame-title"] span[title]` in a row (else its `span[title]`) | chat names |
 | `#main header`, with the title in `[data-testid="conversation-info-header-chat-title"]` | which chat is open |
 | the link screen: a `canvas`, `[data-ref]` or `[data-link-code]` in `#app` (the QR code), with no `#pane-side` | telling the link screen from a page still loading |

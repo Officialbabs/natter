@@ -4,6 +4,7 @@ sight (not on screen, its window minimised or suspended, or the page hidden all 
 while locked, and back where and as it was on every way out. Stand-in widgets: no display, no page."""
 
 import inspect
+import re
 import tempfile
 import types
 import unittest
@@ -213,9 +214,21 @@ class LoanTest(unittest.TestCase):
 
     def test_the_holder_is_unseen_and_out_of_reach(self):
         source = inspect.getsource(HOLDER)
-        for part in ("Gtk.PolicyType.EXTERNAL, vscrollbar_policy=Gtk.PolicyType.EXTERNAL", "opacity=0",
-                     "can_target=False", "can_focus=False", "Gtk.Viewport("):
+        for part in ("Gtk.PolicyType.EXTERNAL, vscrollbar_policy=Gtk.PolicyType.EXTERNAL", "css_classes=[LENT_CLASS]",
+                     "can_target=False", "can_focus=False", "Gtk.Viewport(", "_style(Gdk.Display.get_default())"):
             self.assertIn(part, source)
+
+    def test_the_holder_is_drawn(self):
+        # Not opacity 0, which GTK doesn't draw (nor what's in it: the page would get no frames), nor
+        # set_opacity, which GTK keeps as a byte: CSS opacity, small enough to change no colour by half
+        # a step of 255.
+        source = inspect.getsource(HOLDER)
+        self.assertNotIn("opacity=", source)
+        self.assertIsNone(re.search(r"\.set_opacity\(", inspect.getsource(natter_loan)))
+        opacity = float(re.fullmatch(r"\.%s \{ opacity: ([0-9.]+); \}" % re.escape(natter_loan.LENT_CLASS),
+                                     natter_loan.LENT_CSS)[1])
+        self.assertGreater(opacity, 0)
+        self.assertLess(255 * opacity, 0.5)
 
     def test_given_back(self):
         loan = self.loan()

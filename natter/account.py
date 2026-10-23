@@ -98,11 +98,15 @@ PAGE_HIDDEN_SCRIPT = "return document.visibilityState;"
 # shape of one message key (each run of digits as 9, of letters as a), its footer (which place
 # found the message box, how many buttons, the shapes of its icons' names, whether a message being
 # replied to or a preview showed), which signs of the chat held (sameChat) and where in the header
-# the name was, what the notification carried (whether a body and a picture, its data's kind and
-# key names, its tag's shape), the names of the attributes on the chat, its header, its first
-# message and the elements up to that message's row, and the shapes of the values with an @ or _ in
-# them of those that carry keys (id, data-*). Never a name, words or an id. Natter adds whether
-# the page was on screen to WebKit (mapped) and lent to a reply card (loan.py).
+# the name was, how many rows the chat list marked as the chat open and whether the one had the name,
+# whether the messages were marked with which way they went, whether the notified body was in any of
+# the latest rows (by the bridge's rule, or within their words at all), the kinds of the
+# notification's and the header's pictures' addresses (data, blob, wa, https-other, none), what the
+# notification carried (whether a body and a picture, its data's kind and key names, its tag's
+# shape), the names of the attributes on the chat, its header, its first message and the elements up
+# to that message's row, and the shapes of the values with an @ or _ in them of those that carry keys
+# (id, data-*). Never a name, words or an id. Natter adds whether the page was on screen to WebKit
+# (mapped) and lent to a reply card (loan.py).
 REPLY_DIAG_COUNT = 999  # counts are capped at this
 REPLY_DIAG_SIZE = 9900  # sizes are in hundreds of pixels, up to this
 REPLY_DIAG_SHAPE = re.compile(r"[9a_@.:?-]{0,40}")
@@ -114,14 +118,18 @@ REPLY_DIAG_VALUES = 8  # "<name>=<shape>", at most
 # for it (bridge.js "header-name", "composer"), from 0, or -1 for none.
 REPLY_DIAG_PLACES = 3
 REPLY_DIAG_BOX_PLACES = 3
+# The kinds of a picture's address (bridge.js pictureKind): never the address.
+REPLY_DIAG_PICTURE = ("data", "blob", "wa", "https-other", "none")
 REPLY_DIAG = {
     "visibilityState": ("visible", "hidden", "prerender", "unloaded"),
     "rafFired": bool, "main": bool, "header": bool, "footer": bool, "composer": bool,
     "innerWidth": "size", "innerHeight": "size", "keys": "count", "chatKeys": "count", "rows": "count",
     "shape": "shape",
     "composerAt": "box-place", "buttons": "count", "icons": "shapes", "quote": bool, "preview": bool,
-    "name": bool, "navigated": bool, "body": bool, "avatar": bool, "hasBody": bool, "hasIcon": bool,
+    "name": bool, "navigated": bool, "body": bool, "avatar": bool, "listed": bool, "hasBody": bool, "hasIcon": bool,
     "nameAt": "place", "nameFirst": bool,
+    "selected": "count", "selectedName": bool, "dirClasses": bool, "messageAnywhere": bool, "messageWords": bool,
+    "iconKind": REPLY_DIAG_PICTURE, "headerImgKind": REPLY_DIAG_PICTURE,
     "dataType": ("null", "undefined", "object", "array", "string", "number", "boolean", "function", "bigint", "symbol"),
     "dataKeys": "names", "tagShape": "shape",
     "mainAttrs": "names", "headerAttrs": "names", "keyAttrs": "names", "rowAttrs": "names",
@@ -387,9 +395,20 @@ def diag_line(diag: dict) -> str:
             words.append(f"{name} {yes(diag[key])}")
     # The signs of the chat (bridge.js sameChat), and what the notification carried.
     for key, name in (("name", "name"), ("navigated", "opened"), ("body", "message"), ("avatar", "picture"),
-                      ("hasBody", "notified body"), ("hasIcon", "notified picture")):
+                      ("listed", "listed"), ("hasBody", "notified body"), ("hasIcon", "notified picture")):
         if key in diag:
             words.append(f"{name} {yes(diag[key])}")
+    # The list's mark on the open chat, the messages' direction classes, the body found more loosely,
+    # and the kinds of the pictures' addresses.
+    if "selected" in diag:
+        words.append(f"selected {diag['selected']}")
+    for key, name in (("selectedName", "selected name"), ("dirClasses", "direction classes"),
+                      ("messageAnywhere", "message anywhere"), ("messageWords", "message words")):
+        if key in diag:
+            words.append(f"{name} {yes(diag[key])}")
+    for key, name in (("iconKind", "notified picture kind"), ("headerImgKind", "header picture kind")):
+        if key in diag:
+            words.append(f"{name} {diag[key]}")
     # Where in the header the name was (which of the bridge's places for it), and whether first there.
     if "nameAt" in diag:
         words.append(f"name at {diag['nameAt'] if diag['nameAt'] >= 0 else 'none'}")

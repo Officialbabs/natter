@@ -5,11 +5,12 @@ minimised (or suspended by the desktop), or that account's tab not the one shown
 animation frames and no resize or intersection observers. WhatsApp draws a chat's messages from
 those, so a reply sent then found the chat open and empty, without the messages it's checked by.
 For as long as the reply runs, the page goes under the reply card, which is on screen: unseen
-(opacity 0), out of the pointer's and keyboard's way and hidden from screen readers, at the size it
-had in the window, inside a scrolled window that doesn't follow its size, so WhatsApp lays it out
-as before. It goes back where and as it was on every way out (give_back): the reply's answer, the
-card hidden or gone, the page crashing or loading again, and whatever the app gives it back for
-(the lock, the window shown or no longer minimised, the account removed, quitting).
+(all but no opacity, LENT_CSS, so GTK still draws it), out of the pointer's and keyboard's way and
+hidden from screen readers, at the size it had in the window, inside a scrolled window that doesn't
+follow its size, so WhatsApp lays it out as before. It goes back where and as it was on every way
+out (give_back): the reply's answer, the card hidden or gone, the page crashing or loading again,
+and whatever the app gives it back for (the lock, the window shown or no longer minimised, the
+account removed, quitting).
 """
 
 from __future__ import annotations
@@ -25,6 +26,16 @@ from gi.repository import Gdk, Gtk, WebKit
 # The page's size when it has never been laid out (Natter started hidden) and no window size is
 # known: never 0 × 0, which WhatsApp takes for a phone's screen, or nothing at all.
 FALLBACK_SIZE = (1000, 700)
+
+# How the lent page is kept unseen. Not opacity 0: GTK skips snapshotting a widget at opacity 0, and
+# everything in it, so WebKit's view is never drawn, the page gets no animation frames and WhatsApp
+# doesn't draw the chat. Nor set_opacity(0.001): GTK keeps that opacity as a byte, so 0.001 becomes 0,
+# and the least above it, 1/255, can change a colour by one step of 255. CSS opacity is kept as given:
+# at 0.001 the page is snapshotted, and changes no colour by as much as half a step of 255, so in
+# 8-bit output nothing shows. (GTK 4.22, tried: no snapshots at 0, nor at set_opacity(0.001).)
+LENT_CLASS = "natter-lent-page"
+LENT_CSS = f".{LENT_CLASS} {{ opacity: 0.001; }}"
+_styled: set = set()  # the displays LENT_CSS is on
 
 
 def page_size(allocated: tuple[int, int], window: tuple[int, int]) -> tuple[int, int]:
@@ -52,12 +63,24 @@ def out_of_sight(view) -> bool:
     return not view.get_mapped() or toplevel_hidden(view.get_root())
 
 
+def _style(display) -> None:
+    """LENT_CSS on `display`, once."""
+    if display is None or display in _styled:
+        return
+    _styled.add(display)
+    css = Gtk.CssProvider()
+    css.load_from_string(LENT_CSS)
+    Gtk.StyleContext.add_provider_for_display(display, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
 def _holder() -> tuple[Gtk.Widget, Gtk.Widget]:
     """What holds the page in the card: a scrolled window that neither scrolls nor follows its
-    child's size, and the viewport in it. Unseen and out of reach, the page in it included."""
+    child's size, and the viewport in it. Unseen (LENT_CLASS) and out of reach, the page in it
+    included, but drawn."""
+    _style(Gdk.Display.get_default())
     viewport = Gtk.Viewport(scroll_to_focus=False)
     holder = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.EXTERNAL, vscrollbar_policy=Gtk.PolicyType.EXTERNAL,
-                                child=viewport, opacity=0, can_target=False, can_focus=False)
+                                child=viewport, css_classes=[LENT_CLASS], can_target=False, can_focus=False)
     return holder, viewport
 
 

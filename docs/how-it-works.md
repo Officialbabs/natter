@@ -146,10 +146,21 @@ press Send:
    there aren't touched. WhatsApp's messages no longer carry the chat's id, so the chat is told by
    its name, which must be the notification's title, and at least one more sign: the message you
    were notified of among its latest messages (generic ones, such as "📷 Photo" or "Sticker", don't
-   count), its picture in the header being the notification's, or the reply's own click having
-   opened it, from no chat or from one with another name. A name alone is never enough, as two chats
-   can share one; a chat of that name open before the click needs the message or the picture. Only
-   messages that came in count as the message, not your own. For a notification WhatsApp had closed
+   count), its picture in the header being the notification's (WhatsApp's picture addresses compared
+   by their host and path, as the same picture comes with other query strings), the reply's own
+   click having opened it, from no chat or from one with another name, or the chat list marking it
+   as the chat open while it's the only chat of that name in the list, the list shows all the chats
+   from its top with the chat among its first four rows (up to three pinned chats, then the latest),
+   and the notification was still shown when you asked to reply (`listed`). A name alone is never
+   enough, as two chats can share one; a chat of that name open before the click needs the message,
+   the picture or the list. Only messages that came in count as the message, not your own; where
+   WhatsApp no longer marks which way its messages went, any of the latest messages counts, but only
+   for a notification still shown when you asked, with the chat list as for `listed` (it needn't
+   mark the chat open). A message drawn with a word set apart at its start (bold, a link, an
+   @mention) counts for the words after that only when they have four letters or digits at least,
+   unless that word is the group sender's name in the notification. The message is looked for as
+   WhatsApp draws it: its time or a group's sender's name drawn in with its words, and a long
+   message cut short with "Read more" by enough of its start. For a notification WhatsApp had closed
    when you asked to reply, whose click may open nothing, the message must have four letters or
    digits at least (twelve if the notification cut it short), and in a group the sender's name must
    show with it, or on the message that starts that sender's run of messages just above, with no
@@ -162,10 +173,13 @@ press Send:
    messages as long as the reply may take, less the time typing and Send need: when the message
    isn't the chat's latest, WhatsApp can take some seconds to load the ones around it. Just before
    Send it checks it's still the same chat, with the same name, and for a chat the click didn't
-   open, with the message or the picture still there. One case remains: with two chats of the same
-   name that aren't both in the visible chat list, and WhatsApp's click not opening the chat, or
-   opening it only after a second or so, the open one can be taken for the other if it shows the
-   same message.
+   open, with the message, the picture or the list's mark still there. One case remains: with two
+   chats of the same name that aren't both in the visible chat list, and WhatsApp's click not opening
+   the chat, or opening it only after a second or so, the open one can be taken for the other if it
+   shows the same message. The list's mark only counts near the list's top, where the other, just
+   written to, would be drawn too; archived chats aren't in the list at all, so an archived chat
+   notifying (a mention in a group, say) with the same name as an open chat near the top is a case
+   the list can't rule out.
 3. Your words go into the box through the page's own editing commands, a line at a time, and must
    land as you typed them (WhatsApp's own swap of `:-)` for an emoji aside).
 4. WhatsApp's Send button is pressed once, not the Enter key, and the reply counts as sent when
@@ -184,9 +198,10 @@ WhatsApp only draws a chat and its messages while its page is on screen. So whil
 window is closed or minimised (or hidden by the desktop some other way, as the page itself says),
 or shows another account, Natter Den moves WhatsApp's page under the reply window for as long as
 the reply runs: unseen, out of reach and at the size it had in the window, so WhatsApp draws the
-chat and its messages as it would there. The page goes back as soon as the reply ends, the reply
-window closes, Natter Den locks, or its window opens on that account, is no longer minimised or
-gets the focus. A reply typed in a KDE notification brings the reply window up for it, showing the
+chat and its messages as it would there. It's drawn at an opacity of 0.001, not 0, which GTK would
+skip drawing altogether, leaving the page without frames; at 0.001 it changes no colour on screen.
+The page goes back as soon as the reply ends, the reply window closes, Natter Den locks, or its
+window opens on that account, is no longer minimised or gets the focus. A reply typed in a KDE notification brings the reply window up for it, showing the
 words being sent. With the page on screen, WhatsApp may show you as online and mark the chat as
 read, as replying in WhatsApp itself would.
 
@@ -195,8 +210,8 @@ pages wait), and a hidden window's page isn't throttled meanwhile. A locked Natt
 send: Reply asks for the passcode first, words typed in a KDE notification while it's locked wait in
 the reply window until you press Send, and a reply window the lock closes with words in it comes
 back after the passcode. Natter Den's log says how each reply ended, and how the chat was told
-(`natter: reply: sent (name+body)`, or `name+avatar`, `name+click`, `ids`), not who to or what. When
-the chat wasn't the one or couldn't be told (`mismatch (other-name)`, `mismatch (unconfirmed)`,
+(`natter: reply: sent (name+body)`, or `name+avatar`, `name+click`, `name+listed`, `ids`), not who to
+or what. When the chat wasn't the one or couldn't be told (`mismatch (other-name)`, `mismatch (unconfirmed)`,
 `mismatch (ambiguous)`, `mismatch (filtered)` and the like, or `gone` or `not-ready` once WhatsApp's
 notification was clicked), or the reply stopped after the check (`draft (quote)`, `left-as-draft
 (no-button)`, `left-as-draft (text)`, `cant-send`, `unsure`), the line ends with what the page was
@@ -207,11 +222,15 @@ shape of its first key (each run of digits as 9, of letters as a). Then the foot
 bridge's places for the message box found it, how many buttons it had, the shapes of its icons'
 names, and whether a message being replied to or a preview showed by the box or a picture or file
 waited to be sent. Then which signs of the chat held (its name, the click opening it, the message,
-the picture), where in the header the name was found (which of the bridge's places for it, and
-whether it was the first name there), whether the notification had a body and a picture, the kind of
-its data and the names of its keys, the shape of its tag, the names of the attributes on the chat,
-its header, its first message and that message's row, and the shapes of the values with an `@` or
-`_` in them of those that hold keys (`id` and `data-` ones). Never a name, words, an id or their
+the picture, the list), whether the notification had a body and a picture, how many rows the chat
+list marked as the chat open and whether the one had the notification's name, whether the chat's
+messages were marked with which way they went, whether the notified message was among the latest
+ones whichever way they went, or within their words at all, and the kinds of the notification's and
+the header's picture addresses (`data`, `blob`, `wa`, `https-other` or `none`). Then where in the
+header the name was found (which of the bridge's places for it, and whether it was the first name
+there), the kind of the notification's data and the names of its keys, the shape of its tag, the
+names of the attributes on the chat, its header, its first message and that message's row, and the
+shapes of the values with an `@` or `_` in them of those that hold keys (`id` and `data-` ones). Never a name, words, an id or their
 lengths. A notification's id and its Reply and Mute actions name no chat, only a random reference,
 as desktops may keep them.
 
