@@ -331,8 +331,15 @@ class AboutTest(unittest.TestCase):
         metainfo = ElementTree.parse(ROOT / "data" / f"{DEFAULT_APP_ID}.metainfo.xml").getroot()
         release = metainfo.find("releases/release")
         self.assertEqual(release.get("version"), VERSION)
-        written = "".join(f"<p>{' '.join(''.join(p.itertext()).split())}</p>" for p in release.find("description"))
-        self.assertEqual(" ".join(RELEASE_NOTES.split()), written)
+
+        def markup(element):  # a <p>, <ul> or <li> as the About dialog takes it, white space folded
+            if element.tag == "ul":
+                inside = "".join(map(markup, element))
+            else:
+                inside = " ".join("".join(element.itertext()).split())
+            return f"<{element.tag}>{inside}</{element.tag}>"
+        written = "".join(map(markup, release.find("description")))
+        self.assertEqual(re.sub(r">\s+<", "><", " ".join(RELEASE_NOTES.split())), written)
 
     def test_debug_info(self):
         info = debug_info("the call window", None, False)

@@ -140,9 +140,16 @@ UDEV_DATA = "/run/udev/data"
 MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
                  "camera": "Camera turned off. WhatsApp's video has stopped"}
 WEBSITE = "https://github.com/Officialbabs/natter"
-# The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same.
-RELEASE_NOTES = (f"<p>First release as {DEFAULT_APP_ID}, with a Flatpak, and support for GNOME, KDE Plasma, "
-                 "Xfce, Sway and Ada.</p>")
+# The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
+# in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
+RELEASE_NOTES = ("<p>First release. So far it has been run on Ada 26.04 and on CachyOS with KDE Plasma.</p>"
+                 "<ul>"
+                 "<li>One notification per chat, quiet hours and Do not disturb</li>"
+                 "<li>Ctrl+K to go to a chat or message a phone number</li>"
+                 "<li>A privacy blur and an app lock</li>"
+                 "<li>Several accounts, each with its own session</li>"
+                 "<li>Experimental: replying from a notification, calls, and a Flatpak</li>"
+                 "</ul>")
 
 
 def color_scheme(appearance, ada_dark: Optional[bool]) -> Adw.ColorScheme:
@@ -2697,7 +2704,7 @@ class Natter(Adw.Application):
         about = Adw.AboutDialog(
             application_name=NAME, application_icon=DEFAULT_APP_ID, version=VERSION,
             developer_name=f"{NAME} contributors", website=WEBSITE, issue_url=f"{WEBSITE}/issues",
-            comments="WhatsApp for Linux that feels like part of your desktop",
+            comments="Unofficial WhatsApp Web client for Linux",
             license_type=Gtk.License.GPL_3_0, release_notes=RELEASE_NOTES,
             debug_info_filename="natter-debug.txt")
         about.add_legal_section("WhatsApp", None, Gtk.License.CUSTOM,

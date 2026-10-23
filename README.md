@@ -20,18 +20,18 @@ phone as a linked device, as you would WhatsApp Web in a browser.
 curl -fsSL https://raw.githubusercontent.com/Officialbabs/natter/master/get.sh | sh
 ```
 
-[get.sh](get.sh) downloads Natter Den into `~/.local/lib/natter/source` and runs its `install.sh`,
-which installs it for you alone. If packages are missing, it lists them and asks before installing
-them with your package manager (through `sudo`). Then open Natter Den from your apps and scan the
-code from *Linked devices* in WhatsApp on your phone.
+[get.sh](get.sh) downloads the latest release of Natter Den into `~/.local/lib/natter/source` and
+runs its `install.sh`, which installs it for you alone. If packages are missing, it lists them and
+asks before installing them with your package manager (through `sudo`). Then open Natter Den from
+your apps and scan the code from *Linked devices* in WhatsApp on your phone.
 
-- **Update:** run the same command again.
+- **Update:** run the same command again. It installs the newest release.
 - **Uninstall:** `~/.local/lib/natter/source/install.sh --uninstall && rm -rf ~/.local/lib/natter`
   (your sessions and settings stay in `~/.local/share/natter`, `~/.config/natter` and
   `~/.cache/natter` until you delete them).
 
-The steps by hand, and the packages for each distribution, are in
-[docs/packaging.md](docs/packaging.md).
+The releases are listed on [GitHub](https://github.com/Officialbabs/natter/releases). The steps by
+hand, and the packages for each distribution, are in [docs/packaging.md](docs/packaging.md).
 
 ### Flatpak
 
@@ -43,7 +43,7 @@ the Flatpak instead, on GNOME's runtime:
 curl -fsSL https://raw.githubusercontent.com/Officialbabs/natter/master/get.sh | sh -s -- --flatpak
 ```
 
-- **Update:** run the same command again.
+- **Update:** run the same command again. It builds the newest release.
 - **Uninstall:** `flatpak uninstall --user io.github.Officialbabs.Natter && rm -rf ~/.local/lib/natter/source ~/.cache/natter-den-flatpak`
   (your data stays in `~/.var/app/io.github.Officialbabs.Natter`).
 

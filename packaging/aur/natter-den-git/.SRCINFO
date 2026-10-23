@@ -1,5 +1,5 @@
 pkgbase = natter-den-git
-	pkgdesc = Unofficial WhatsApp client that fits your desktop
+	pkgdesc = Unofficial WhatsApp Web client for Linux
 	pkgver = r6.ab3e527
 	pkgrel = 1
 	url = https://github.com/Officialbabs/natter

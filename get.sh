@@ -3,9 +3,10 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/Officialbabs/natter/master/get.sh | sh
 #
-# Downloads Natter Den into ~/.local/lib/natter/source (or replaces it there with the latest) and
-# runs its install.sh. Needs only curl (or wget) and tar: no git. Run it again to update. With
-# --flatpak it builds and installs the Flatpak instead, for systems too old to run Natter Den as it is:
+# Downloads Natter Den's latest release (not the latest commit on master) into
+# ~/.local/lib/natter/source, replacing the copy there, and runs its install.sh. Needs only curl (or
+# wget) and tar: no git. Run it again to update to the newest release. With --flatpak it builds and
+# installs the Flatpak instead, for systems too old to run Natter Den as it is:
 #
 #   curl -fsSL https://raw.githubusercontent.com/Officialbabs/natter/master/get.sh | sh -s -- --flatpak
 #
@@ -14,8 +15,10 @@ set -eu
 
 APP_ID=io.github.Officialbabs.Natter
 APP_NAME="Natter Den"
-# NATTER_ARCHIVE: another .tar.gz to install, for testing get.sh only.
-ARCHIVE="${NATTER_ARCHIVE:-https://github.com/Officialbabs/natter/archive/refs/heads/master.tar.gz}"
+REPO="https://github.com/Officialbabs/natter"
+LATEST_API="https://api.github.com/repos/Officialbabs/natter/releases/latest"
+# NATTER_ARCHIVE: another .tar.gz to install, for testing get.sh only. No release is looked up.
+ARCHIVE="${NATTER_ARCHIVE:-}"
 GET="curl -fsSL https://raw.githubusercontent.com/Officialbabs/natter/master/get.sh | sh"
 # Next to the camera fix (install.sh's CAMFIX_DIR), away from the WhatsApp data in ~/.local/share/natter.
 SOURCE="$HOME/.local/lib/natter/source"
@@ -52,9 +55,48 @@ flatpak_missing() {
     echo "$missing"
 }
 
-# Natter Den's source in SOURCE: the latest from GitHub, as an archive (no git needed). A new
-# copy is unpacked next to SOURCE and only then put in its place, so a failed download leaves the
-# installed one as it was.
+# Whether $1 is a tag to download: v, then only letters, digits, dots, underscores and hyphens.
+sane_tag() {
+    case "$1" in
+        v | v*[!0-9A-Za-z._-]*) return 1 ;;
+        v*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Where the Releases page's link to the latest release leads: .../releases/tag/<tag> once there is one.
+latest_redirect() {
+    case "$fetch" in
+        curl*) curl -fsIL -o /dev/null -w '%{url_effective}' "$REPO/releases/latest" ;;
+        # wget can't say where it ended up, but -S shows the Location of each redirect.
+        *) wget -S --spider "$REPO/releases/latest" 2>&1 ;;
+    esac
+}
+
+# The tag of Natter Den's latest release, from GitHub's API or, when that fails (it answers 60
+# requests an hour from one address), from latest_redirect. Fails without a sane tag: with 2 when
+# GitHub answered but has no release (the latest link leads to the Releases page itself), else 1.
+latest_release() {
+    page=""
+    # shellcheck disable=SC2086  # $fetch is the command and its options
+    tag="$($fetch "$LATEST_API" </dev/null 2>/dev/null |
+        sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+    if ! sane_tag "$tag"; then
+        page="$(latest_redirect </dev/null 2>/dev/null || true)"
+        tag="$(printf '%s\n' "$page" | sed -n 's|.*/releases/tag/\([^/?#[:space:]]*\).*|\1|p' | head -n 1)"
+    fi
+    if sane_tag "$tag"; then
+        echo "$tag"
+    elif printf '%s\n' "$page" | grep -Eq "^(.*[[:space:]])?$REPO/releases([[:space:]].*)?\$"; then
+        return 2
+    else
+        return 1
+    fi
+}
+
+# Natter Den's source in SOURCE: its latest release from GitHub, as an archive (no git needed). A
+# new copy is unpacked next to SOURCE and only then put in its place, so a failed download leaves
+# the installed one as it was.
 get_source() {
     if have curl; then fetch="curl -fsSL"
     elif have wget; then fetch="wget -qO-"
@@ -78,10 +120,25 @@ get_source() {
         echo "then run this again."
         exit 1
     fi
+    release=""
+    if [ -z "$ARCHIVE" ]; then
+        found=0
+        release="$(latest_release)" || found=$?
+        if [ "$found" -eq 2 ]; then
+            echo "There's no release of $APP_NAME on GitHub yet ($REPO/releases)."
+            echo "Run this again once there is one."
+            exit 1
+        elif [ "$found" -ne 0 ]; then
+            echo "Couldn't find $APP_NAME's latest release on GitHub."
+            echo "Check your connection, then run this again in a moment."
+            exit 1
+        fi
+        ARCHIVE="$REPO/archive/refs/tags/$release.tar.gz"
+    fi
     mkdir -p "$(dirname "$SOURCE")"
     work="$(mktemp -d "$(dirname "$SOURCE")/.download.XXXXXX")"
     trap 'rm -rf "$work"' EXIT
-    echo "==> Downloading $APP_NAME"
+    echo "==> Downloading $APP_NAME${release:+ $release}"
     # shellcheck disable=SC2086  # $fetch is the command and its options
     if ! $fetch "$ARCHIVE" >"$work/source.tar.gz" </dev/null; then
         echo "Couldn't download $APP_NAME. Check your connection, then run this again."

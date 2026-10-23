@@ -7,10 +7,12 @@ in this file has been tried on another distribution.
 
 ## What get.sh and install.sh do
 
-`get.sh` downloads the latest Natter Den from GitHub as an archive (it needs curl or wget, and tar;
-no git), puts it in `~/.local/lib/natter/source`, replacing the copy there only once the download
-is complete, and runs its `install.sh`. It stops while Natter Den is running. With `--flatpak` it
-builds and installs the Flatpak instead.
+`get.sh` downloads Natter Den's latest release from GitHub as an archive (it needs curl or wget,
+and tar; no git), puts it in `~/.local/lib/natter/source`, replacing the copy there only once the
+download is complete, and runs its `install.sh`. It finds the release through GitHub's API, or
+through the [Releases page](https://github.com/Officialbabs/natter/releases) when the API doesn't
+answer, and installs nothing if neither names one. It stops while Natter Den is running. With
+`--flatpak` it builds and installs the Flatpak instead.
 
 `install.sh` checks what Natter Den needs. If packages are missing, it lists them in three groups
 and asks before installing them with your package manager (apt-get, dnf, pacman or zypper,
@@ -85,11 +87,13 @@ sudo zypper install gcc pkgconf-pkg-config gstreamer-devel
 On Fedora Atomic, `rpm-ostree install` can layer Fedora's packages instead (they take effect after
 a restart); the Flatpak is the other way there, and on Bazzite and SteamOS.
 
-Then download Natter Den and install it:
+Then download the latest release and install it. Its tag is the one marked *Latest* on the
+[Releases page](https://github.com/Officialbabs/natter/releases); put it in place of `v0.1.0` below:
 
 ```sh
+tag=v0.1.0   # the latest release's tag
 mkdir -p ~/.local/lib/natter/source && cd ~/.local/lib/natter/source
-curl -fsSL https://github.com/Officialbabs/natter/archive/refs/heads/master.tar.gz | tar -xz --strip-components=1
+curl -fsSL "https://github.com/Officialbabs/natter/archive/refs/tags/$tag.tar.gz" | tar -xz --strip-components=1
 ./install.sh   # adds Natter Den to your apps and `natter` to ~/.local/bin
 ```
 

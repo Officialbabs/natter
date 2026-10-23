@@ -5,35 +5,36 @@
   <project_license>GPL-3.0-or-later</project_license>
 
   <name>Natter Den</name>
-  <summary>Unofficial WhatsApp client that fits your desktop</summary>
+  <summary>Unofficial WhatsApp Web client</summary>
   <developer id="io.github.officialbabs">
     <name>Natter Den contributors</name>
   </developer>
 
   <description>
     <p>
-      Natter Den shows WhatsApp Web in a native GTK and libadwaita window and connects it to the
-      rest of your desktop: notifications, the tray, the dock and the keyboard.
+      Natter Den shows WhatsApp Web in a GTK 4 and libadwaita window, with desktop notifications,
+      a tray icon and keyboard shortcuts.
     </p>
     <p>
       Natter Den is unofficial. It isn’t made by, endorsed by or affiliated with WhatsApp or Meta.
-      It runs the real WhatsApp Web, the same way your browser would, and you link it to your
-      phone the same way.
+      You link it to your phone as a linked device, as you would WhatsApp Web in a browser.
     </p>
     <ul>
       <li>One notification per chat, with the sender’s picture; clicking it opens that chat</li>
-      <li>Quiet hours, and an unread count in the tray and on the dock icon</li>
-      <li>Ctrl+K jumps to any chat by name, or messages a phone number you haven’t saved</li>
-      <li>Paste or drop pictures and files into a chat, or send them from the file manager</li>
-      <li>wa.me and whatsapp:// links open in Natter Den</li>
+      <li>Quiet hours, and Do not disturb for one hour, two or until you turn it off</li>
+      <li>The unread count in the tray, and on the dock icon where the dock shows badges (not in the Flatpak)</li>
+      <li>Ctrl+K goes to a chat by name, or messages a phone number without saving it</li>
+      <li>Paste or drop pictures and files on a chat</li>
+      <li>whatsapp:// links from other apps open in Natter Den</li>
       <li>A privacy blur that hides names, pictures and messages until you point at them</li>
+      <li>An app lock with a passcode</li>
       <li>Several accounts, each with its own session</li>
-      <li>Keeps running in the background, and gives memory back while its window is closed</li>
+      <li>Closing the window keeps it running in the tray</li>
     </ul>
     <p>
-      Calls happen in Natter Den, with WhatsApp’s own call buttons in the chat, when GStreamer’s
-      WebRTC plugins are installed. Without them, calls open in your web browser. Voice calls
-      work, and video calls are still being finished.
+      Replying from a notification and calls are experimental. Calls use WhatsApp’s own call
+      buttons: in Natter Den’s window when GStreamer’s WebRTC plugins are installed, otherwise in a
+      separate call window if Qt WebEngine for Python is installed, or else in your web browser.
     </p>
   </description>
 
@@ -65,7 +66,6 @@
   <supports>
     <control>keyboard</control>
     <control>pointing</control>
-    <control>touch</control>
   </supports>
 
   <branding>
@@ -81,12 +81,18 @@
   </content_rating>
 
   <releases>
-    <release version="0.1.0" date="2026-10-19">
+    <release version="0.1.0" date="2026-10-23">
       <description>
         <p>
-          First release as io.github.Officialbabs.Natter, with a Flatpak, and support for
-          GNOME, KDE Plasma, Xfce, Sway and Ada.
+          First release. So far it has been run on Ada 26.04 and on CachyOS with KDE Plasma.
         </p>
+        <ul>
+          <li>One notification per chat, quiet hours and Do not disturb</li>
+          <li>Ctrl+K to go to a chat or message a phone number</li>
+          <li>A privacy blur and an app lock</li>
+          <li>Several accounts, each with its own session</li>
+          <li>Experimental: replying from a notification, calls, and a Flatpak</li>
+        </ul>
       </description>
     </release>
   </releases>

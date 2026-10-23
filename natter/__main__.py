@@ -1,4 +1,4 @@
-"""Natter: WhatsApp for Linux that feels like part of the desktop.
+"""Natter Den: an unofficial WhatsApp Web client for Linux.
 
   natter                      open Natter (or bring it forward)
   natter --background         start hidden, for login: notifications and the tray still work
