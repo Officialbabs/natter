@@ -45,7 +45,7 @@ LAUNCHER_XML = """
 
 
 class Badge:
-    """The unread count on the dock icon, over the Unity LauncherEntry API that Ada's dock reads."""
+    """The unread count on the dock icon, over the Unity LauncherEntry API."""
 
     def __init__(self, bus: Gio.DBusConnection) -> None:
         self.bus = bus

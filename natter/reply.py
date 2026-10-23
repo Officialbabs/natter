@@ -1,7 +1,7 @@
 """Replying from a notification, in a small window of its own.
 
 Reply on a chat's notification opens it, unless KDE Plasma's reply field was typed in, which
-sends from the notification itself (app.on_reply). Other desktops' notifications (Ada's, GNOME's)
+sends from the notification itself (app.on_reply). Other desktops' notifications (GNOME's, for one)
 can't hold a text field, so the window is the next best thing: a card like the notification, with
 who wrote and their latest messages, and a field to type in. Enter sends, Shift+Enter starts a new
 line, Escape closes and keeps what was typed for the next Reply to that chat (in memory only).

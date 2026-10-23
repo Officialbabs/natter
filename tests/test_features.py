@@ -282,7 +282,7 @@ class BlankPageTest(unittest.TestCase):
         self.assertEqual(page.loads, [page.home])
 
     def test_time_frozen_is_not_a_stall(self):
-        # Ada pauses a hidden Natter, its page with it: a look that comes long after it was due
+        # A desktop that pauses a hidden Natter pauses its page with it: a look that comes long after it was due
         # starts the count again rather than blaming the page for the time it was frozen.
         from unittest import mock
 
@@ -409,7 +409,7 @@ class TrayTest(unittest.TestCase):
         labels = [item.label for item in items if not item.separator]
         self.assertEqual(labels, [f"Show {NAME}", "Turn On Privacy Blur", "Do Not Disturb…", f"Lock {NAME}",
                                   f"Quit {NAME}"])
-        self.assertFalse(any(item.children for item in items))  # Ada's panel unfolds submenus
+        self.assertFalse(any(item.children for item in items))  # some panels unfold submenus
         next(item for item in items if item.label == "Do Not Disturb…").run()
         self.assertEqual(fake.chosen, ["dnd"])
         self.assertFalse(any(a.separator and b.separator for a, b in zip(items, items[1:])))

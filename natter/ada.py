@@ -1,10 +1,8 @@
-"""Ada's own appearance setting, which GTK apps aren't told about.
+"""Following Ada's Appearance setting, on Ada.
 
-Ada's Settings → Appearance picks the apps' style: Light, Dark or Dune (a warm dark). Ada's own
-apps read it from ~/.config/os-ai/desktop.ini ([Desktop] Theme=paper, midnight or dune). It never
-reaches GNOME's color-scheme setting or the desktop portal, which is what GTK apps follow, so
-Natter Den set to follow the system stayed dark after Light was picked. On Ada, following the
-system means following Theme= instead, and changing along with it.
+Ada's Settings → Appearance picks the apps' style: Light, Dark or Dune (a warm dark), kept in
+~/.config/os-ai/desktop.ini ([Desktop] Theme=paper, midnight or dune). On Ada, following the
+system means following Theme= there, and changing along with it.
 """
 
 from __future__ import annotations
@@ -57,7 +55,7 @@ class AdaStyle:
         self.dark = self._read()
         self._monitor: Optional[Gio.FileMonitor] = None
         try:
-            # Ada may replace the file rather than write into it: the monitor watches the name.
+            # The file may be replaced rather than written into: the monitor watches the name.
             self._monitor = Gio.File.new_for_path(str(path)).monitor_file(Gio.FileMonitorFlags.WATCH_MOVES, None)
             self._monitor.connect("changed", self._changed)
         except GLib.Error:

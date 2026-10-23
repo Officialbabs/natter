@@ -62,7 +62,7 @@ ICONS = icons_folder()
 
 def app_icon() -> Gio.Icon:
     """Natter's icon for its own notifications: the file itself, which every notification server
-    can show (Ada's doesn't look icons up by name in ~/.local/share/icons), else the theme name."""
+    can show (some don't look icons up by name in ~/.local/share/icons), else the theme name."""
     svg = ICONS / "hicolor" / "scalable" / "apps" / f"{DEFAULT_APP_ID}.svg"
     return Gio.FileIcon.new(Gio.File.new_for_path(str(svg))) if svg.is_file() else Gio.ThemedIcon.new(DEFAULT_APP_ID)
 
@@ -87,7 +87,7 @@ NETWORK_CHECK = 5  # seconds between looks at WebKit's network process (_check_n
 # Every second at first: WhatsApp's busiest start is when a dying network process is likeliest,
 # and one that dies and is replaced between two looks would go unnoticed.
 NETWORK_CHECK_EARLY, NETWORK_EARLY_LOOKS = 1, 120
-# Looks that come this much later than due mean Natter was frozen (Ada pauses hidden apps,
+# Looks that come this much later than due mean Natter was frozen (some desktops pause hidden apps,
 # sometimes seconds after they hide). Thawed, it gets a moment to give memory back before the
 # freeze, and the swapping that comes with it, can blame it again (_thawed).
 THAW_GAP = 20
@@ -147,9 +147,9 @@ RELEASE_NOTES = (f"<p>First release as {DEFAULT_APP_ID}, with a Flatpak, and sup
 
 def color_scheme(appearance, ada_dark: Optional[bool]) -> Adw.ColorScheme:
     """The style Natter asks libadwaita for. Following the system (what Preferences shows for
-    "system" and for anything it doesn't know) means following Ada's own setting on Ada (ada.py),
-    which never reaches GTK apps; elsewhere, or when Ada's file doesn't say, libadwaita follows
-    the desktop itself."""
+    "system" and for anything it doesn't know) means following Ada's Appearance setting on Ada
+    (ada.py), kept in Ada's own desktop.ini; elsewhere, or when that file doesn't say, libadwaita
+    follows the desktop itself."""
     scheme = APPEARANCES.get(appearance, Adw.ColorScheme.DEFAULT) if isinstance(appearance, str) \
         else Adw.ColorScheme.DEFAULT
     if scheme == Adw.ColorScheme.DEFAULT and ada_dark is not None:
@@ -208,11 +208,11 @@ def pages_held() -> int:
 
 
 def stall_line(stalled: float, held: int, swapped: int, before: dict[str, int], after: dict[str, int]) -> str:
-    """The log line for a main loop that didn't run for `stalled` seconds: Ada froze the hidden
-    window, or the computer was too short of memory to run it. What Natter's unit holds (`held`,
-    `swapped` of it, in bytes), and what the kernel did to it meanwhile: memory.events (`before`
-    and `after` the gap) counts the times it was held back (high), kept at its limit (max), and
-    the processes it ended (oom_kill)."""
+    """The log line for a main loop that didn't run for `stalled` seconds: the desktop froze the
+    hidden window, or the computer was too short of memory to run it. What Natter's unit holds
+    (`held`, `swapped` of it, in bytes), and what the kernel did to it meanwhile: memory.events
+    (`before` and `after` the gap) counts the times it was held back (high), kept at its limit
+    (max), and the processes it ended (oom_kill)."""
     line = f"natter: main loop stalled {stalled:.0f} s; {held >> 20} MB held, {swapped >> 20} MB of it in swap"
     counts = [f"{name} +{after[name] - before.get(name, after[name])}" for name in ("high", "max", "oom_kill")
               if name in after]
@@ -649,11 +649,11 @@ class Natter(Adw.Application):
 
     def do_startup(self) -> None:
         # Only the first instance gets here. Group Natter's processes under a scope of its
-        # own before WebKit starts any (Ada's launcher already makes one; a terminal doesn't).
+        # own before WebKit starts any (a desktop's launcher makes one; a terminal doesn't).
         accounts = len(self.settings["accounts"])
         self.scope = move_to_own_scope(accounts=accounts)
         if self.scope is None:
-            limit_own_scope(accounts)  # a launcher's scope (Ada's): the same backstop as Natter's own
+            limit_own_scope(accounts)  # a launcher's scope: the same backstop as Natter's own
         # Counted from here: an oom_kill from before this start (in a launcher's scope) isn't a page's.
         self._memory_events = memory_events()
         self._oom_kills = self._unit_events().get("oom_kill", 0)
@@ -1280,8 +1280,8 @@ class Natter(Adw.Application):
                 account.view.set_is_muted(muted)
 
     def _dnd_items(self) -> list[MenuItem]:
-        """One tray item for do not disturb. Its choices were a submenu, but Ada's panel unfolds
-        submenus into loose items and drops their name ("For 1 Hour", of what?), so they're asked
+        """One tray item for do not disturb. Its choices were a submenu, but some panels unfold
+        submenus into loose items and drop their name ("For 1 Hour", of what?), so they're asked
         in Natter's window instead (choose_do_not_disturb)."""
         if self.settings.do_not_disturb():
             return [MenuItem("Resume Notifications", self.resume_notifications)]
@@ -2299,7 +2299,7 @@ class Natter(Adw.Application):
                 items.append(MenuItem(f"{account.name}: Needs Linking" if several else "Needs Linking", None,
                                       enabled=False))
         # Only what's reached for in passing. No chats (no names on the panel), no unread count
-        # (the icon shows it), and labels that say what they'll do: panels such as Ada's don't
+        # (the icon shows it), and labels that say what they'll do: some panels don't
         # draw a menu's checkmarks. The rest is in Preferences.
         if not self.locked:
             blur = self.settings["privacy_blur"]

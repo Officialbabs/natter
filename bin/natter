@@ -29,7 +29,7 @@ def menu_entry(app_id):
 
 
 # Desktops tell an app's processes apart from background ones by GIO_LAUNCHED_DESKTOP_FILE,
-# which GLib sets when an app is opened from its menu entry (Ada's Task Manager reads it
+# which GLib sets when an app is opened from its menu entry (some task managers read it
 # from /proc). Started from a terminal or script it's missing; set it and start again, once,
 # since a process's own environment in /proc is the one it started with.
 if (os.environ.get("NATTER_APP_ID") or DEFAULT_APP_ID) == DEFAULT_APP_ID and "GIO_LAUNCHED_DESKTOP_FILE" not in os.environ:

@@ -1570,8 +1570,8 @@ class Account(GObject.Object):
 
     def _page_stalled(self) -> bool:
         """While the page loads: has it moved on since the last look? Time it couldn't have, a
-        look that came late because Natter was frozen (Ada pauses hidden apps) or starved, isn't
-        counted against it: there the page was frozen too."""
+        look that came late because Natter was frozen (some desktops pause hidden apps) or
+        starved, isn't counted against it: there the page was frozen too."""
         if self.ready or self.needs_link or self.failed:
             self._page_timer = 0
             return GLib.SOURCE_REMOVE

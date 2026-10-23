@@ -26,8 +26,8 @@ finish-args:
   - --device=dri
   # Where WhatsApp's downloads go, unless you pick another folder in Preferences.
   - --filesystem=xdg-download
-  # Ada's own Light, Dark or Dune setting (desktop.ini), read only: Ada never tells GTK apps or
-  # the portal, so "Follow System" reads it there (natter/ada.py).
+  # Read only, for "Follow System" on Ada, which keeps its Light, Dark or Dune choice in
+  # desktop.ini (natter/ada.py).
   - --filesystem=xdg-config/os-ai:ro
   # Not here: org.freedesktop.Notifications. Inside the sandbox notify.py sends notifications
   # through GNotification (the notification portal), which replaces a chat's notification in

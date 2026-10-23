@@ -85,15 +85,32 @@ API. The dock menu is written as `[Desktop Action]` entries into Natter Den's ow
 `~/.local/share/applications` (never a package's or the Flatpak's), naming chats by a hash rather
 than by name on the command line. It's left empty while a passcode is set or privacy blur is on.
 
-Desktop search answers from the chat lists on disk, so a search doesn't start WhatsApp. The
+Desktop search (`natter/search.py`) lists chats by name, through the interface GNOME Shell uses
+for app search results:
+
+| | |
+|---|---|
+| Bus name | `io.github.Officialbabs.Natter` (D-Bus service: `~/.local/share/dbus-1/services/io.github.Officialbabs.Natter.service`) |
+| Object | `/io/github/Officialbabs/Natter/SearchProvider` |
+| Interface | `org.gnome.Shell.SearchProvider2` |
+| Provider file | `~/.local/share/gnome-shell/search-providers/io.github.Officialbabs.Natter.search-provider.ini` (in the Flatpak, under its exports) |
+| Result ids | `<account id>/<chat name>`, e.g. `main/Ana Souza` |
+| Result metas | `id`, `name` (the chat), `description` ("WhatsApp chat", followed by " · <account name>" when there are several accounts), `gicon` (`io.github.Officialbabs.Natter`) |
+
+`GetInitialResultSet` returns the chats whose names contain what was typed, best first.
+`ActivateResult` opens that chat, and `LaunchSearch` opens Natter Den's own chat search with the
+terms filled in. Only chat names are searched, never messages.
+
+Searches are answered from the chat lists on disk, so a search doesn't start WhatsApp. The
 provider file says `AutoStart=false`, but Natter Den's bus name is D-Bus-activatable: a desktop
 that calls it anyway starts a Natter Den that only answers searches and quits 30 s after the last
 one, without opening WhatsApp.
 
 ### What it asks of the desktop
 
-Natter Den has only been tried on Ada. Elsewhere, each feature needs the desktop to offer what the
-right-hand column names; whether it then works there is untried.
+Natter Den has been run on Ada 26.04 (based on Ubuntu) and on CachyOS (based on Arch) with KDE
+Plasma. Elsewhere, each feature needs the desktop to offer what the right-hand column names; whether
+it then works there is untried.
 
 | Feature | Needs |
 |---|---|
@@ -107,6 +124,9 @@ right-hand column names; whether it then works there is untried.
 | Start hidden at login | XDG autostart, or the Background portal in the Flatpak |
 | Window forward from a notification | an activation token from the notification server (on Wayland) |
 | One process group, memory back while hidden | a systemd user session; for memory, zram or zswap too |
+
+On Ada, adding `io.github.Officialbabs.Natter` to `AllowBackground` in
+`~/.config/os-ai/lifecycle.ini` keeps Natter Den receiving messages while its window is closed.
 
 ## Replies from notifications
 
@@ -139,6 +159,10 @@ back after the passcode. Natter Den's log says how each reply ended (`natter: re
 to or what. A notification's id and its Reply and Mute actions name no chat, only a random
 reference, as desktops may keep them.
 
+Where the notification server offers KDE's inline reply, Natter Den offers the field only when the
+notification shows who wrote, and takes the text only from the server's own bus name, once per
+field.
+
 ## Themes
 
 WhatsApp Web paints through its own colour names (`--WDS-accent`,
@@ -165,7 +189,7 @@ label the chat list's unread badges, and there the label is near-black in light 
 yellow, cream or lime picked for Custom does the same. WhatsApp's surfaces and text keep
 WhatsApp's colours, and the window keeps libadwaita's greys, at most faintly turned towards the
 theme. Light, Dark or Follow System passes through to WhatsApp; on Ada, Follow System follows Ada's
-own Light, Dark or Dune.
+own Light, Dark or Dune, from `~/.config/os-ai/desktop.ini`.
 
 So that a theme changes how WhatsApp looks and nothing else, it is:
 
@@ -201,11 +225,11 @@ So that a theme changes how WhatsApp looks and nothing else, it is:
 program name is the app id, so on X11 the window's `WM_CLASS` matches `StartupWMClass` in the
 desktop file and the dock puts the window under Natter Den's icon.
 
-Desktops start apps in a systemd unit of their own, named after the app id: on Ada,
-`app-ada-io.github.Officialbabs.Natter-<pid>.scope`. By the XDG convention other desktops' are
-`app-gnome-<app id>-<pid>.scope` (GNOME), `app-<app id>@<random>.service` (KDE Plasma) and
-`app-flatpak-<app id>-<pid>.scope` (a Flatpak); only Ada's has been seen. When Natter Den finds
-itself in a unit that isn't named after it (started from a terminal or a script, say), it asks
-systemd for `app-io.github.Officialbabs.Natter-<pid>.scope` before WebKit starts any process, so
-every WebKit process, sandbox and proxy joins it. Without a systemd user manager, or inside a
-sandbox, it leaves things as they are.
+Desktops start apps in a systemd unit of their own, named after the app id. By the XDG convention
+these are `app-gnome-<app id>-<pid>.scope` (GNOME), `app-<app id>@<random>.service` (KDE Plasma)
+and `app-flatpak-<app id>-<pid>.scope` (a Flatpak); on Ada it's
+`app-ada-io.github.Officialbabs.Natter-<pid>.scope`. When Natter Den finds itself in a unit that
+isn't named after it (started from a terminal or a script, say), it asks systemd for
+`app-io.github.Officialbabs.Natter-<pid>.scope` before WebKit starts any process, so every WebKit
+process, sandbox and proxy joins it. Without a systemd user manager, or inside a sandbox, it leaves
+things as they are.

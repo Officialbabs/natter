@@ -82,8 +82,8 @@ The Flatpak is experimental: it hasn't been tested yet, calls in it included.
   running there, and it can start hidden at login.
 - While the window is closed, it asks the kernel to take back memory WhatsApp isn't using, and a
   guard ends and reloads a WhatsApp page that keeps growing ([details](docs/memory.md)).
-- Chats by name for desktop search (`org.gnome.Shell.SearchProvider2`), used by Ada's search
-  ([docs/ada.md](docs/ada.md)).
+- Chats by name for desktop search (`org.gnome.Shell.SearchProvider2`)
+  ([details](docs/how-it-works.md#desktop-integration)).
 
 Experimental:
 
@@ -93,7 +93,7 @@ Experimental:
   box, or something else is open over the chat ([how](docs/how-it-works.md#replies-from-notifications)).
   *Show Reply Button* in Preferences → Notifications turns it off.
 - **Typing the reply in the notification**, where the notification server offers KDE's inline
-  reply. Not tried yet on any desktop; Ada's notifications don't offer it.
+  reply. Not tried yet on any desktop.
 - **Calls**, with WhatsApp's own call buttons, in Natter Den's window when GStreamer's WebRTC
   plugins are installed. Without them, calls go to a separate call window if Qt WebEngine for
   Python (PyQt6) is installed, linked to your phone as one more device; otherwise to your browser.
@@ -136,14 +136,14 @@ WebRTC plugins.
 versions, these should be new enough: Ubuntu 24.04, Debian 13, Fedora 40, RHEL 10 and its
 rebuilds, openSUSE Tumbleweed and Leap 16, Arch, and their newer releases and derivatives.
 Ubuntu 22.04, Debian 12 and openSUSE Leap 15 are too old; use the [Flatpak](#flatpak) there, and
-on Mageia and OpenMandriva, whose packages `install.sh` can't name. So far Natter Den has only
-been run on Ada 26.04, which is based on Ubuntu.
+on Mageia and OpenMandriva, whose packages `install.sh` can't name. So far Natter Den has been
+run on Ada 26.04 (based on Ubuntu) and on CachyOS (based on Arch) with KDE Plasma.
 
 ## Known limitations
 
-- Only tried on Ada. The desktop features use common interfaces
+- Only tried on Ada and on CachyOS with KDE Plasma. The desktop features use common interfaces
   ([listed here](docs/how-it-works.md#what-it-asks-of-the-desktop)), but nothing has been tried on
-  GNOME, KDE Plasma, Xfce or Sway yet.
+  GNOME, Xfce or Sway yet.
 - Natter Den works through WhatsApp Web's page. When a WhatsApp update moves something it relies
   on, the feature that leans on it stops, and the log names what it couldn't find
   ([docs/development.md](docs/development.md#when-whatsapp-changes)).
@@ -154,9 +154,6 @@ been run on Ada 26.04, which is based on Ubuntu.
 - Without a tray (a StatusNotifierItem host), closing the window quits Natter Den unless *Keep
   Running When Closed* is on.
 - Giving memory back while hidden needs zram or zswap, and a systemd user session.
-- On Ada, `ada-lifecycled` pauses apps that stay hidden, and a paused Natter Den gets no messages
-  until it's opened. Adding `io.github.Officialbabs.Natter` to `AllowBackground` in
-  `~/.config/os-ai/lifecycle.ini` keeps it running ([docs/ada.md](docs/ada.md)).
 - If WhatsApp's page keeps growing (one did while a video was being attached), the memory guard
   ends and reloads it. Ended again within ten minutes, it stays down until you press *Try Again*.
 - Without GStreamer's codecs some videos and voice messages don't play. On Fedora, H.264 needs
@@ -196,7 +193,6 @@ been run on Ada 26.04, which is based on Ubuntu.
 - [Packaging](docs/packaging.md): installing by hand, the Flatpak and meson builds, moving from
   `io.natter.Natter`, the Flathub checklist
 - [Development](docs/development.md): when WhatsApp changes, the test page, debug options
-- [Natter Den on Ada](docs/ada.md)
 
 ## License
 

@@ -384,11 +384,11 @@ echo "==> Installing the menu entry, icons and desktop search"
 EXEC="$(exec_quote "$LAUNCHER")"
 mkdir -p "$APPS" "$ICONS" "$SYMBOLIC" "$SEARCH" "$SERVICES"
 cp "$HERE/data/icons/hicolor/scalable/apps/$APP_ID.svg" "$HERE/data/icons/hicolor/scalable/apps/$APP_ID-unread.svg" "$ICONS/"
-# The tray icon in the panel's own colour, for panels other than Ada's (tray.py).
+# The tray icon in the panel's own colour (tray.py).
 cp "$HERE/data/icons/hicolor/symbolic/apps/$APP_ID-symbolic.svg" \
    "$HERE/data/icons/hicolor/symbolic/apps/$APP_ID-unread-symbolic.svg" "$SYMBOLIC/"
-# The icon by its full path: Ada's shell (Qt) doesn't find icons by name in ~/.local/share/icons,
-# which has no index.theme.
+# The icon by its full path, for shells (a Qt one, say) that don't look icons up by name in
+# ~/.local/share/icons, which has no index.theme.
 sed -e "s|@EXEC@|$(sed_escape "$EXEC")|" -e "s|^Icon=.*|Icon=$(sed_escape "$ICONS/$APP_ID.svg")|" \
     "$HERE/natter.desktop.in" > "$ENTRY.new"
 # Keep the recent-chat actions Natter already wrote, if any.
@@ -407,7 +407,7 @@ refresh_caches
 # Ada's background allow list names apps by id: an entry for the old one no longer counts.
 LIFECYCLE="$CONFIG/os-ai/lifecycle.ini"
 if [ -f "$LIFECYCLE" ] && grep -qF "$OLD_APP_ID" "$LIFECYCLE"; then
-    echo "Note: $LIFECYCLE names $OLD_APP_ID. Replace it with $APP_ID there, so Ada lets $APP_NAME run in the background."
+    echo "Note: $LIFECYCLE names $OLD_APP_ID. Replace it with $APP_ID there, so $APP_NAME keeps receiving messages while hidden."
 fi
 
 # whatsapp:// links: take them only if no other app had them (ZapZap, say) or the old Natter

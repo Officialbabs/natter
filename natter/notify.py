@@ -34,7 +34,7 @@ from . import APP_ID, DEFAULT_APP_ID, NAME
 from .launcher import INVISIBLE
 
 # The app icon as a file path: the spec allows one, and it works where icon names in
-# ~/.local/share/icons aren't looked up (Ada's shell). It's named by the default id, as in
+# ~/.local/share/icons aren't looked up (some shells). It's named by the default id, as in
 # app.py: a separate instance (NATTER_APP_ID) has no icon of its own.
 _SVG = Path(__file__).resolve().parent.parent / "data" / "icons" / "hicolor" / "scalable" / "apps" / f"{DEFAULT_APP_ID}.svg"
 APP_ICON = str(_SVG) if _SVG.is_file() else DEFAULT_APP_ID

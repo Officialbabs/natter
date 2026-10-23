@@ -1,4 +1,4 @@
-"""Natter's tray icon: a StatusNotifierItem with a dbusmenu, the protocol Ada's panel hosts."""
+"""Natter's tray icon: a StatusNotifierItem with a dbusmenu."""
 
 from __future__ import annotations
 
@@ -269,7 +269,7 @@ class Tray:
         if self.sandboxed:
             self.service = bus.get_unique_name()
         else:
-            # The name panels know tray items by, and what Ada's lifecycle daemon may look for.
+            # The name panels know tray items by, and one other desktop services may look for.
             self._owner = Gio.bus_own_name_on_connection(bus, f"org.kde.StatusNotifierItem-{os.getpid()}-1",
                                                          Gio.BusNameOwnerFlags.NONE, self._named, self._unnamed)
         # Register now, and again whenever the panel restarts.

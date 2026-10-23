@@ -47,8 +47,8 @@ these reasons:
 And only once the window has been hidden ten minutes; not during a call or a reply, nor within five
 minutes of a call ending or a notification; not while the page loads; and, except after a call,
 not within four hours of the page's last load. With several accounts, one page at a time. Natter
-Den looks every minute, and again when it runs after being paused (desktops such as Ada may freeze
-a hidden app). Each fresh page is logged with the memory it saw.
+Den looks every minute, and again when it runs after a desktop has paused it while hidden. Each
+fresh page is logged with the memory it saw.
 
 WebKit's own limit ends a page only at 2.5 times the limit, or higher: half a gigabyte above the
 most the guard lets a page hold during a call, as WebKit doesn't know about calls.
@@ -70,11 +70,11 @@ The last backstop is the kernel's. In a unit whose `OOMPolicy` is `continue`, su
 Natter Den makes for itself, it sets `MemoryMax` (one page's limit, plus 1.5 GB for each account and
 half a gigabyte for Natter Den, at most 60% of the computer's memory) and at most 1.5 GB of swap,
 and makes its pages the kernel's first choice: the kernel ending a page there leaves Natter Den
-running. The units desktops start apps in have had `OOMPolicy=stop` wherever it was checked (Ada's),
-where the kernel ending one page stops all of Natter Den: there Natter Den sets no limit, leaves its
-pages' standing with the kernel as it is, and the guard alone ends a page that grows without end
-(the log says so once). The log says what each page held, and the files handed to WhatsApp by
-number, size and type, not by name.
+running. The units desktops start apps in have had `OOMPolicy=stop` wherever it was checked, and
+in those the kernel ending one page stops all of Natter Den: there Natter Den sets no limit,
+leaves its pages' standing with the kernel as it is, and the guard alone ends a page that grows
+without end (the log says so once). The log says what each page held, and the files handed to
+WhatsApp by number, size and type, not by name.
 
 ## Closing when asked
 

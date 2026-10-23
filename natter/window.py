@@ -838,7 +838,7 @@ class Window(Adw.ApplicationWindow):
     def _on_close(self, _window) -> bool:
         if not self.get_visible():
             # Nobody clicks the close button of a hidden window: it's the desktop closing apps
-            # (Ada, to make room when memory is full), which opens them again from the dock.
+            # (some do, to make room when memory is full), which opens them again from the dock.
             self.app.quit_natter()
             return True
         self.remember_size()

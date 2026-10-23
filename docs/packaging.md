@@ -1,8 +1,9 @@
 # Installing and packaging
 
 The one-line command in the [README](../README.md#install) does what the first two sections say,
-for you. The package names here are the ones `install.sh` uses, from `natter/distro.py`; nothing
-in this file has been tried on a distribution other than Ada 26.04 (based on Ubuntu).
+for you. The package names here are the ones `install.sh` uses, from `natter/distro.py`. Natter Den
+has been run on Ada 26.04 (based on Ubuntu) and on CachyOS (based on Arch) with KDE Plasma; nothing
+in this file has been tried on another distribution.
 
 ## What get.sh and install.sh do
 
@@ -138,10 +139,9 @@ were (both ids use the `natter` folders), so there's nothing to link again. Dock
 id, so pin Natter Den again. With `install.sh --force` and the old Natter still running, the new
 one won't open WhatsApp until the old one quits: it brings the old window forward instead.
 
-On Ada, if you let the old Natter run in the background by adding `io.natter.Natter` to
-`AllowBackground` in `~/.config/os-ai/lifecycle.ini`, replace it there with
-`io.github.Officialbabs.Natter`. `install.sh` reminds you when the old id is still in that file;
-it doesn't change the file itself.
+On Ada, if `AllowBackground` in `~/.config/os-ai/lifecycle.ini` names `io.natter.Natter`, replace
+it with `io.github.Officialbabs.Natter`. `install.sh` says when the old id is still there and
+leaves the file to you.
 
 ## Flathub checklist
 
@@ -157,5 +157,5 @@ What's still to do before submitting Natter Den to Flathub:
   source with a tag and commit.
 - **Checks.** `meson test -C build` runs `appstreamcli validate` and `desktop-file-validate`, but
   skips each when it isn't installed.
-- **Permissions a reviewer may ask about**, such as `--filesystem=xdg-config/os-ai:ro` (for Ada's
-  style setting).
+- **Permissions a reviewer may ask about**, such as `--filesystem=xdg-config/os-ai:ro` (for Follow
+  System on Ada).

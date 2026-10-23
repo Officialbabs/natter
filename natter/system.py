@@ -448,7 +448,7 @@ def memory_events(cgroup: Optional[Path] = None) -> dict[str, int]:
 
 def memory_tight(meminfo: Optional[str] = None) -> bool:
     """Whether the whole computer is short of memory: under a tenth of it available, and swap
-    (if any) all but full. Ada's lifecycled asks apps to close then; Natter, hidden, has no
+    (if any) all but full. Some desktops ask apps to close then; Natter, hidden, has no
     window to close, so it answers by giving back what it can (a fresh page)."""
     values = {}
     for line in (meminfo if meminfo is not None else _read("/proc/meminfo")).splitlines():
@@ -463,8 +463,8 @@ def memory_tight(meminfo: Optional[str] = None) -> bool:
 
 
 # Swap is for what's cold and will be wanted again. WhatsApp's leaked heap never is: parked in
-# swap it stays there, and one day it filled the computer's 15 GB (Ada's hibernation room
-# included) until Ada said memory was full. Past either of these, the Reclaimer stops moving
+# swap it stays there, and one day it filled the computer's 15 GB (hibernation room included)
+# until the desktop said memory was full. Past either of these, the Reclaimer stops moving
 # Natter's memory to swap. They are the Reclaimer's own limits and nothing else's: what it put
 # in swap is never a reason for a fresh page (app.py), or it would reload WhatsApp each time it
 # had done its job (as it did, every half hour, until October 2026).
@@ -514,8 +514,9 @@ def memory_stalls(pressure: Optional[str] = None) -> float:
 
 
 class Reclaimer:
-    """Gives Natter's cold memory back while its window is hidden, the way Ada does for paused
-    apps, except Natter keeps running so messages and notifications still arrive.
+    """Gives Natter's cold memory back while its window is hidden, the way a desktop that pauses
+    hidden apps may do for them, except Natter keeps running so messages and notifications still
+    arrive.
 
     Pages WhatsApp hasn't touched in a while go to (compressed) swap in small steps; anything
     it needs again comes straight back. It stops at `floor` MB, when swap has taken all it
@@ -608,8 +609,8 @@ class CallSound:
     """A silent sound stream of Natter's own, while a call is on.
 
     The call's real sound comes from WebKit's sandboxed web process, which the desktop can't tell
-    is Natter's. Desktops that pause hidden apps unless they play or record sound (Ada's
-    lifecycled does) see this one, from Natter's own process, and leave the call alone.
+    is Natter's. Desktops that pause hidden apps unless they play or record sound see this one,
+    from Natter's own process, and leave the call alone.
     """
 
     def __init__(self) -> None:
