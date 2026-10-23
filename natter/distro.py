@@ -33,7 +33,10 @@ MANAGERS = {
     # Mageia and OpenMandriva say they're like Fedora, but their packages have other names.
     "mageia": None, "openmandriva": None, "mandriva": None,
     "fedora": "dnf", "rhel": "dnf", "centos": "dnf",
-    "arch": "pacman",
+    # Arch and the systems built on it, by their own ID too: CachyOS's os-release hook writes
+    # ID_LIKE=arch, but installs without it have been seen (and so have other derivatives').
+    "arch": "pacman", "cachyos": "pacman", "endeavouros": "pacman", "manjaro": "pacman", "garuda": "pacman",
+    "artix": "pacman",
     "opensuse": "zypper", "suse": "zypper", "sles": "zypper",
 }
 INSTALL = {

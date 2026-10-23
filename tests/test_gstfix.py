@@ -155,6 +155,39 @@ class EnvironmentTest(Temp):
         body = main[main.index("def main()"):]
         self.assertLess(body.index("fix_camera()"), body.index("if check():"))  # check() loads WebKit
         self.assertLess(body.index("fix_camera()"), body.index("from .app import"))
+        # Natter's own GStreamer starts right after, without the tracer, before check() starts it.
+        self.assertLess(body.index("fix_camera()"), body.index("start_gstreamer()"))
+        self.assertLess(body.index("start_gstreamer()"), body.index("if check():"))
+
+
+class OwnGStreamerTest(Temp):
+    """Natter's own process starts GStreamer without the tracer (start_own): a crash there would
+    take the whole app, and the capture pipelines it fixes are only in WebKit's web process."""
+
+    def test_the_tracer_is_left_out_while_it_starts_and_put_back_after(self):
+        for before, during in (("nattercamfix", None), ("leaks;nattercamfix", "leaks"),
+                               ("nattercamfix(x=1);latency", "latency"), ("latency", "latency")):
+            with self.subTest(before):
+                env, seen = {"GST_TRACERS": before}, []
+                self.assertTrue(gstfix.start_own(env, init=lambda: seen.append(env.get("GST_TRACERS"))))
+                self.assertEqual(seen, [during])
+                self.assertEqual(env, {"GST_TRACERS": before})  # for WebKit's processes
+
+    def test_without_tracers_nothing_changes(self):
+        env, seen = {}, []
+        gstfix.start_own(env, init=lambda: seen.append(dict(env)))
+        self.assertEqual((env, seen), ({}, [{}]))
+
+    def test_put_back_even_when_gstreamer_wont_start(self):
+        env = {"GST_TRACERS": "nattercamfix"}
+
+        def fail():
+            raise RuntimeError("no GStreamer")
+        self.assertFalse(gstfix.start_own(env, init=fail))
+        self.assertEqual(env, {"GST_TRACERS": "nattercamfix"})
+
+    def test_natters_own_environment_by_default(self):
+        self.assertIs(inspect.signature(gstfix.start_own).parameters["environ"].default, os.environ)
 
 
 class GatingTest(Temp):
@@ -466,6 +499,24 @@ print(json.dumps(out))
 """
 
 
+# Natter's own start (gstfix.start_own), then WebKit's capture pipeline in that process.
+OWN_PROBE = r"""
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+from natter import gstfix
+started = gstfix.start_own()
+import gi
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst
+pipeline = Gst.Pipeline.new("Video_capturer_pipeline0_7DE6440DD080")
+rate = Gst.ElementFactory.make("videorate")
+pipeline.add(rate)
+print(json.dumps({"started": started, "env": os.environ.get("GST_TRACERS"),
+                  "tracers": [type(tracer).__name__ for tracer in Gst.tracing_get_active_tracers()],
+                  "settings": [rate.get_property(key) for key in ("skip-to-first", "drop-only", "average-period")]}))
+"""
+
+
 def toolchain() -> bool:
     return bool(shutil.which(compiler()[0]) and shutil.which("pkg-config")) and subprocess.run(
         ["pkg-config", "--exists", "gstreamer-1.0"], capture_output=True).returncode == 0
@@ -558,6 +609,20 @@ class PluginTest(unittest.TestCase):
         self.assertEqual(len(changes), 2, log)  # one line per videorate changed
         self.assertIn("Video_capturer_pipeline0_7DE6440DD080: set skip-to-first=true, drop-only=true, "
                       "average-period=1 (were false, false, 0)", changes[0])
+
+    def test_natters_own_process_runs_without_it(self):
+        # The same pipeline as WebKit's capture: in Natter's own process (start_own) it's left as it
+        # is, while the environment WebKit's processes get still has the tracer.
+        if self.reachable.returncode != 0:
+            self.skipTest("no GStreamer for Python in the probes' environment")
+        result = subprocess.run([*CHILD, "-c", OWN_PROBE, str(ROOT)], capture_output=True, text=True, timeout=120,
+                                env=self.gst_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        found = json.loads(result.stdout.splitlines()[-1])
+        self.assertTrue(found["started"])
+        self.assertEqual(found["settings"], [False, False, 0])
+        self.assertNotIn("NatterCamFix", found["tracers"])
+        self.assertEqual(found["env"], "nattercamfix")
 
     def test_without_the_tracer_nothing_changes(self):
         found, _log = self.probe(self.gst_env(tracer=False, registry="plain.bin"))

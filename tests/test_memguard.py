@@ -126,6 +126,10 @@ class LimitsTest(unittest.TestCase):
         guard = memguard.MemoryGuard(3 * GiB, idle_add=lambda *a: None)
         self.assertEqual(guard.limits(False), (3 * GiB, 3 * GiB + CALL_ROOM))
         self.assertEqual(guard.limits(True), (3 * GiB + CALL_ROOM, 3 * GiB + CALL_ROOM + CALL_MARGIN))
+        for in_call in (False, True):  # the same sums for anyone else who needs them (app.py's kill_threshold)
+            self.assertEqual(memguard.page_limits(3 * GiB, None, in_call), guard.limits(in_call))
+            self.assertEqual(memguard.page_limits(3 * GiB, 4 * GiB, in_call),
+                             tuple(min(limit, 4 * GiB) for limit in guard.limits(in_call)))
         self.assertLess(RUNAWAY_RATE, 130 * MiB)  # the slowest runaway seen grew 130-160 MB/s
 
     def test_mem_total(self):
@@ -168,6 +172,17 @@ class GuardTest(GuardBase):
         # WebKit starts them through the portal there: not Natter's children.
         self.proc.children([])
         self.assertEqual(memguard.web_processes(UI, self.proc.root, flatpak=True), {3002, 4002})
+
+    def test_page_sizes(self):
+        # What app.py weighs a hidden page by: each page alone, swap and all, not Natter's whole unit.
+        self.proc.set(3002, anon_mb=1000, swap_mb=500)
+        self.assertEqual(memguard.page_sizes(UI, self.proc.root, flatpak=False), {3002: 1500 * MiB, 4002: 20 * MiB})
+
+    def test_pages_keep_their_oom_score_where_the_kernel_would_stop_all_of_natter(self):
+        # Under a launcher's unit (OOMPolicy=stop) the kernel's choosing a page stops all of Natter.
+        guard = self.make(oom_score_adj=None)
+        guard.check(now=0)
+        self.assertEqual((self.proc.root / "3002" / "oom_score_adj").read_text(), "0\n")
 
     def test_held_counts_swap(self):
         self.proc.set(3002, anon_mb=1000, swap_mb=2500)

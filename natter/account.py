@@ -48,6 +48,7 @@ LINK_WAIT = 4  # seconds a wa.me link opened in the page gets to open its chat b
 BLANK_CHECK = 3  # seconds after the page loads before Natter looks for WhatsApp's app in it
 STALL_CHECK = 15  # seconds between looks at a page still loading
 STALL_LIMIT = 45  # seconds a loading page may go without any progress (slow is fine, stopped isn't)
+STALL_THAW = 20  # seconds later than due a look may come before the time since the last one doesn't count
 BLANK_TRIES, BLANK_WINDOW = 3, 10 * 60  # reloads of a blank or stalled page within this many seconds
 # WebKit hands a page the microphone or camera again without asking Natter while it captures,
 # and for about this long after its last capture ended (its idle watchdog then forgets).
@@ -381,9 +382,15 @@ class Account(GObject.Object):
         self.rtc: Optional[rtc.Host] = None
         self._picked: Optional[list[str]] = None  # files waiting for WebKit to ask for them (attach)
         self.fresh_at = 0.0  # time.monotonic() of the last fresh page (fresh_page, a memory kill)
+        # time.monotonic() of the page's last load of any kind (its first, a reload, a fresh page,
+        # WhatsApp's own), and of its last notification: a page that just loaded, or that just
+        # said something (a message, a call ringing), gets no fresh page for memory (app.py).
+        self.loaded_at = time.monotonic()
+        self.notified_at: Optional[float] = None
         self._reload_timer = 0
         self._page_timer = 0  # looks at a page that's loading or just loaded (_watch_page)
         self._progress = (-1.0, 0.0)  # the loading page's progress, and since when (_page_stalled)
+        self._stall_look = 0.0  # time.monotonic() of _page_stalled's last look
         self._blank_reloads: list[float] = []
         self._link: Optional[str] = None  # while a link opens in the page: the chat that was open before
         self._link_timer = 0
@@ -1031,6 +1038,7 @@ class Account(GObject.Object):
         self._fresh_after_call = set()
         self._held_media = []
         self.ready = False
+        self.loaded_at = time.monotonic()
         self.look = self.look_dark = None  # the new page says again how it looks
         self._set_reloading(uri == self.home)  # not for a link opened in the page
         self.view.load_uri(uri)
@@ -1138,6 +1146,7 @@ class Account(GObject.Object):
             return
         kind = message["type"]
         if kind == "notify":
+            self.notified_at = time.monotonic()
             self.emit("notify-message", message["id"], message["title"], message["body"], message["tag"],
                       message["icon"])
             self.chats.touch(message["title"])
@@ -1197,6 +1206,7 @@ class Account(GObject.Object):
     def _on_webkit_notification(self, _view, notification: WebKit.Notification) -> bool:
         # Only reached if the bridge didn't load: show it anyway, without a picture.
         page_id = -notification.get_id()
+        self.notified_at = time.monotonic()
         self._fallback[page_id] = notification
         notification.connect("closed", lambda *_: self._fallback.pop(page_id, None))
         self.emit("notify-message", page_id, notification.get_title() or "", notification.get_body() or "",
@@ -1444,6 +1454,7 @@ class Account(GObject.Object):
         # download or a blocked navigation, leaves the old page, still ready, where it was.)
         if event == WebKit.LoadEvent.COMMITTED:
             self.ready = False
+            self.loaded_at = time.monotonic()
             changed = self.failed is not None or self.needs_link
             self.failed = None  # a page arrived after all (an automatic reload, a link): not offline
             self.needs_link = False  # the new page says again whether it shows the link screen
@@ -1456,7 +1467,8 @@ class Account(GObject.Object):
             self._end_link()
             if self.rtc:
                 self.rtc.close()  # the old page's connections went with it
-            self._progress = (-1.0, time.monotonic())
+            self._stall_look = time.monotonic()
+            self._progress = (-1.0, self._stall_look)
             self._watch_page(STALL_CHECK, self._page_stalled)
         elif event == WebKit.LoadEvent.FINISHED and self.failed is None:
             self._watch_page(BLANK_CHECK, self._check_blank)
@@ -1471,15 +1483,19 @@ class Account(GObject.Object):
             self._page_timer = GLib.timeout_add_seconds(seconds, then)
 
     def _page_stalled(self) -> bool:
-        """While the page loads: has it moved on since the last look?"""
+        """While the page loads: has it moved on since the last look? Time it couldn't have, a
+        look that came late because Natter was frozen (Ada pauses hidden apps) or starved, isn't
+        counted against it: there the page was frozen too."""
         if self.ready or self.needs_link or self.failed:
             self._page_timer = 0
             return GLib.SOURCE_REMOVE
         progress, since = self._progress
         now = self.view.get_estimated_load_progress()
-        if now != progress:
-            self._progress = (now, time.monotonic())
-        elif time.monotonic() - since >= STALL_LIMIT:
+        looked = time.monotonic()
+        last, self._stall_look = self._stall_look, looked
+        if now != progress or (last and looked - last > STALL_CHECK + STALL_THAW):
+            self._progress = (now, looked)
+        elif looked - since >= STALL_LIMIT:
             self._page_timer = 0
             self._reload_blank(f"stopped loading ({now:.0%} for {STALL_LIMIT} s)")
             return GLib.SOURCE_REMOVE

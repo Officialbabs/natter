@@ -524,9 +524,11 @@ class Connection:
             options.append("negotiated=(boolean)true")
         if message.get("id") is not None:
             options.append(f"id=(int){int(message['id'])}")
-        if message.get("protocol"):
-            options.append(f"protocol=(string){Gst.Value.serialize(str(message['protocol']))}")
         structure = _structure(", ".join(options))
+        if message.get("protocol"):
+            # Set as a value, never written into the structure's text: the page chooses it, and
+            # set_value needs no quoting (there's no Gst.Value.serialize in the bindings).
+            structure.set_value("protocol", str(message["protocol"]))
         return self.webrtc.emit("create-data-channel", str(message.get("label") or ""), structure)
 
     def close(self) -> None:
@@ -772,7 +774,11 @@ class Host:
         return bool(self._calling)
 
     def _count(self, channel: "Channel", is_open: bool) -> bool:
-        """Keep count of open call channels (main loop)."""
+        """Keep count of open call channels (main loop).
+
+        on_call is told from the main loop afterwards, never from in here: what it starts (a
+        fresh page, when the call ended with the window hidden) closes this Host, and this runs
+        while the Host is closing a connection or releasing a channel (_close, close)."""
         before = bool(self._calling)
         label = channel.channel.get_property("label") or ""
         if is_open and label not in NOT_CALLS and channel.key in self._channels:
@@ -782,7 +788,11 @@ class Host:
         if bool(self._calling) != before:
             _log("call " + ("started" if self._calling else "ended"))
             if self._on_call:
-                self._on_call(bool(self._calling))
+                GLib.idle_add(self._tell_call, bool(self._calling))
+        return GLib.SOURCE_REMOVE
+
+    def _tell_call(self, calling: bool) -> bool:
+        self._on_call(calling)
         return GLib.SOURCE_REMOVE
 
     def adopt(self, connection: Connection, gst_channel) -> None:
@@ -790,9 +800,16 @@ class Host:
         key = next(self._remote_keys)
 
         def take():
+            if self._connections.get(connection.key) is not connection:
+                return GLib.SOURCE_REMOVE  # closed meanwhile: its channels went with it
             channel = Channel(self, key, gst_channel, connection.key)
             self._channels[key] = channel
-            self.emit({"pc": connection.key, "ch": key, "type": "datachannel", "init": channel.init(), "open": channel.open()})
+            is_open = channel.open()
+            # webrtcbin often opens it, on its own thread, before this runs: then its "on-open"
+            # came before Channel listened, and only this counts it as a call's.
+            if is_open:
+                self._count(channel, True)
+            self.emit({"pc": connection.key, "ch": key, "type": "datachannel", "init": channel.init(), "open": is_open})
             return GLib.SOURCE_REMOVE
         GLib.idle_add(take)
 
@@ -922,19 +939,25 @@ class Host:
         connection = self._connections.pop(key, None)
         if connection is None:
             return
-        for channel_key, channel in list(self._channels.items()):
-            if channel.connection == key:
-                if channel.sent or channel.received:
-                    _log(f"ch{channel_key} (pc{key}) closed - sent {channel.sent}, received {channel.received}")
-                channel.release()
-                del self._channels[channel_key]
-        connection.close()
+        try:
+            for channel_key, channel in list(self._channels.items()):
+                if channel.connection == key:
+                    if channel.sent or channel.received:
+                        _log(f"ch{channel_key} (pc{key}) closed - sent {channel.sent}, received {channel.received}")
+                    # Out of the list before it's let go, so nothing that runs meanwhile finds it.
+                    self._channels.pop(channel_key, None)
+                    channel.release()
+        finally:
+            # Whatever happened above, the connection's webrtcbin stops: left playing, its
+            # threads and its connection to the relay would run on in Natter for good.
+            connection.close()
 
     def close(self) -> None:
         """Close everything (the page went away)."""
-        for channel in self._channels.values():
-            channel.release()
+        channels = list(self._channels.values())
         self._channels.clear()
+        for channel in channels:
+            channel.release()
         for key in list(self._connections):
             self._close(key)
         self._certificates.clear()

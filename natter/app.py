@@ -32,14 +32,15 @@ from .distro import os_release
 from .gstfix import debug_line as camera_fix_line
 from .links import chat_link, page_link
 from .launcher import Badge, chat_key, exec_quote, set_menu_chats
-from .memguard import KILL_MEMORY, MemoryGuard, mem_total, page_ceiling, page_limit
+from .memguard import (KILL_MEMORY, OOM_SCORE_ADJ, MiB, MemoryGuard, mem_total, page_ceiling, page_limit,
+                       page_limits, page_sizes)
 from .notify import Notifier, ReplyTarget
 from .reply import LIMIT as REPLY_LIMIT, ReplyWindow, notice as reply_notice, units as reply_units
 from .search import SearchProvider
 from .settings import AUTOSTART, CACHE, CONFIG, DATA, Chat, ChatIndex, Settings, private_folder
-from .system import (SWAP_BUDGET_MB, AudioFollower, CallSound, Reclaimer, footprint, give_system_bus, in_own_scope,
-                     in_sandbox, limit_own_scope, media_report, memory_events, memory_tight, move_to_own_scope,
-                     network_processes, open_uri, own_swap, request_background, swap_full)
+from .system import (AudioFollower, CallSound, Reclaimer, footprint, give_system_bus, in_own_scope, in_sandbox,
+                     limit_own_scope, media_report, memory_events, memory_tight, move_to_own_scope, network_processes,
+                     open_uri, own_swap, pages_end_alone, request_background)
 from .tray import MenuItem, Tray, tray_host_available
 
 HERE = Path(__file__).resolve().parent
@@ -70,13 +71,16 @@ MEMORY_THRESHOLDS = (0.55, 0.8)  # conservative, strict: fractions of the limit
 MEMORY_POLL = 30  # seconds between WebKit's memory checks
 # Past this many times the limit, WebKit ends the page and Natter starts a fresh one (a plan,
 # not a crash: Account._on_crash). Without it the limit only ever freed caches, while what
-# WhatsApp's call engine keeps after a call grew on to several gigabytes. 2.5 leaves room for a
-# call on top of an idle page (about 1.2 GB): ending the page during a call ends the call.
-# It's the second net, not the first: WebKit counts only what's resident (a page pushed into
-# swap passes under it), and looks from a timer on the page's own main thread, which a page
-# busy growing never lets run (on 20 Oct 2026 one stayed past it for 45 s, on to 12 GB).
-# Natter's guard (memguard.py, started in do_startup) looks from outside the page.
+# WhatsApp's call engine keeps after a call grew on to several gigabytes. It's the second net,
+# not the first: WebKit counts only what's resident (a page pushed into swap passes under it),
+# looks from a timer on the page's own main thread, which a page busy growing never lets run
+# (on 20 Oct 2026 one stayed past it for 45 s, on to 12 GB), and doesn't know about calls:
+# ending the page during a call ends the call. Natter's guard (memguard.py, started in
+# do_startup) looks from outside the page and gives a call room, so WebKit's kill comes only
+# past the most the guard lets a page hold in a call, KILL_ROOM above it (kill_threshold);
+# 2.5 at least.
 MEMORY_KILL = 2.5
+KILL_ROOM = 512  # MB
 MEMORY_CHECK = 60  # seconds between Natter's own checks (_check_memory)
 NETWORK_CHECK = 5  # seconds between looks at WebKit's network process (_check_network_process)
 # Every second at first: WhatsApp's busiest start is when a dying network process is likeliest,
@@ -86,10 +90,19 @@ NETWORK_CHECK_EARLY, NETWORK_EARLY_LOOKS = 1, 120
 # sometimes seconds after they hide). Thawed, it gets a moment to give memory back before the
 # freeze, and the swapping that comes with it, can blame it again (_thawed).
 THAW_GAP = 20
-FRESH_AGAIN = 30 * 60  # seconds before the same account gets another fresh page for memory
+# A fresh page (Account.fresh_page) reloads WhatsApp: for a while no messages arrive, so no
+# notifications and no ringing. While the window is hidden a page gets one for its memory only
+# when it's past the guard's limit for a page, when the computer is really short of memory, or
+# after a call that left a lot behind (_fresh_pages_for_memory); then only once the window has
+# been hidden a while, the page has been quiet a while, and, but for a call's leftovers (once a
+# call), never more often than FRESH_AGAIN.
+FRESH_AGAIN = 4 * 60 * 60  # seconds after a page's last load before it gets a fresh one for memory
+HIDDEN_BEFORE_FRESH = 10 * 60  # seconds the window stays hidden first
+QUIET_BEFORE_FRESH = 5 * 60  # seconds since the page's last notification, and since a call ended
+CALL_GROWTH = 512  # MB a call has to leave behind (what the pages grew since it began) for a fresh page after it
 HIDDEN_BEFORE_RECLAIM = 90  # seconds hidden before Natter gives memory back
-FRESH_AFTER_CALL = 120  # seconds hidden after a call before WhatsApp gets a fresh page (Account.fresh_page)
 RECLAIM_AGAIN = 15 * 60  # and again this often while it stays hidden
+SETTLE_BEFORE_RECLAIM = 10 * 60  # seconds after a page's last load before its memory goes to swap
 SEARCH_LINGER = 30_000  # ms a Natter started only for desktop search stays after the last search
 MEDIA_CHECK_DELAY = 10  # seconds after WhatsApp is up, so the check doesn't slow its start
 SNAPSHOTS = CACHE / "snapshots"  # the only folder debug snapshots are saved to
@@ -178,6 +191,19 @@ def memory_pressure(limit: Optional[str], thresholds: Optional[str]) -> Optional
     if not 0 < conservative < strict < 1:
         conservative, strict = MEMORY_THRESHOLDS
     return megabytes, conservative, strict
+
+
+def kill_threshold(limit_mb: int, total: int) -> float:
+    """WebKit's own kill, as a share of its memory limit (`limit_mb`) on a computer with `total`
+    bytes of memory: MEMORY_KILL, or more where that would end a page before the guard would in
+    a call. The guard knows about calls; WebKit doesn't, and its kill ends one."""
+    _soft, hard = page_limits(page_limit(total), page_ceiling(total), True)
+    return max(MEMORY_KILL, (hard + KILL_ROOM * MiB) / (limit_mb * MiB))
+
+
+def pages_held() -> int:
+    """Bytes all of Natter's pages hold together, resident or swapped (memguard.page_sizes)."""
+    return sum(page_sizes().values())
 
 
 def stall_line(stalled: float, held: int, swapped: int, before: dict[str, int], after: dict[str, int]) -> str:
@@ -429,14 +455,21 @@ class Natter(Adw.Application):
         self.downloaded: set[str] = set()  # what open-file may open: Natter's own downloads
         self._held = False
         self._reclaim_timer = 0
-        self._after_call: set = set()  # accounts that had a call since their page started
+        # Memory while hidden (_fresh_pages_for_memory): since when the window has been hidden
+        # (None while it's shown; at start it isn't yet), when the last call ended, what the
+        # pages held when each account's call began, and, for an account whose call ended
+        # since its page loaded, (what they held then, when it ended).
+        self._hidden_at: Optional[float] = time.monotonic()
+        self._call_ended_at: Optional[float] = None
+        self._call_held: dict = {}
+        self._after_call: dict = {}
+        self._memory_waiting: Optional[tuple] = None  # what the last "not yet" said (_memory_wait)
         # The app lock (lock.py): while locked, the window shows only the passcode, and what
         # would show a chat waits for the unlock.
         self.locked = False
         self._attempts = applock.Attempts(self.settings)
         self._after_unlock: list[tuple[str, Callable[[], None]]] = []  # (key, run), oldest first
         self._last_activity = awake_time()
-        self._fresh_timer = 0
         # Natter's own watch on its pages' memory (memguard.py, started in do_startup), and the
         # kernel's counts for its unit (system.memory_events): as at the last look, how many of
         # its oom_kills have been seen, and when each of those no page has claimed yet was
@@ -535,8 +568,11 @@ class Natter(Adw.Application):
         # swap: the guard looks at every page from a thread of Natter's own, window shown or not,
         # and ends one past its limit (a crash its view puts down to memory: Account._on_crash).
         # A call gets more room, as ending the page would end it.
+        # Its pages are the kernel's first choice only where that ends the page alone: in a unit
+        # whose OOMPolicy is "continue" (system.py). Elsewhere that would stop all of Natter.
         total = mem_total()
-        self.memory_guard = MemoryGuard(page_limit(total), calling=lambda: self.calling, ceiling=page_ceiling(total))
+        self.memory_guard = MemoryGuard(page_limit(total), calling=lambda: self.calling, ceiling=page_ceiling(total),
+                                        oom_score_adj=OOM_SCORE_ADJ if pages_end_alone() else None)
         self.memory_guard.start()
         self._apply_spelling()
 
@@ -713,7 +749,7 @@ class Natter(Adw.Application):
                 pressure.set_strict_threshold(strict)
                 pressure.set_conservative_threshold(conservative)
             pressure.set_poll_interval(MEMORY_POLL)
-            pressure.set_kill_threshold(MEMORY_KILL)
+            pressure.set_kill_threshold(kill_threshold(limit, mem_total()))
             self.web_context = WebKit.WebContext(memory_pressure_settings=pressure)
         else:
             self.web_context = WebKit.WebContext()
@@ -1879,16 +1915,19 @@ class Natter(Adw.Application):
         if self._reclaim_timer:
             GLib.source_remove(self._reclaim_timer)
             self._reclaim_timer = 0
-        self._schedule_fresh_pages(visible)
+        if visible:
+            self._hidden_at = None
+        elif self._hidden_at is None:  # not again when a call ends with it hidden (_on_page_call)
+            self._hidden_at = time.monotonic()
         self._refresh_tray()
         if visible:
             self.reclaimer.stop()
             self._check_media()
             return
         self._write_menu_chats()
-        # Now, not on a timer: Ada may freeze a hidden Natter within seconds, and a frozen one
-        # runs nothing, so a page past its limit would be swapped out whole instead.
-        self._fresh_pages_for_memory()
+        # No fresh page now: closing the window isn't a reason to reload WhatsApp, and messages
+        # that come during a reload come without notifications. _check_memory looks every minute
+        # (and _thawed after a freeze) once the window has been hidden HIDDEN_BEFORE_FRESH.
         if self.settings["light_background"] and self.reclaimer.available and not self.calling:
             self._reclaim_timer = GLib.timeout_add_seconds(HIDDEN_BEFORE_RECLAIM, self._reclaim)
 
@@ -1899,10 +1938,17 @@ class Natter(Adw.Application):
 
     def _on_page_call(self, account: Account, active: bool) -> None:
         # During a call nothing squeezes the page: no reclaim, and a sound stream the desktop
-        # can see (see CallSound) so it isn't paused either. Afterwards, as before, and once
-        # Natter has been hidden a while, a fresh page for the memory the call left behind.
-        if not active:
-            self._after_call.add(account)
+        # can see (see CallSound) so it isn't paused either. Afterwards, once Natter has been
+        # hidden a while, a fresh page if the call left a lot behind (_fresh_pages_for_memory).
+        if active:
+            if account not in self._call_held:  # from before its first call since the page loaded
+                earlier = self._after_call.pop(account, None)
+                self._call_held[account] = earlier[0] if earlier else pages_held()
+        else:
+            self._call_ended_at = time.monotonic()
+            began = self._call_held.pop(account, None)
+            if began is not None:
+                self._after_call[account] = (began, self._call_ended_at)
         self._apply_page_sound()
         if self.calling:
             if self._reclaim_timer:
@@ -1915,68 +1961,113 @@ class Natter(Adw.Application):
             if self.window and not self.window.get_visible():
                 self._on_window_visible(False)
 
-    def _schedule_fresh_pages(self, visible: bool) -> None:
-        if self._fresh_timer:
-            GLib.source_remove(self._fresh_timer)
-            self._fresh_timer = 0
-        if not visible and self._after_call and not self.calling:
-            self._fresh_timer = GLib.timeout_add_seconds(FRESH_AFTER_CALL, self._fresh_pages)
-
-    def _fresh_pages(self) -> bool:
-        self._fresh_timer = 0
-        if self.calling or (self.window and self.window.get_visible()):
-            return GLib.SOURCE_REMOVE
-        for account in list(self._after_call):
-            if account in self.accounts and not account.calling:
-                if GLib.getenv("NATTER_DEBUG"):
-                    print(f"natter: a fresh page for {account.name}, for the memory its call left behind", flush=True)
-                account.fresh_page()
-            self._after_call.discard(account)
-        return GLib.SOURCE_REMOVE
-
     def _reclaim(self) -> bool:
         # Past the limit, what's there is WhatsApp's own and live (WebKit can't collect it):
         # pushing it to swap only hides it, and filled 9.7 GB of swap one day. A fresh page frees it.
-        # Not while a reply is being sent: the page it's typing in would be pushed out under it.
-        if not self._fresh_pages_for_memory() and not any(account.replying for account in self.accounts):
+        # Not while a page loads or has just loaded, or a reply is being sent: the page would be
+        # pushed out under it. What the Reclaimer puts in swap is never a reason for a fresh page.
+        if not self._fresh_pages_for_memory() and not self._reclaim_wait(time.monotonic()):
             self.reclaimer.start()
         self._reclaim_timer = GLib.timeout_add_seconds(RECLAIM_AGAIN, self._reclaim)
         return GLib.SOURCE_REMOVE
 
-    def _memory_past_limit(self) -> bool:
-        """Natter's unit holds more than its accounts' pages should: their limit each, and Natter."""
-        limit = (memory_pressure(GLib.getenv("NATTER_MEMORY_LIMIT"), None) or (MEMORY_LIMIT, 0, 0))[0]
-        return footprint() > (limit * max(1, len(self.accounts)) + 300) * 1024 * 1024
+    def _reclaim_wait(self, now: float) -> str:
+        """Why the Reclaimer shouldn't run now, in words; "" when it may."""
+        if self.calling:
+            return "a call is on"
+        for account in self.accounts:
+            if account.replying:
+                return "a reply is being sent"
+            if account.reloading or now - account.loaded_at < SETTLE_BEFORE_RECLAIM:
+                return "a page is loading or has just loaded"
+        return ""
 
     def _fresh_pages_for_memory(self) -> bool:
-        """While hidden and not calling: fresh pages for accounts past the limit, or when the
-        whole computer is short of memory. True if any was started."""
-        if self.calling or (self.window and self.window.get_visible()):
+        """While hidden: a fresh page for one account whose page needs one (_memory_reason, or a
+        call that left CALL_GROWTH behind), once it may have one (_memory_wait). One a look: the
+        guard can't tell whose page is whose, so with several accounts the page longest since its
+        last load goes first, and if a page is still past its limit at the next look, the next.
+        True if one was started. Each decision is logged, and each wait once."""
+        if self.window is None or self.window.get_visible():
+            self._memory_waiting = None
+            if self.window is not None:
+                self._hidden_at = None  # shown: the next hide counts from then, whatever told it
             return False
-        why = self._memory_reason()
-        if not why:
+        now, pages = time.monotonic(), page_sizes()
+        biggest, total = max(pages.values(), default=0), sum(pages.values())
+        wanted = []  # (account, (what kind of reason, its words)), in the order they'd go
+        reason = self._memory_reason(biggest)
+        if reason:
+            wanted += [(account, reason) for account in sorted(self.accounts, key=lambda a: a.loaded_at)]
+        for account, (began, ended) in list(self._after_call.items()):
+            if account not in self.accounts or account.loaded_at > ended:
+                del self._after_call[account]  # gone, or its page loaded again since: the call's memory went with it
+            elif total - began < CALL_GROWTH * MiB:
+                del self._after_call[account]
+                print(f"natter: memory: {account.name}'s call left {max(0, total - began) >> 20} MB behind; "
+                      "no fresh page for it", flush=True)
+            else:
+                wanted.append((account, ("call", f"its call left {(total - began) >> 20} MB behind")))
+        if not wanted:
+            self._memory_waiting = None
             return False
-        now, started = time.monotonic(), False
-        for account in self.accounts:
-            if account.ready and not account.calling and now - account.fresh_at > FRESH_AGAIN:
-                print(f"natter: a fresh page for {account.name}: {why} ({footprint() >> 20} MB held, "
+        first = None
+        for account, (kind, why) in wanted:
+            wait = self._memory_wait(account, now, kind)
+            if not wait:
+                print(f"natter: a fresh page for {account.name}: {why} ({NAME} holds {footprint() >> 20} MB, "
                       f"{own_swap() >> 20} MB of it in swap)", flush=True)
+                self._memory_waiting = None
+                self._after_call.pop(account, None)
                 account.fresh_page()
-                self._after_call.discard(account)
-                started = True
-        return started
+                return True
+            first = first or (account, kind, why, wait)
+        account, kind, why, (waits, words) = first
+        if self._memory_waiting != (account.id, kind, waits):  # said once, not every minute
+            self._memory_waiting = (account.id, kind, waits)
+            print(f"natter: memory: {account.name} could do with a fresh page ({why}), but not yet: {words}",
+                  flush=True)
+        return False
 
-    def _memory_reason(self) -> str:
-        """Why Natter should give memory back now, in words; "" when it needn't. A fresh page
-        is the only way to free what's in swap (the old process's slots go with it)."""
-        held = footprint()
-        if self._memory_past_limit():
-            return "past its limit"
-        if own_swap() > SWAP_BUDGET_MB * 1024 * 1024:
-            return "much of it in swap"
-        if held > MEMORY_LIMIT * 1024 * 1024 and (memory_tight() or swap_full()):
-            return "the computer is short of memory"
-        return ""
+    def _memory_reason(self, biggest: int) -> Optional[tuple[str, str]]:
+        """Why the pages need a fresh one, for the biggest of them holding `biggest` bytes:
+        (what kind of reason, its words), or None when they don't. A page past the guard's own
+        limit for one (memguard.py), or the whole computer short of memory (memory_tight: little
+        available and swap all but full) with a page holding more than WebKit's limit for one.
+        Never what's in swap alone, and never what Natter's own Reclaimer put there: it does
+        that while hidden, by design."""
+        limit = self.memory_guard.limit if self.memory_guard is not None else page_limit(mem_total())
+        if biggest > limit:
+            return "limit", f"a page holds {biggest >> 20} MB, past the guard's limit of {limit >> 20} MB"
+        webkit = (memory_pressure(GLib.getenv("NATTER_MEMORY_LIMIT"), None) or (MEMORY_LIMIT, 0, 0))[0]
+        if biggest > webkit * MiB and memory_tight():
+            return "short", f"the computer is short of memory, and a page holds {biggest >> 20} MB"
+        return None
+
+    def _memory_wait(self, account: Account, now: float, kind: str = "") -> Optional[tuple[str, str]]:
+        """Why `account` can't have a fresh page for its memory now: (a key, the words), or None
+        when it can. Not before the window has been hidden HIDDEN_BEFORE_FRESH, not during a
+        call or a reply, nor for QUIET_BEFORE_FRESH after one ended or a notification came (a
+        call rings with one), not while it loads, and not within FRESH_AGAIN of its last load,
+        unless the reason (`kind`) is a call's leftovers: those are asked for once per call and
+        gone with the fresh page, so they can't make a loop, and the guard counts on them going
+        (memguard.py: the call's room above a page's limit)."""
+        hidden = now - self._hidden_at if self._hidden_at is not None else 0.0
+        if hidden < HIDDEN_BEFORE_FRESH:
+            return "hidden", f"the window was hidden {hidden / 60:.0f} min ago"
+        if self.calling:
+            return "call", "a call is on"
+        if self._call_ended_at is not None and now - self._call_ended_at < QUIET_BEFORE_FRESH:
+            return "call ended", "a call ended a moment ago"
+        if account.replying:
+            return "reply", "a reply is being sent"
+        if account.crashing or account.reloading or not account.ready:
+            return "loading", "its page isn't up"
+        if account.notified_at is not None and now - account.notified_at < QUIET_BEFORE_FRESH:
+            return "notified", "a notification came a moment ago"
+        if kind != "call" and now - account.loaded_at < FRESH_AGAIN:
+            return "again", f"its page loaded {(now - account.loaded_at) / 60:.0f} min ago"
+        return None
 
     def _check_memory(self) -> bool:
         self._fresh_pages_for_memory()
@@ -2444,7 +2535,8 @@ class Natter(Adw.Application):
             self.withdraw_notification(f"memory-{account.id}")
         self.window.remove_account(account)
         self.accounts.remove(account)
-        self._after_call.discard(account)
+        self._after_call.pop(account, None)
+        self._call_held.pop(account, None)
         for handler in getattr(account, "app_handlers", []):
             account.disconnect(handler)
         self.settings["accounts"] = [a for a in self.settings["accounts"] if a["id"] != account.id]

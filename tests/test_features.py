@@ -237,7 +237,7 @@ class BlankPageTest(unittest.TestCase):
         page._reload_blank = lambda what: Account._reload_blank(page, what)
         values = iter(progress)
         page.view = type("View", (), {"get_estimated_load_progress": lambda _view: next(values)})()
-        page._progress, page._page_timer = (-1.0, 0.0), 1
+        page._progress, page._page_timer, page._stall_look = (-1.0, 0.0), 1, 0.0
         return page
 
     def test_reloads_are_limited(self):
@@ -279,6 +279,23 @@ class BlankPageTest(unittest.TestCase):
             self.assertTrue(Account._page_stalled(page))
             self.assertTrue(Account._page_stalled(page))
             self.assertFalse(Account._page_stalled(page))
+        self.assertEqual(page.loads, [page.home])
+
+    def test_time_frozen_is_not_a_stall(self):
+        # Ada pauses a hidden Natter, its page with it: a look that comes long after it was due
+        # starts the count again rather than blaming the page for the time it was frozen.
+        from unittest import mock
+
+        from natter.account import STALL_CHECK, STALL_LIMIT, Account
+
+        thawed = STALL_CHECK + 600  # the third look, 10 minutes late
+        looks = [0, STALL_CHECK] + [thawed + STALL_CHECK * n for n in range(STALL_LIMIT // STALL_CHECK + 1)]
+        page = self.page(progress=[0.5] * len(looks))
+        with mock.patch("natter.account.time.monotonic", side_effect=looks + [looks[-1]]):
+            for _ in looks[:-1]:
+                self.assertTrue(Account._page_stalled(page))  # counted from the thaw, not from the start
+            self.assertEqual(page.loads, [])
+            self.assertFalse(Account._page_stalled(page))  # then no progress for STALL_LIMIT: a stall
         self.assertEqual(page.loads, [page.home])
 
 

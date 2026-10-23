@@ -187,6 +187,8 @@ introspection data. Without them Natter Den still runs, and calls open in your b
 ```sh
 # Debian, Ubuntu and derivatives
 sudo apt install gstreamer1.0-plugins-bad gstreamer1.0-nice gir1.2-gst-plugins-bad-1.0 gir1.2-gst-plugins-base-1.0
+# Arch and derivatives (CachyOS, EndeavourOS, Manjaro…)
+sudo pacman -S --needed gst-plugins-bad gst-plugins-bad-libs gst-plugins-base-libs libnice
 ```
 
 Then download Natter Den and install it (this is what the one-line command does):
@@ -448,17 +450,26 @@ Most of Natter Den's memory is WhatsApp's own page.
   to the window stuttered while it was pulled back in. It only does this where swapping is
   cheap (zram, or zswap in front of the swap file), so the memory is compressed, not gone to
   disk, and not where the unit's swap is turned off. It stops once 1 GB of Natter Den is in swap,
-  or 60% of the computer's swap is in use: WhatsApp's leaked memory never comes back from swap,
-  so more of it there only fills it. Preferences → *Use Less Memory in the Background*.
-- **A fresh page instead of a leak**: after a call WhatsApp keeps its call engine (twenty
-  threads and memory that only grows). Once Natter Den has been hidden two minutes after a call, or
-  whenever it's hidden and holds more than its limit, has much of it in swap, or the computer is
-  short of memory, WhatsApp gets a fresh page (a new web process, back on the chat that was
-  open), not a trip to swap. A fresh page is also the one thing that empties swap. Natter Den
-  checks the moment its window hides, and again whenever it runs after being paused, since
-  desktops such as Ada may freeze a hidden app within seconds. WebKit itself ends a page past
-  2.5 times the limit (about 3.8 GB), and Natter Den starts a fresh one. Each of these decisions
-  is logged with the memory it saw.
+  or 60% of the computer's swap is in use, or the computer is already waiting on memory (memory
+  pressure past 20%): WhatsApp's leaked memory never comes back from swap, so more of it there only
+  fills it. Not while a page loads or in its first ten minutes, during a call, or while a reply is
+  being sent. What it puts in swap is never a reason to reload WhatsApp. Preferences → *Use Less
+  Memory in the Background*.
+- **A fresh page, rarely**: a fresh page (a new web process, back on the chat that was open)
+  reloads WhatsApp, and messages that arrive meanwhile come without notifications, so a hidden
+  Natter Den gives one only for a real reason: a page holding more than the guard's limit for a
+  page (below), the whole computer short of memory (under a tenth of it available and swap all but
+  full) with a page holding more than WebKit's limit, or a call that left half a gigabyte or more
+  behind (WhatsApp keeps its call engine after a call: twenty threads and memory that only grows).
+  Never because of what's in swap, and never the moment the window closes: only once it has been
+  hidden ten minutes, not during a call or a reply, not within five minutes of a call ending or a
+  notification (a call rings with one), not while the page loads, and, except for what a call
+  left behind (once a call), not within four hours of the page's last load. With several
+  accounts, one at a time. Natter Den looks every minute, and again whenever it runs after being
+  paused (desktops such as Ada may freeze a hidden app). Each
+  fresh page is logged with the memory it saw, and each wait once. WebKit itself ends a page only
+  past the most the guard lets a page hold in a call, half a gigabyte above it (at least 2.5 times
+  the limit), as it doesn't know about calls, and Natter Den starts a fresh one.
 - **A guard for a page that grows without end**: WebKit's limit only counts what's resident, and
   only looks when the page's own main thread lets it, so a page busy growing gets past it (on
   20 October 2026 a video being attached took one to 12 GB). Natter Den looks at each page itself
@@ -470,11 +481,16 @@ Most of Natter Den's memory is WhatsApp's own page.
   within ten minutes, it stays down until you press Try Again, and if you're not looking at the
   window a notification says so. During a call, and for a minute after, the page may hold 1.5 GB
   more before growth counts, and half a gigabyte more again whatever it does. The last backstop
-  is the kernel's: the unit Natter Den runs in has a `MemoryMax` (one page's limit, 1.5 GB for
-  each account and half a gigabyte for Natter Den, at most 60% of the computer's memory) and at
-  most 1.5 GB of swap. Where Natter Den makes the unit itself it's `OOMPolicy=continue`, so the
-  kernel ending a page there leaves Natter Den running. The log says what each page held, and
-  the files handed to WhatsApp by number, size and type, never by name.
+  is the kernel's, only where the unit Natter Den runs in has `OOMPolicy=continue`, which it sets
+  on the unit it makes for itself (started from a terminal, a script): there the unit has a
+  `MemoryMax` (one page's limit, 1.5 GB for each account and half a gigabyte for Natter Den, at
+  most 60% of the computer's memory) and at most 1.5 GB of swap, the kernel ending a page leaves
+  Natter Den running, and it ends a page before other apps. The units desktops start apps in
+  (KDE's `app-…@….service`, GNOME's and Ada's scopes, autostart) have `OOMPolicy=stop`, where
+  the kernel ending one page stops all of Natter Den: there Natter Den sets no limit, leaves its
+  pages' standing with the kernel as it is, and the guard alone ends a page that grows without
+  end (the log says so once). The log says what each page held, and the files handed to WhatsApp
+  by number, size and type, never by name.
 - **Closing when asked**: a desktop closing apps to make room (a close request to a hidden
   window, or SIGTERM) gets a real quit, not a trip to the tray.
 - **No spare processes**: process swapping and the back/forward cache are off (one site, no

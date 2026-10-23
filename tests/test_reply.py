@@ -1224,7 +1224,7 @@ class AppTest(unittest.TestCase):
         app = self.make()
         work = Fake(id="work", app_handlers=[])
         app.accounts.append(work)
-        app._memory_told, app._after_call, app.window = set(), set(), Fake()
+        app._memory_told, app._after_call, app._call_held, app.window = set(), {}, {}, Fake()
         mine, theirs = Window(), Window()
         app.replies = {("main", "a"): mine, ("work", "b"): theirs}
         app.reply_drafts = {("main", "c"): "kept", ("work", "d"): "dropped"}

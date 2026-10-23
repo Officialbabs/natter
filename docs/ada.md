@@ -64,9 +64,9 @@ Two things for lifecycled, from a WhatsApp page that grew to 12 GB (20 October 2
 - **Make launcher scopes with `OOMPolicy=continue`.** systemd's default, `stop`, stops the whole
   app when the kernel ends one of its processes at the unit's `MemoryMax`; with `continue` only
   that process goes, and Natter Den starts a fresh page in its place. It can only be set when
-  the scope is made, so Natter Den sets it on scopes it makes itself, sets `MemoryMax` and
-  `MemorySwapMax` on Ada's, and says in its log when Ada's is `stop`. Its own guard
-  (`natter/memguard.py`) ends a runaway page well before either.
+  the scope is made, so Natter Den sets it on scopes it makes itself. On Ada's, which has
+  `stop`, it sets no `MemoryMax` (a page past it would stop all of Natter Den) and says so in its
+  log; its own guard (`natter/memguard.py`) ends a runaway page alone.
 
 ## Replying from notifications
 

@@ -11,10 +11,15 @@ apply() turns the tracer on through GStreamer's environment: the plugin's folder
 GST_PLUGIN_PATH_1_0 (or GST_PLUGIN_PATH), "nattercamfix" in GST_TRACERS, and a registry of
 Natter's own in GST_REGISTRY, so the one other GStreamer programs share isn't rewritten each time
 one of them starts with a different set of plugins. GStreamer reads these once, when it starts,
-in Natter and in each WebKit process (WebKit's sandbox passes them on and gives the web process
-the plugin's and the registry's folders), so apply() runs first thing in __main__. It changes
-nothing in the Flatpak or a Snap (their runtimes bring their own GStreamer), without the plugin,
-or with a GStreamer older than 1.28, where WebKit still does it itself.
+in each WebKit process (WebKit's sandbox passes them on and gives the web process the plugin's
+and the registry's folders), so apply() runs first thing in __main__. It changes nothing in the
+Flatpak or a Snap (their runtimes bring their own GStreamer), without the plugin, or with a
+GStreamer older than 1.28, where WebKit still does it itself.
+
+The capture pipelines it fixes are only ever in WebKit's web process. Natter's own process runs
+GStreamer too (calls' webrtcbin, rtc.py), and there a crash takes the whole app with it, not one
+page: so start_own() starts Natter's GStreamer with the tracer left out, right after apply(),
+before anything else does. The settings stay in the environment for the processes WebKit starts.
 
 The settings are for WebKit only, and everything Natter starts inherits its environment: a
 browser, a media player, the call window. launch_env() and cleaned() take them off those, through
@@ -206,6 +211,43 @@ def _apply(environ, flatpak_info, dirs, version) -> Fix:
     return Fix(True, f"GStreamer {dotted(found)}, {shown}", str(plugin), dotted(found), changed)
 
 
+def without_tracer(tracers: str) -> Optional[str]:
+    """GST_TRACERS' value with the camera fix's tracer taken out; None when nothing's left."""
+    kept = [entry for entry in tracers.split(";") if _tracer_name(entry) != TRACER]
+    return ";".join(kept) if any(entry.strip() for entry in kept) else None
+
+
+def start_own(environ: MutableMapping[str, str] = os.environ, init=None) -> bool:
+    """Start GStreamer in Natter's own process without the camera fix's tracer (see the top of
+    this file), and put GST_TRACERS back as it was for the processes WebKit starts. GStreamer
+    reads GST_TRACERS once, when it starts, so call it after apply() and before anything else
+    starts GStreamer. `init` (for tests) starts it; by default Gst.init. True when it started.
+    Without GStreamer's Python bindings it does nothing: the start-up check says what's missing."""
+    tracers = environ.get(TRACERS)
+    hidden = tracers is not None and TRACER in {_tracer_name(entry) for entry in _entries(tracers, ";")}
+    if hidden:
+        kept = without_tracer(tracers)
+        if kept is None:
+            del environ[TRACERS]
+        else:
+            environ[TRACERS] = kept
+    try:
+        if init is None:
+            import gi
+
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gst
+
+            init = (lambda: None) if Gst.is_initialized() else (lambda: Gst.init(None))
+        init()
+        return True
+    except Exception:  # no Gst bindings, or a GStreamer that won't start: check() says so
+        return False
+    finally:
+        if hidden:
+            environ[TRACERS] = tracers
+
+
 def cleaned(environ: Optional[MutableMapping[str, str]] = None) -> dict[str, Optional[str]]:
     """What apply() added, taken out of `environ` (os.environ by default): each variable that
     changes → its value without it, None to unset it. Works from the variables themselves, so a
@@ -221,11 +263,8 @@ def cleaned(environ: Optional[MutableMapping[str, str]] = None) -> dict[str, Opt
             kept = [entry for entry in entries if not (entry.strip() and os.path.normpath(entry.strip()) in folders)]
             if kept != entries:
                 changes[name] = os.pathsep.join(kept) if any(entry.strip() for entry in kept) else None
-    if TRACERS in environ:
-        entries = environ[TRACERS].split(";")
-        kept = [entry for entry in entries if _tracer_name(entry) != TRACER]
-        if kept != entries:
-            changes[TRACERS] = ";".join(kept) if any(entry.strip() for entry in kept) else None
+    if TRACERS in environ and any(_tracer_name(entry) == TRACER for entry in environ[TRACERS].split(";")):
+        changes[TRACERS] = without_tracer(environ[TRACERS])
     if environ.get(REGISTRY) == str(private_registry(environ)):
         changes[REGISTRY] = None
     return changes

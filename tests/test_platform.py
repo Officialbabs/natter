@@ -245,6 +245,14 @@ class DistroTest(Temp):
         self.assertEqual(self.manager('ID="rocky"\nID_LIKE="rhel centos fedora"\n'), "dnf")
         self.assertEqual(self.manager("ID=arch\n"), "pacman")
         self.assertEqual(self.manager("ID=manjaro\nID_LIKE=arch\n"), "pacman")
+        # CachyOS: its os-release hook writes ID_LIKE=arch, but installs without that line have been
+        # seen; named by its own ID too, like Arch's other derivatives.
+        self.assertEqual(self.manager('NAME="CachyOS Linux"\nID=cachyos\nID_LIKE=arch\nBUILD_ID=rolling\n'), "pacman")
+        for derivative in ("cachyos", "endeavouros", "manjaro", "garuda", "artix"):
+            self.assertEqual(self.manager(f"ID={derivative}\n"), "pacman", derivative)
+        self.assertEqual(install_hint(DESKTOP, os_release("ID=cachyos\n")),
+                         "sudo pacman -S --needed " + DESKTOP["pacman"])
+        self.assertEqual(distro.too_old_release(os_release("ID=cachyos\nID_LIKE=arch\nBUILD_ID=rolling\n")), "")
         self.assertEqual(self.manager('ID="opensuse-tumbleweed"\nID_LIKE="opensuse suse"\n'), "zypper")
         self.assertEqual(self.manager('ID="sles"\nID_LIKE="suse"\n'), "zypper")
         self.assertIsNone(self.manager("ID=nixos\n"))

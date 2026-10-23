@@ -217,10 +217,17 @@ def scope_name(pid: int) -> str:
 # (memguard.py) couldn't act: past MemoryMax, with its swap capped by MemorySwapMax, the kernel
 # ends the biggest process in the unit, a page (the guard ranks pages first, oom_score_adj).
 # What follows is the unit's OOMPolicy: "continue" leaves Natter running to start a fresh page;
-# systemd's default, "stop", stops all of Natter. No MemoryHigh: it never kills, and on 20 Oct
-# 2026 it held a runaway page at 6 GB while pushing gigabytes of it into swap, and stalled
-# Natter's window with it. memguard.scope_limits sizes both from the computer's memory.
+# systemd's default, "stop", stops all of Natter, and so does any other kernel OOM kill in the
+# unit (memory.events counts them all). So the backstop is set only on a unit whose OOMPolicy is
+# "continue": the scope Natter makes for itself. A launcher's unit (KDE's app-…@….service, its
+# autostart, GNOME's and Ada's scopes) has "stop", which only the launcher can change, and gets
+# no limit: there the guard alone ends a page that grows without end. No MemoryHigh: it never
+# kills, and on 20 Oct 2026 it held a runaway page at 6 GB while pushing gigabytes of it into
+# swap, and stalled Natter's window with it. memguard.scope_limits sizes both from the
+# computer's memory.
 _made_scope: Optional[str] = None  # the scope move_to_own_scope made
+_made_without_policy = False  # systemd refused OOMPolicy=continue on it
+_unit_policy: Optional[tuple[str, Optional[str]]] = None  # (a launcher's unit, its OOMPolicy), once asked
 _launcher_limits: Optional[tuple[Optional[int], Optional[int]]] = None  # (MemoryMax, MemorySwapMax) a launcher set
 _told_oom_policy = False
 
@@ -246,27 +253,68 @@ def _unit_property(bus: Gio.DBusConnection, unit: str, name: str) -> Optional[st
     return value if isinstance(value, str) else None
 
 
+def unit_oom_policy(unit: str, bus: Gio.DBusConnection) -> Optional[str]:
+    """What systemd does to Natter's unit `unit` when the kernel ends a process in it for memory:
+    "continue" (that process only) or "stop" (all of Natter); None when systemd can't say. The
+    scope Natter made has what it was made with; a launcher's is asked once, as it can't change."""
+    global _unit_policy
+    if unit == _made_scope:
+        return "stop" if _made_without_policy else "continue"
+    if _unit_policy is None or _unit_policy[0] != unit:
+        _unit_policy = (unit, _unit_property(bus, unit, "OOMPolicy"))
+    return _unit_policy[1]
+
+
+def pages_end_alone() -> bool:
+    """Whether the kernel, ending one of Natter's pages for memory, leaves the rest of Natter
+    running: only in a unit of Natter's own whose OOMPolicy is "continue". Elsewhere the guard
+    doesn't make its pages the kernel's first choice (memguard's oom_score_adj): there, the
+    kernel's choosing one would stop all of Natter."""
+    cgroup = own_cgroup()
+    if in_sandbox() or not in_own_scope(cgroup):
+        return False
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+    except GLib.Error:
+        return False
+    return unit_oom_policy(cgroup.name, bus) == "continue"
+
+
 def limit_own_scope(accounts: int = 1) -> bool:
     """Set the backstop's MemoryMax and MemorySwapMax, for `accounts` pages, on the unit Natter
-    runs in: one a launcher made (Ada's does), or the one move_to_own_scope made. Call it again
-    whenever an account is added or removed. True when they were set.
+    runs in, if its OOMPolicy is "continue": the one move_to_own_scope made, or a launcher's that
+    has it. Call it again whenever an account is added or removed. True when they were set.
 
-    A launcher's own lower limits stay. Its OOMPolicy can't be changed after the unit starts
-    (systemd refuses it), so if it's "stop" that is logged, once: there the kernel's backstop
-    stops all of Natter, and only the guard ends a runaway page alone."""
+    A launcher's own lower limits stay. A unit with OOMPolicy "stop" (every launcher's unit
+    seen so far: KDE's, GNOME's, Ada's; it can't be changed once the unit runs) gets no limit:
+    the kernel ending one page there would stop all of Natter, the very thing the backstop is
+    meant to spare. There the guard alone ends a page that grows without end. Said once."""
     global _launcher_limits, _told_oom_policy
     cgroup = own_cgroup()
     if in_sandbox() or not in_own_scope(cgroup):
         return False
-    memory_max, swap_max = scope_limits(mem_total(), accounts)
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+    except GLib.Error as error:
+        print(f"natter: memory: couldn't limit {cgroup.name}: {error.message}", flush=True)
+        return False
     launcher = cgroup.name != _made_scope
+    policy = unit_oom_policy(cgroup.name, bus)
+    if policy != "continue":
+        if not _told_oom_policy:
+            _told_oom_policy = True
+            whose = "its launcher's, which only the launcher can change" if launcher else "systemd's default"
+            print(f"natter: memory: {cgroup.name} has OOMPolicy={policy or 'unknown'} ({whose}): the kernel ending "
+                  f"one page there would stop all of {NAME}, so {NAME} sets no memory limit on it; the guard "
+                  "ends a page that grows without end, alone", flush=True)
+        return False
+    memory_max, swap_max = scope_limits(mem_total(), accounts)
     if launcher:
         if _launcher_limits is None:  # read before Natter set anything of its own
             _launcher_limits = (_cgroup_limit(cgroup, "memory.max"), _cgroup_limit(cgroup, "memory.swap.max"))
         memory_max = min(memory_max, _launcher_limits[0] or memory_max)
         swap_max = min(swap_max, swap_max if _launcher_limits[1] is None else _launcher_limits[1])
     try:
-        bus = Gio.bus_get_sync(Gio.BusType.SESSION)
         bus.call_sync(SYSTEMD, "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
                       "SetUnitProperties",
                       GLib.Variant("(sba(sv))", (cgroup.name, True, [("MemoryMax", GLib.Variant("t", memory_max)),
@@ -275,13 +323,6 @@ def limit_own_scope(accounts: int = 1) -> bool:
     except GLib.Error as error:
         print(f"natter: memory: couldn't limit {cgroup.name}: {error.message}", flush=True)
         return False
-    if launcher and not _told_oom_policy:
-        _told_oom_policy = True
-        policy = _unit_property(bus, cgroup.name, "OOMPolicy")
-        if policy != "continue":
-            print(f"natter: memory: past {memory_max >> 20} MB, the kernel ends a page and systemd stops all of "
-                  f"{NAME} ({cgroup.name} has OOMPolicy={policy or 'unknown'}, which only its launcher can "
-                  "change); the guard ends a runaway page alone, before that", flush=True)
     return True
 
 
@@ -291,9 +332,11 @@ def move_to_own_scope(timeout: float = 0.5, accounts: int = 1) -> Optional[str]:
     OOMPolicy=continue, which can only be set now.
 
     Returns the scope's name, or None when Natter already has one, runs in a sandbox (whose
-    launcher made the scope), or there's no systemd user manager to ask.
+    launcher made the scope), or there's no systemd user manager to ask. A systemd that won't
+    set OOMPolicy on a scope gets one without it, and then without the limits too (see
+    limit_own_scope: under "stop", the kernel ending a page stops all of Natter).
     """
-    global _made_scope
+    global _made_scope, _made_without_policy, _told_oom_policy
     if in_sandbox() or in_own_scope():
         return None
     try:
@@ -315,20 +358,25 @@ def move_to_own_scope(timeout: float = 0.5, accounts: int = 1) -> Optional[str]:
         # The kernel ending a page past MemoryMax leaves Natter running: it starts a fresh page.
         ("OOMPolicy", GLib.Variant("s", "continue")),
     ]
+    without_policy = False
     try:
         try:
             _start_unit(bus, name, properties)
         except GLib.Error as error:
             if "OOMPolicy" not in error.message:
                 raise
-            # A systemd that can't set OOMPolicy on a scope refuses the whole unit: the rest still helps.
-            print(f"natter: memory: systemd won't set OOMPolicy on {name} ({error.message}); past its "
-                  f"limit, it stops all of {NAME}", flush=True)
-            _start_unit(bus, name, [prop for prop in properties if prop[0] != "OOMPolicy"])
+            # A systemd that can't set OOMPolicy on a scope refuses the whole unit. The scope
+            # still groups Natter's processes, but with systemd's default policy, "stop": no limits.
+            print(f"natter: memory: systemd won't set OOMPolicy on {name} ({error.message}): the kernel ending "
+                  f"one page there would stop all of {NAME}, so {NAME} sets no memory limit on it; the guard "
+                  "ends a page that grows without end, alone", flush=True)
+            _start_unit(bus, name, [prop for prop in properties
+                                    if prop[0] not in ("OOMPolicy", "MemoryMax", "MemorySwapMax")])
+            without_policy = _told_oom_policy = True
     except GLib.Error as error:
         print(f"natter: couldn't get a scope of its own: {error.message}")
         return None
-    _made_scope = name
+    _made_scope, _made_without_policy = name, without_policy
     # systemd moves the process once the job runs; wait so WebKit's processes follow it.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -416,10 +464,16 @@ def memory_tight(meminfo: Optional[str] = None) -> bool:
 
 # Swap is for what's cold and will be wanted again. WhatsApp's leaked heap never is: parked in
 # swap it stays there, and one day it filled the computer's 15 GB (Ada's hibernation room
-# included) until Ada said memory was full. Past either of these, Natter stops moving memory to
-# swap, and a hidden Natter takes a fresh page instead, the one thing that empties it (app.py).
+# included) until Ada said memory was full. Past either of these, the Reclaimer stops moving
+# Natter's memory to swap. They are the Reclaimer's own limits and nothing else's: what it put
+# in swap is never a reason for a fresh page (app.py), or it would reload WhatsApp each time it
+# had done its job (as it did, every half hour, until October 2026).
 SWAP_BUDGET_MB = 1024  # of Natter's own memory in swap
 SWAP_SHARE = 0.6  # of the computer's swap in use
+# The Reclaimer doesn't add to a computer already waiting on memory, where the kernel reclaims
+# anyway: past this much of the last 10 s with some task waiting on memory (PSI "some avg10",
+# in %). systemd-oomd ends whole units under pressure, picking the one reclaiming the most.
+RECLAIM_PRESSURE = 20.0
 
 
 def own_swap(cgroup: Optional[Path] = None) -> int:
@@ -448,13 +502,25 @@ def swap_full(cgroup: Optional[Path] = None, meminfo: Optional[str] = None) -> b
     return own_swap(cgroup) > SWAP_BUDGET_MB * 1024 * 1024 or swap_share(meminfo) > SWAP_SHARE
 
 
+def memory_stalls(pressure: Optional[str] = None) -> float:
+    """The share of the last 10 s some task on the computer waited on memory, in % (PSI's
+    "some avg10" in /proc/pressure/memory; `pressure` is that file's text). 0 when unknown."""
+    text = _read("/proc/pressure/memory") if pressure is None else pressure
+    found = re.search(r"^some\b.*?\bavg10=([0-9.]+)", text, re.M)
+    try:
+        return float(found[1]) if found else 0.0
+    except ValueError:
+        return 0.0
+
+
 class Reclaimer:
     """Gives Natter's cold memory back while its window is hidden, the way Ada does for paused
     apps, except Natter keeps running so messages and notifications still arrive.
 
     Pages WhatsApp hasn't touched in a while go to (compressed) swap in small steps; anything
     it needs again comes straight back. It stops at `floor` MB, when swap has taken all it
-    should (swap_full), or when the kernel can't find more to take.
+    should (swap_full), when the computer is already waiting on memory (RECLAIM_PRESSURE), or
+    when the kernel can't find more to take.
     """
 
     STEP = "64M"
@@ -520,7 +586,8 @@ class Reclaimer:
 
     def _run(self) -> None:
         before = self.usage()
-        while not self._stop.is_set() and self.usage() > self.floor and not swap_full(self.cgroup):
+        while (not self._stop.is_set() and self.usage() > self.floor and not swap_full(self.cgroup)
+               and memory_stalls() < RECLAIM_PRESSURE):
             try:
                 if not self._step():
                     break

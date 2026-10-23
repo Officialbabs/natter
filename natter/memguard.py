@@ -78,7 +78,10 @@ RESERVATION = 16 * GiB
 # A crash reported this long after a kill is still that kill: the main loop that reports it may
 # have been stalled by the very shortage the guard ended.
 KILL_MEMORY = 120.0
-OOM_SCORE_ADJ = 500  # the kernel, short of memory, takes a page before Natter's window or other apps
+# The kernel, short of memory, takes a page before Natter's window or other apps. Only where that
+# ends the page alone (system.pages_end_alone: Natter's own unit, OOMPolicy=continue): under a
+# launcher's unit (OOMPolicy=stop) the kernel's ending a page stops all of Natter.
+OOM_SCORE_ADJ = 500
 WEB_PROCESS = "WebKitWebProces"  # /proc/<pid>/comm is cut to 15 characters
 
 
@@ -119,11 +122,23 @@ def page_ceiling(total: int) -> int:
     """The most a page may hold (resident or swapped), whatever it does and call or not, on a
     computer with `total` bytes of memory: what Natter's unit with one account leaves a page
     beside Natter, swap and all, less CALL_MARGIN for the growth between two looks. The guard
-    has to act first: past the unit's limit the kernel ends the page, and a launcher's unit
-    (Ada's) then stops all of Natter. It only comes below the call's room on small computers,
-    where the unit is held to UNIT_SHARE."""
+    acts first: past the unit's limit, which only a scope of Natter's own has (system.py), the
+    kernel would end the page itself. Under a launcher's unit, which gets no limit, it's simply
+    the most the guard lets a page hold. It only comes below the call's room on small
+    computers, where the unit is held to UNIT_SHARE."""
     memory_max, swap_max = scope_limits(total, 1)
     return memory_max + swap_max - NATTER_ROOM - CALL_MARGIN
+
+
+def page_limits(limit: int, ceiling: Optional[int], in_call: bool) -> tuple[int, int]:
+    """(soft, hard) for a page whose limit is `limit` (page_limit): past soft the guard ends it
+    when it grows like a runaway, past hard whatever it does. A call moves both up (CALL_ROOM),
+    and `ceiling` (page_ceiling), when given, caps them."""
+    soft = limit + (CALL_ROOM if in_call else 0)
+    hard = soft + (CALL_MARGIN if in_call else CALL_ROOM)
+    if ceiling is not None:
+        soft, hard = min(soft, ceiling), min(hard, ceiling)
+    return soft, hard
 
 
 def in_flatpak() -> bool:
@@ -161,6 +176,13 @@ def web_processes(pid: Optional[int] = None, proc: Path = PROC, depth: int = 4,
         found.update(child for child in below if _read(proc / str(child) / "comm").startswith(WEB_PROCESS))
         level = below - found
     return found
+
+
+def page_sizes(pid: Optional[int] = None, proc: Path = PROC, flatpak: Optional[bool] = None) -> dict[int, int]:
+    """What each of Natter's pages holds (held), by pid: the guard's measure, the page alone."""
+    found = web_processes(pid, proc, flatpak=in_flatpak() if flatpak is None else flatpak)
+    sizes = {page: held(page, proc) for page in found}
+    return {page: size for page, size in sizes.items() if size is not None}
 
 
 def held(pid: int, proc: Path = PROC) -> Optional[int]:
@@ -313,14 +335,16 @@ class MemoryGuard:
     whatever it does (limits). `ceiling` (page_ceiling), when given, is the most any page may
     hold. `calling()`, when given, says whether a call is on in any page (it's asked from the
     guard's thread). `on_kill(pid, held)` runs on the main loop after a kill: the kill itself
-    and its log line don't wait for it."""
+    and its log line don't wait for it. Each page's oom_score_adj is set to `oom_score_adj`,
+    unless that's None (see OOM_SCORE_ADJ)."""
 
     def __init__(self, limit_bytes: int, on_kill: Optional[Callable[[int, int], None]] = None,
                  poll: float = GUARD_POLL, calling: Optional[Callable[[], bool]] = None, *,
                  ceiling: Optional[int] = None, pid: Optional[int] = None, proc: Path = PROC,
                  flatpak: Optional[bool] = None, killer: Optional[Callable[[int], bool]] = None,
-                 idle_add: Optional[Callable] = None) -> None:
+                 idle_add: Optional[Callable] = None, oom_score_adj: Optional[int] = OOM_SCORE_ADJ) -> None:
         self.limit = limit_bytes
+        self.oom_score_adj = oom_score_adj
         self.ceiling = ceiling
         self.on_kill = on_kill
         self.poll = poll
@@ -370,11 +394,7 @@ class MemoryGuard:
     def limits(self, in_call: bool) -> tuple[int, int]:
         """(soft, hard) for a page now: past soft it's ended when it grows like a runaway, past
         hard whatever it does."""
-        soft = self.limit + (CALL_ROOM if in_call else 0)
-        hard = soft + (CALL_MARGIN if in_call else CALL_ROOM)
-        if self.ceiling is not None:
-            soft, hard = min(soft, self.ceiling), min(hard, self.ceiling)
-        return soft, hard
+        return page_limits(self.limit, self.ceiling, in_call)
 
     def _in_call(self, now: float) -> bool:
         if self.calling is not None:
@@ -463,9 +483,11 @@ class MemoryGuard:
                   + ("; ".join(describe_region(region) for region in regions) or "unreadable"), flush=True)
 
     def _raise_oom_score(self, pid: int) -> None:
+        if self.oom_score_adj is None:
+            return
         try:
             with open(self.proc / str(pid) / "oom_score_adj", "w") as handle:
-                handle.write(str(OOM_SCORE_ADJ))
+                handle.write(str(self.oom_score_adj))
         except OSError:
             pass
 
