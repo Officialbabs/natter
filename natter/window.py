@@ -32,8 +32,9 @@ CSS = """
 /* The Reload button's arrow turns while WhatsApp loads again (GTK skips it with animations off). */
 @keyframes natter-turn { from { -gtk-icon-transform: rotate(0turn); } to { -gtk-icon-transform: rotate(1turn); } }
 button.natter-reloading image { animation: natter-turn 1s linear infinite; }
-/* The lock's page, laid over WhatsApp's (Window.show_lock), which may be running under it: opaque
-   even with a theme whose window colour lets some through. */
+/* The lock's page, laid over WhatsApp's (Window.show_lock), which may be running under it, and the
+   cover while in the background (AccountPage.set_away): opaque even with a theme whose window
+   colour lets some through. */
 .natter-cover { background-color: black; background-image: image(@window_bg_color); }
 """
 
@@ -226,6 +227,15 @@ class AccountPage(Gtk.Overlay):
         # WhatsApp paints it: WebKit's own is white, a flash in the dark style.
         self._style_changed = Adw.StyleManager.get_default().connect("notify::dark", lambda *_: self.paint())
         self.paint()
+        # Cover When in the Background (set_away): the window's colour and Natter's icon over the
+        # page, drawn by GTK. It costs nothing however much the page draws under it, where a blur
+        # of the whole page cost a pass over all of it on every frame. It takes the click that
+        # brings the window forward, so that click doesn't land on a chat nobody could see.
+        # Under the drop hint and the notices, which show no chat.
+        icon = Gtk.Image(icon_name=DEFAULT_APP_ID, pixel_size=96, halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER,
+                         accessible_role=Gtk.AccessibleRole.PRESENTATION)
+        self.away_cover = Adw.Bin(child=icon, css_classes=["natter-cover"], visible=False)
+        self.add_overlay(self.away_cover)
         # Where dragged files will go, while they're over the window.
         self.drop_hint = Adw.StatusPage(icon_name="document-send-symbolic", title="Drop to Send")
         edge = Adw.Bin(child=self.drop_hint, css_classes=["natter-drop-edge"])
@@ -254,6 +264,10 @@ class AccountPage(Gtk.Overlay):
     def paint(self) -> None:
         dark = Adw.StyleManager.get_default().get_dark()
         self.account.view.set_background_color(rgba(themes.page_background(self.settings["theme"], dark)))
+
+    def set_away(self, away: bool) -> None:
+        """The page under its cover while another window is in front, and out at once when not."""
+        self.away_cover.set_visible(away)
 
     def forget(self) -> None:
         """The account is gone: its page stops following the style."""
@@ -333,6 +347,7 @@ class Window(Adw.ApplicationWindow):
         # window was minimised or suspended when last looked (_on_surface_state).
         self.loans: dict[str, PageLoan] = {}
         self._was_hidden = False
+        self.away = False  # the pages under their covers (set_away)
 
         self.stack = Adw.ViewStack(vexpand=True)
         self.stack.connect("notify::visible-child",
@@ -612,8 +627,9 @@ class Window(Adw.ApplicationWindow):
     # ---- Accounts --------------------------------------------------------------------------
 
     def add_account(self, account: Account) -> None:
-        page = self.stack.add_titled_with_icon(AccountPage(account, self.app.settings, self._behind_lock),
-                                               account.id, account.name, ACCOUNT_ICON)
+        child = AccountPage(account, self.app.settings, self._behind_lock)
+        child.set_away(self.away)
+        page = self.stack.add_titled_with_icon(child, account.id, account.name, ACCOUNT_ICON)
         self.pages[account.id] = page
         for signal in ("state-changed", "chats-changed"):
             account.connect(signal, lambda a: a is self.account and self._show_call())
@@ -629,6 +645,13 @@ class Window(Adw.ApplicationWindow):
             page.get_child().forget()
             self.stack.remove(page.get_child())
         self._show_switcher()
+
+    def set_away(self, away: bool) -> None:
+        """Cover When in the Background: every account's page under its cover while another window
+        is in front (the app's on_focus_changed), and out from it the moment this one is again."""
+        self.away = away
+        for page in self.pages.values():
+            page.get_child().set_away(away)
 
     def repaint_pages(self) -> None:
         """Another theme: each page's colour before WhatsApp paints follows it."""

@@ -68,12 +68,54 @@ def _problems() -> tuple[list[str], list[str]]:
     }), []
 
 
-# The GStreamer elements calls need (rtc.available(), kept in step by tests/test_install_deps.py),
-# by the piece (distro.PIECES) whose packages bring them.
-CALL_ELEMENTS = {"webrtc": ("webrtcbin", "sctpenc", "sctpdec", "dtlsenc"), "nice": ("nicesrc",)}
+# The GStreamer elements calls need, by the piece (distro.PIECES) whose packages bring them: what
+# rtc.available() checks (tests/test_install_deps.py keeps it a part of this) and what webrtcbin
+# makes inside itself, which it can't do without: SRTP's (dtlssrtpenc/dec make srtpenc/dec),
+# DTLS's decoder, nicesink and rtpbin (GStreamer's good plugins, with the codecs).
+CALL_ELEMENTS = {
+    "webrtc": ("webrtcbin", "sctpenc", "sctpdec", "dtlsenc", "dtlsdec", "dtlssrtpenc", "dtlssrtpdec",
+               "srtpenc", "srtpdec"),
+    "nice": ("nicesrc", "nicesink"),
+    "codecs": ("rtpbin",),
+}
+# The typelibs calls need, beyond the ones Natter runs without.
+CALL_TYPELIBS = ("Gst", "GstWebRTC", "GstSdp")
+# Other elements, by piece: the microphone and the camera's v4l2 fallback (good plugins), and
+# the camera through the desktop's portal, which hands over a PipeWire stream.
+DEVICE_ELEMENTS = {"codecs": ("pulsesrc", "v4l2src"), "pipewire": ("pipewiresrc",)}
 # The introspection data for each piece that is one, as gi.require_version takes it.
 TYPELIBS = {"Gtk": "4.0", "Adw": "1", "WebKit": "6.0", "Soup": "3.0", "GdkPixbuf": "2.0", "Gst": "1.0",
             "GstWebRTC": "1.0", "GstSdp": "1.0"}
+
+
+def lacking(elements: dict[str, tuple[str, ...]]) -> set[str]:
+    """The pieces among `elements` (piece → GStreamer elements) that GStreamer lacks one of here."""
+    import gi
+
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+
+    Gst.init(None)
+    return {piece for piece, names in elements.items() if not all(Gst.ElementFactory.find(name) for name in names)}
+
+
+def calls_missing() -> list[str]:
+    """What calls in WhatsApp's page lack here, as piece names (distro.PIECES); empty when they
+    have it all. Never raises: what can't be checked counts as missing."""
+    try:
+        import gi
+
+        absent = []
+        for namespace in CALL_TYPELIBS:
+            try:
+                gi.require_version(namespace, "1.0")
+            except ValueError:
+                absent.append(namespace)
+        if "Gst" in absent:
+            return absent + list(CALL_ELEMENTS)
+        return absent + sorted(lacking(CALL_ELEMENTS))
+    except Exception:
+        return [*CALL_TYPELIBS, *CALL_ELEMENTS]
 
 
 def missing_pieces(environ=None) -> set[str]:
@@ -100,22 +142,19 @@ def missing_pieces(environ=None) -> set[str]:
                 gi.require_version(namespace, version)
             except ValueError:
                 missing.add(namespace)
+    unknown = {"codecs", *CALL_ELEMENTS, *DEVICE_ELEMENTS}
     if "Gst" in missing:
-        missing |= {"codecs", *CALL_ELEMENTS}
+        missing |= unknown
     else:
         try:
-            from gi.repository import Gst
-
             from .system import media_report
 
-            Gst.init(None)
-            for piece, elements in CALL_ELEMENTS.items():
-                if not all(Gst.ElementFactory.find(name) for name in elements):
-                    missing.add(piece)
+            missing |= lacking({piece: CALL_ELEMENTS.get(piece, ()) + DEVICE_ELEMENTS.get(piece, ())
+                                for piece in unknown})
             if media_report()[0]:
                 missing.add("codecs")
         except Exception:
-            missing |= {"codecs", *CALL_ELEMENTS}
+            missing |= unknown
     # The camera fix's build, as install.sh's build_camfix does it: $CC (make's: "ccache gcc"…).
     try:
         compiler = shlex.split(environ.get("CC") or "cc")[0]
@@ -146,7 +185,18 @@ def deps() -> int:
     missing = missing_pieces()
     old = [] if any(PIECE[name].group == REQUIRED for name in missing if name in PIECE) else _problems()[0]
     version = gstreamer_version()
-    print("\n".join(report(os_release(), missing, old, optional=version is not None and version >= FIRST_AFFECTED)))
+    stub = False
+    if "codecs" in missing and "Gst" not in missing:
+        # The stand-in note only when H.264 is what's missing: with another decoder for it, the
+        # stand-in is beside the point.
+        try:
+            from .system import media_report, openh264_stub
+
+            stub = any("H.264" in words for words in media_report()[0]) and openh264_stub()
+        except Exception:
+            pass
+    print("\n".join(report(os_release(), missing, old, optional=version is not None and version >= FIRST_AFFECTED,
+                           stub=stub)))
     return 0
 
 

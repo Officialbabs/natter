@@ -678,10 +678,10 @@ class Page:
     def emit(self, *signal):
         self.emitted.append(signal)
 
-    def fresh_page(self):
+    def fresh_page(self, why=""):
         self.fresh += 1
 
-    def reload(self):
+    def reload(self, why=""):
         self.reloads += 1
 
     def _end_link(self):

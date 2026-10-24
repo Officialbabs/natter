@@ -15,10 +15,13 @@ from natter.settings import Settings
 
 class Window:
     def __init__(self, active=True, account=None):
-        self.active, self.account, self.toasts, self.locks = active, account, [], []
+        self.active, self.account, self.toasts, self.locks, self.away = active, account, [], [], []
 
     def is_active(self):
         return self.active
+
+    def set_away(self, away):
+        self.away.append(away)
 
     def get_visible(self):
         return True

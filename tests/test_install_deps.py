@@ -21,7 +21,8 @@ from pathlib import Path
 from unittest import mock
 
 from natter import NAME, distro
-from natter.__main__ import CALL_ELEMENTS, TYPELIBS, check, missing_pieces, problems
+from natter.__main__ import (CALL_ELEMENTS, CALL_TYPELIBS, DEVICE_ELEMENTS, TYPELIBS, calls_missing, check,
+                             missing_pieces, problems)
 from natter.distro import (AUTO, DESKTOP, GST_PYTHON, MEDIA, OPTIONAL, PIECE, PIECES, RECOMMENDED, REQUIRED,
                            known_packages, os_release, pretend_missing, report, too_old_release)
 
@@ -104,7 +105,9 @@ class PackagesTest(unittest.TestCase):
         self.assertLessEqual({namespace for namespace, _, _ in LIBRARIES} | {"gi"}, required)
         self.assertIn("Gst", required)  # GStreamer for Python: the codec check and calls
         self.assertLessEqual(set(TYPELIBS), set(PIECE))
-        self.assertLessEqual(set(CALL_ELEMENTS), {piece.name for piece in PIECES if piece.group == RECOMMENDED})
+        self.assertLessEqual(set(CALL_ELEMENTS) | set(DEVICE_ELEMENTS),
+                             {piece.name for piece in PIECES if piece.group == RECOMMENDED})
+        self.assertLessEqual(set(CALL_TYPELIBS), set(TYPELIBS))
         self.assertEqual({piece.name for piece in PIECES if piece.group == OPTIONAL}, {"cc", "pkg-config", "gst-dev"})
 
     def test_calls_need_what_rtc_checks_for(self):
@@ -112,7 +115,11 @@ class PackagesTest(unittest.TestCase):
         available = re.search(r"def available\(\).*?return all\(.*?for name in \(([^)]*)\)\)", source, re.S)
         self.assertIsNotNone(available)
         wanted = set(re.findall(r'"([^"]+)"', available[1]))
-        self.assertEqual(wanted, {name for names in CALL_ELEMENTS.values() for name in names})
+        # What rtc.available() checks, and what webrtcbin makes inside itself too.
+        checked = {name for names in CALL_ELEMENTS.values() for name in names}
+        self.assertLessEqual(wanted, checked)
+        self.assertLessEqual({"dtlsdec", "dtlssrtpenc", "dtlssrtpdec", "srtpenc", "srtpdec", "nicesink", "rtpbin"},
+                             checked)
         for namespace in ("GstSdp", "GstWebRTC"):
             self.assertIn(f'gi.require_version("{namespace}", "1.0")', source)
             self.assertEqual(PIECE[namespace].group, RECOMMENDED)
@@ -162,9 +169,31 @@ class PackagesTest(unittest.TestCase):
         found = self.plan("tumbleweed", {"gi", "Gtk", "Soup", "codecs", "nice", "cc"})
         self.assertEqual(found["manager"], "zypper")
         self.assertEqual(found["required"], "python3-gobject python3-gobject-Gdk typelib-1_0-Gtk-4_0 typelib-1_0-Soup-3_0")
-        self.assertEqual(found["recommended"],
-                         "gstreamer-plugin-openh264 gstreamer-plugins-libav gstreamer-plugins-good gstreamer-libnice")
+        # Not gstreamer-plugin-openh264: Tumbleweed's openh264 repository has an old one by that
+        # name that can't install, and zypper takes a name before a capability.
+        self.assertEqual(found["recommended"], "gstreamer-plugins-bad gstreamer-plugins-libav "
+                                               "gstreamer-plugins-good gstreamer-libnice")
         self.assertEqual(found["optional"], "gcc")
+        self.assertNotIn("gstreamer-plugin-openh264", " ".join(PIECE["codecs"].packages.values()).split())
+
+    def test_camera_through_pipewire(self):
+        self.assertEqual(PIECE["pipewire"].group, RECOMMENDED)
+        self.assertEqual(DEVICE_ELEMENTS["pipewire"], ("pipewiresrc",))
+        expected = {"ubuntu-24.04": "gstreamer1.0-pipewire", "fedora-41": "pipewire-gstreamer",
+                    "arch": "gst-plugin-pipewire", "tumbleweed": "gstreamer-plugin-pipewire"}
+        for name, package in expected.items():
+            found = self.plan(name, {"pipewire"})
+            self.assertEqual(found["recommended"], package, name)
+            self.assertIn("camera", found["recommended-words"])
+
+    def test_openh264_stand_in(self):
+        for name, says in (("fedora-41", "dnf swap noopenh264 openh264"), ("tumbleweed", "repo-openh264")):
+            found = lines(report(release(name), {"codecs"}, stub=True, ask=knows_all))
+            self.assertIn(says, found["note"], name)
+            self.assertIn("recommended", found)
+        for name in ("ubuntu-24.04", "arch"):
+            self.assertNotIn("note", lines(report(release(name), {"codecs"}, stub=True, ask=knows_all)), name)
+        self.assertNotIn("note", lines(report(release("fedora-41"), {"codecs"}, ask=knows_all)))
 
     def test_ubuntu_22_04_is_too_old(self):
         # It has packages by these names (gir1.2-webkit-6.0 too, in jammy-updates), but GTK 4.6
@@ -305,7 +334,48 @@ class HookTest(unittest.TestCase):
         with self.pretend("gi codecs"):
             found = missing_pieces()
         self.assertLessEqual(real, found)  # never hides what's really missing
-        self.assertLessEqual({"gi", "codecs", *TYPELIBS, *CALL_ELEMENTS}, found)  # without PyGObject: unknown, so missing
+        self.assertLessEqual({"gi", "codecs", *TYPELIBS, *CALL_ELEMENTS, *DEVICE_ELEMENTS}, found)  # unknown, so missing
+
+    def test_missing_pieces_by_element(self):
+        """A piece counts as missing when GStreamer lacks any one of its elements: srtp's, say,
+        while webrtcbin is there, or the camera's pipewiresrc."""
+        try:
+            import gi
+
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gst
+        except (ImportError, ValueError):
+            self.skipTest("needs GStreamer for Python")
+        Gst.init(None)
+        find = Gst.ElementFactory.find
+        for gone, piece in (("srtpenc", "webrtc"), ("dtlssrtpdec", "webrtc"), ("nicesink", "nice"),
+                            ("pipewiresrc", "pipewire"), ("pulsesrc", "codecs"), ("rtpbin", "codecs")):
+            with self.subTest(gone), mock.patch.object(Gst.ElementFactory, "find",
+                                                       lambda name, gone=gone: None if name == gone else find(name)):
+                if find(gone) is None:
+                    continue  # not installed here: missing_pieces() says so already
+                self.assertIn(piece, missing_pieces())
+                if piece != "pipewire" and gone != "pulsesrc":
+                    self.assertIn(piece, calls_missing())
+
+    def test_calls_missing(self):
+        try:
+            import gi
+
+            gi.require_version("Gst", "1.0")
+        except (ImportError, ValueError):
+            self.skipTest("needs GStreamer for Python")
+        import gi
+
+        require = gi.require_version
+
+        def without_webrtc(namespace, version):
+            if namespace == "GstWebRTC":
+                raise ValueError("Namespace GstWebRTC not available")
+            return require(namespace, version)
+
+        with mock.patch.object(gi, "require_version", without_webrtc):
+            self.assertIn("GstWebRTC", calls_missing())
 
     def test_missing_pieces_without_a_compiler(self):
         found = missing_pieces({"PATH": "/nonexistent", "CC": "ccache gcc"})
@@ -372,7 +442,7 @@ class InstallScriptTest(unittest.TestCase):
         for folder in ("/usr/bin", "/bin", "/usr/sbin", "/sbin"):
             for entry in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
                 target = cls.system / entry
-                if entry not in KEPT_OUT and not target.exists():
+                if entry not in KEPT_OUT and not target.is_symlink() and not target.exists():  # a broken link is there too
                     target.symlink_to(Path(folder, entry))
         cls.helper = base / "fake_manager.py"
         cls.helper.write_text(FAKE_MANAGER)
@@ -545,8 +615,29 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertEqual(self.installs(), [])
         self.assertIn("no terminal to ask on", out)
+        self.assertNotIn("--yes", out)  # get.sh, which runs it this way, takes no --yes
         self.assertIn("  sudo apt-get install gir1.2-adw-1 gstreamer1.0-nice", out)
+        self.assertIn("goes without: libnice's GStreamer plugin, for calls.", out)
         self.assertFalse(self.installed())
+
+    def test_no_terminal_only_recommended_missing(self):
+        """Natter installs, and says (last of all, too) what doesn't work and the one command."""
+        code, out = self.run_install(missing="nice pipewire")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.installs(), [])
+        self.assertTrue(self.installed())
+        command = "  sudo apt-get install gstreamer1.0-nice gstreamer1.0-pipewire"
+        self.assertIn(f"Without the recommended ones, {NAME} goes without: libnice's GStreamer plugin, for calls;"
+                      " GStreamer's PipeWire plugin, for the camera.", out)
+        self.assertIn("Calls then open in your browser", out)
+        self.assertIn("Not installed yet:\n" + command, out)
+        self.assertGreater(out.rindex("Not installed yet"), out.index("==> Installing the menu entry"))
+
+    def test_installed_says_nothing_more(self):
+        code, out = self.run_install("--yes", missing="nice")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("goes without", out)
+        self.assertNotIn("Not installed yet", out)
 
     def test_yes_without_a_terminal(self):
         code, out = self.run_install("--yes", missing="Adw nice cc")

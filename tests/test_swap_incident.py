@@ -278,7 +278,7 @@ class Page:
         self.loaded_at, self.notified_at = loaded_at, None
         self.fresh = []
 
-    def fresh_page(self):
+    def fresh_page(self, why=""):
         self.fresh.append(self.world.clock.now)
         self.loaded_at = self.world.clock.now
         self.world.pages[self.name] = 900 * MiB

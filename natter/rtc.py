@@ -7,7 +7,8 @@ RTCDataChannel; this module does the networking. One Host per page, one webrtcbi
 RTCPeerConnection, and everything for the page goes back in order, in batches.
 
 GStreamer calls back from its own threads; those only queue events here. The page is told on
-GLib's main loop, and what the page asks is done there too.
+GLib's main loop, and what the page asks is done there too, but for its packets: those go out
+from a thread of their own (Sender), so their cost stays off the main loop.
 
 rtc.js also counts what the page's video decoders and encoders do; those counts go to the log
 here (CodecLog).
@@ -20,6 +21,7 @@ import ctypes
 import hashlib
 import itertools
 import json
+import queue
 import re
 import secrets
 import ssl
@@ -266,6 +268,7 @@ class Channel:
     def __init__(self, host: "Host", key: int, channel, connection: int) -> None:
         self.host, self.key, self.channel, self.connection = host, key, channel, connection
         self.sent = self.received = 0
+        self.released = False
         self._ids = [channel.connect("on-open", lambda _c: self._emit("open", id=self._id())),
                      channel.connect("on-close", lambda _c: self._emit("close")),
                      channel.connect("on-error", lambda _c, error: self._emit("error", message=str(error))),
@@ -302,8 +305,14 @@ class Channel:
         return int(self.channel.get_property("ready-state")) == int(GstWebRTC.WebRTCDataChannelState.OPEN)
 
     def send(self, data: Optional[bytes] = None, text: Optional[str] = None) -> None:
+        """Queued for the Sender's thread (main loop): it goes out after what was queued before it."""
         self.sent += 1
         self.host.packets += 1
+        self.host.sender.put(self, data, text)
+
+    def send_now(self, data: Optional[bytes] = None, text: Optional[str] = None) -> None:
+        """Handed to GStreamer now, from this thread (the Sender's, under its lock). GStreamer
+        queues it on the channel's appsrc; SCTP, DTLS and the socket run on its own threads."""
         try:
             if text is not None:
                 if hasattr(self.channel, "send_string_full"):
@@ -318,9 +327,14 @@ class Channel:
             self._emit("error", message=error.message)
 
     def close(self) -> None:
+        """After the packets queued before it (Sender)."""
+        self.host.sender.put(self, close=True)
+
+    def close_now(self) -> None:
         self.channel.emit("close")
 
     def release(self) -> None:
+        self.released = True  # the Sender drops what's still queued for it
         for handler in self._ids:
             self.channel.disconnect(handler)
         self._ids = []
@@ -698,7 +712,10 @@ def pack(events: list) -> str:
         else:
             chunks.append(payload)
             items.append([event["ch"], len(payload)])
-    return json.dumps([base64.b64encode(b"".join(chunks)).decode() if chunks else "", items], separators=(",", ":"))
+    # Base64 needs no escaping in JSON: put in as it is, it isn't looked through character by
+    # character (a third of a batch's cost on the main loop).
+    packed = base64.b64encode(b"".join(chunks)).decode("ascii") if chunks else ""
+    return '["' + packed + '",' + json.dumps(items, separators=(",", ":")) + "]"
 
 
 def _stat(structure) -> dict:
@@ -715,6 +732,59 @@ def _stat(structure) -> dict:
     if "timestamp" in stat and isinstance(stat["timestamp"], (int, float)):
         stat["timestamp"] = float(stat["timestamp"])
     return stat
+
+
+class Sender:
+    """The page's packets for the far side, sent in order from a thread of their own (one per Host).
+
+    Handing one to GStreamer only queues it (the channel's appsrc), but on GLib's main loop that
+    still cost 30-170 µs a packet in a lab, mostly waiting on locks and the GIL while the call's
+    own packets came in on GStreamer's threads, and a video call sends several hundred a second.
+    The main loop only queues them.
+
+    `lock` is held while one goes out: what stops a channel or its connection takes it first,
+    so nothing is sent on a webrtcbin being stopped, and what's queued for a channel let go
+    (Channel.released) is dropped."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self._queue: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._thread: Optional[threading.Thread] = None
+        self._failed = False
+        self._put = self._done = 0  # counts, each written by one thread only (idle)
+
+    def put(self, channel: "Channel", data: Optional[bytes] = None, text: Optional[str] = None,
+            close: bool = False) -> None:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="natter-rtc-send", daemon=True)
+            self._thread.start()
+        self._put += 1
+        self._queue.put((channel, data, text, close))
+
+    def _run(self) -> None:
+        while True:
+            channel, data, text, close = self._queue.get()
+            try:
+                with self.lock:
+                    if channel.released:
+                        continue
+                    if close:
+                        channel.close_now()
+                    else:
+                        channel.send_now(data, text)
+            except Exception as error:  # one bad packet mustn't stop the call's others
+                if not self._failed:
+                    self._failed = True
+                    print(f"natter: rtc: a packet couldn't be sent ({type(error).__name__})", flush=True)
+            finally:
+                self._done += 1
+
+    def idle(self, seconds: float = 2.0) -> bool:
+        """Wait until all that was queued has been sent or dropped (tests); True if it has."""
+        deadline = time.monotonic() + seconds
+        while self._done < self._put and time.monotonic() < deadline:
+            time.sleep(0.002)
+        return self._done >= self._put
 
 
 class Host:
@@ -748,6 +818,9 @@ class Host:
         self._waiting = None  # (reply, JS context) of the page's waiting pull
         self._sent_at = 0.0
         self._codec_log = CodecLog()
+        self.sender = Sender()
+        self._sign = ""  # what first said a call was on (for its line in the log)
+        self._connected_once = False  # a channel of the call opened, since it came on
 
     # ---- To the page ----
 
@@ -804,12 +877,13 @@ class Host:
         while it only rings (app.py's do not disturb keeps a ringing page muted)."""
         return bool(self._calling) or self._hold_kind == "grace"
 
-    def ring(self, seconds: float = 0) -> None:
+    def ring(self, seconds: float = 0, why: str = "it rang") -> None:
         """A call is ringing or being placed: on from now, for RING seconds (or `seconds`) unless
         a channel opens meanwhile. During GRACE it stays a grace: a reconnect's new channel that
-        never opens doesn't end the call any sooner."""
+        never opens doesn't end the call any sooner. `why` is for the log."""
         if self._calling:
             return
+        self._sign = self._sign or why
         self._hold_for(seconds or RING, "grace" if self._hold_kind == "grace" else "ring")
         self._changed()
 
@@ -842,6 +916,15 @@ class Host:
         if self.calling != self._told:
             self._told = self.calling
             _log("call " + ("started" if self._told else "ended"))
+            # Always logged, words of Natter's own only: which sign came first, and whether
+            # anything connected (a call that rang here and never did was declined, missed, or
+            # answered on another device).
+            if self._told:
+                print(f"natter: rtc: a call is on (first sign: {self._sign or 'unknown'})", flush=True)
+            else:
+                print("natter: rtc: the call is over" + ("" if self._connected_once else ", never connected"),
+                      flush=True)
+                self._sign, self._connected_once = "", False
             if self._on_call:
                 GLib.idle_add(self._tell_call, self._told)
         if self.in_call != self._told_in:
@@ -856,7 +939,10 @@ class Host:
         ringing = channel.key in self._ringing
         self._ringing.discard(channel.key)
         if is_open and label not in NOT_CALLS and channel.key in self._channels:
+            if not self._calling and not self._hold:
+                self._sign = self._sign or "the far side opened a call's channel"
             self._calling.add(channel.key)
+            self._connected_once = True
         else:
             self._calling.discard(channel.key)
         if self._calling:
@@ -929,7 +1015,7 @@ class Host:
                     self._channels[key] = Channel(self, key, gst_channel, connection.key)
                     if str(message.get("label") or "") not in NOT_CALLS and not self._calling:
                         self._ringing.add(key)  # the first sign of a call, before anything connects
-                        self.ring()
+                        self.ring(why="the page made a call's channel")
         elif op == "close-channel":
             channel = self._channels.get(message.get("ch"))
             if channel:
@@ -1019,25 +1105,28 @@ class Host:
         connection = self._connections.pop(key, None)
         if connection is None:
             return
-        try:
-            for channel_key, channel in list(self._channels.items()):
-                if channel.connection == key:
-                    if channel.sent or channel.received:
-                        _log(f"ch{channel_key} (pc{key}) closed - sent {channel.sent}, received {channel.received}")
-                    # Out of the list before it's let go, so nothing that runs meanwhile finds it.
-                    self._channels.pop(channel_key, None)
-                    channel.release()
-        finally:
-            # Whatever happened above, the connection's webrtcbin stops: left playing, its
-            # threads and its connection to the relay would run on in Natter for good.
-            connection.close()
+        # Not while a packet is going out on it (Sender): what's queued for its channels is dropped.
+        with self.sender.lock:
+            try:
+                for channel_key, channel in list(self._channels.items()):
+                    if channel.connection == key:
+                        if channel.sent or channel.received:
+                            _log(f"ch{channel_key} (pc{key}) closed - sent {channel.sent}, received {channel.received}")
+                        # Out of the list before it's let go, so nothing that runs meanwhile finds it.
+                        self._channels.pop(channel_key, None)
+                        channel.release()
+            finally:
+                # Whatever happened above, the connection's webrtcbin stops: left playing, its
+                # threads and its connection to the relay would run on in Natter for good.
+                connection.close()
 
     def close(self) -> None:
         """Close everything (the page went away): a call in it is over, grace and all."""
         channels = list(self._channels.values())
         self._channels.clear()
-        for channel in channels:
-            channel.release()
+        with self.sender.lock:
+            for channel in channels:
+                channel.release()
         for key in list(self._connections):
             self._close(key)
         self._ringing.clear()

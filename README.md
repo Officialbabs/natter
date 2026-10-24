@@ -70,8 +70,8 @@ The Flatpak is experimental: it hasn't been tested yet, calls in it included.
 - Themes in Preferences → General → Appearance: Den, WhatsApp's 22 chat themes, Custom (from a
   colour you pick) or Plain. A theme is a local style sheet over WhatsApp's colours
   ([how](docs/how-it-works.md#themes)).
-- Privacy blur (Ctrl+Shift+B) hides names, pictures and messages until you point at them. It can
-  also come on whenever Natter Den is in the background.
+- Privacy blur (Ctrl+Shift+B) hides names, pictures and messages until you point at them. Cover
+  When in the Background covers the whole page whenever another window is in front.
 - App lock: a passcode when Natter Den starts, when its window closes, or after it's been idle;
   Ctrl+L locks it now. While it's locked, or with privacy blur on, notifications don't say who
   wrote or what.

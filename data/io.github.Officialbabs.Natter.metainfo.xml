@@ -81,6 +81,18 @@
   </content_rating>
 
   <releases>
+    <release version="0.1.3" date="2026-10-24">
+      <description>
+        <p>A lighter privacy blur, steadier calls, and a dependency check for every distribution.</p>
+        <ul>
+          <li>Privacy blur without a graphics filter, and a cover (not a blur) while another window is in front: both cost next to nothing now</li>
+          <li>Other apps' audio pauses while you record a voice message, and plays again after</li>
+          <li>Calls: packets leave from their own thread, a network-process loss waits for the call to end, incoming calls are recognised in more languages, and the log says why every reload happened</li>
+          <li>The installer checks and names every piece calls, videos, sound and the camera need, on Arch, Debian, Ubuntu, Fedora and openSUSE</li>
+          <li>The problem report lists graphics-driver hangs from the previous boot too</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.2" date="2026-10-23">
       <description>
         <p>Fixes for replying from notifications.</p>

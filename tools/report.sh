@@ -8,18 +8,25 @@
 #   sh tools/report.sh [--watch [MINUTES]] [--hours HOURS]
 #
 # --watch also watches Natter Den for MINUTES (10 unless given, 60 at most) while you make the
-# problem happen: its memory and CPU every 5 seconds, its log, the kernel's out-of-memory kills,
-# and the times it asks the desktop for a notification (never what the notification says).
+# problem happen: its memory and CPU every 5 seconds, its log, the kernel's out-of-memory kills
+# and GPU errors, and the times it asks the desktop for a notification (never what the
+# notification says). It keeps what it sees in ~/natter-watch-DATE-TIME.txt as it goes, so a
+# freeze doesn't lose it: the next run adds that file to its report.
 # --hours: how far back the logs go (24 unless given, 72 at most).
+#
+# Run it after a freeze too: it reads the previous boot's log for GPU hangs and resets.
 #
 # It only looks: no sudo, no settings changed, nothing installed, nothing kept running after it,
 # and nothing sent anywhere. It never reads WhatsApp's data: Natter Den's own folders appear only
-# as sizes and file counts. Of the logs it keeps Natter Den's own lines, warnings and errors, and
-# replaces the home folder, user and computer names, e-mail, IP and MAC addresses, Wi-Fi names and
-# long numbers (phone numbers) before anything is written.
+# as sizes and file counts, and of its settings only three switches are read (privacy_blur,
+# blur_when_away and hardware_acceleration). Of the logs it keeps Natter Den's own lines, warnings
+# and errors, and replaces the home folder, user and computer names, e-mail, IP and MAC addresses,
+# Wi-Fi names and long numbers (phone numbers) before anything is written; other apps' names in
+# the kernel's GPU lines become <app>.
 #
 # Test-only hooks (tests/test_report.py sets them; nothing else should):
 #   NATTER_REPORT_TEST_PROC      a folder to read processes from instead of /proc
+#   NATTER_REPORT_TEST_SYS       a folder to read GPUs and modules from instead of /sys
 #   NATTER_REPORT_TEST_CGROUP    a folder to read cgroups from instead of /sys/fs/cgroup
 #   NATTER_REPORT_TEST_SECONDS   how long the watch lasts, in seconds
 #   NATTER_REPORT_TEST_INTERVAL  seconds between the watch's samples
@@ -33,7 +40,8 @@ WATCH_ARG=""
 NOTES=""
 R_PROC=${NATTER_REPORT_TEST_PROC:-/proc}
 R_CGROOT=${NATTER_REPORT_TEST_CGROUP:-/sys/fs/cgroup}
-export R_PROC R_CGROOT
+R_SYS=${NATTER_REPORT_TEST_SYS:-/sys}
+export R_PROC R_CGROOT R_SYS
 DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
 CACHE_HOME=${XDG_CACHE_HOME:-$HOME/.cache}
 CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
@@ -45,6 +53,8 @@ Usage: sh report.sh [--watch [MINUTES]] [--hours HOURS]
 
 Writes ~/natter-report-DATE-TIME.txt about $NAME on this computer, for you to read over and
 send to whoever asked for it. It sends nothing itself.
+
+Run this after a freeze too: it reads the previous boot's log.
 
   --watch [MINUTES]  also watch $NAME while you make the problem happen
                      (10 minutes unless given, 60 at most; Ctrl+C stops early)
@@ -999,7 +1009,334 @@ section_notify() {
     fi
 }
 
-# ---- 7. The watch ----------------------------------------------------------------------------
+# ---- 7. Graphics and freezes -----------------------------------------------------------------
+
+# The kernel's lines about GPU hangs and resets, screens that stopped updating, stuck or locked-up
+# tasks and hardware errors: what a freeze leaves in the log, when the log is saved in time.
+GPU_HANGS='NVRM: Xid|NVRM: .*(fail|error|timeout|timed out|fallen off|hang|lockup)|nvidia-modeset: (ERROR|WARNING)|amdgpu.*(timeout|timed out|reset|hang|fault|mes failed|not responding|no response|failed|recover|process .* pid)|\[(gfx|mm)hub\]|i915.*(hang|reset)|(^| )xe [0-9a-f]{4}:.*(timedout|timed out|reset|hang)|nouveau.*(fault|timeout|error)|\*ERROR\*|flip_done timed out|gpu hang|gpu reset|blocked for more than|soft lockup|hard lockup|detected stall|hung_task|Oops:|Hardware Error|machine check'
+
+# Kernel lines with other apps' names hidden: a name stays only when it's Natter's (natter,
+# python, WebKit), the display server's or the kernel's own; any other becomes <app>. The names
+# sit after "name=" (NVIDIA), before " pid " (AMD's process, and its thread when the process is
+# hidden), in hung-task and lockup lines, after " in " in Intel's GPU hang lines, and as
+# "name[pid]" in brackets in nouveau's.
+HIDE_NAMES='
+function kept(name) {
+    sub(/:.*/, "", name)
+    return name ~ /^(natter|python[0-9.]*|WebKit|Xwayland|Xorg|gnome-shell|kwin|mutter|plasmashell|cosmic-comp|sway|Hyprland|niri|labwc|wayfire|weston|kworker|kthreadd|ksoftirqd|swapper|systemd|rcu|migration|irq\/)/
+}
+function hide(s, lead, tail,    out, i, j, name) {
+    out = ""
+    while ((i = index(s, lead)) > 0) {
+        out = out substr(s, 1, i - 1 + length(lead))
+        s = substr(s, i + length(lead))
+        j = index(s, tail)
+        if (j < 2) continue
+        name = substr(s, 1, j - 1)
+        if (index(name, ": ") || kept(name)) continue
+        out = out "<app>"
+        s = substr(s, j)
+    }
+    return out s
+}
+# nouveau names the process on a channel in brackets: "[00ff6e9000 firefox[3487]]" or "[firefox[3487]]".
+function hide_nouveau(s,    out, at, size, name, lead, pid) {
+    out = ""
+    while (match(s, /\[[^][]+\[[0-9]+\]\]/)) {
+        at = RSTART; size = RLENGTH
+        name = substr(s, at + 1, size - 2)
+        lead = ""
+        if (match(name, /^(0x)?[0-9a-f]+ /)) { lead = substr(name, 1, RLENGTH); name = substr(name, RLENGTH + 1) }
+        match(name, /\[[0-9]+\]$/)
+        pid = substr(name, RSTART)
+        name = substr(name, 1, RSTART - 1)
+        out = out substr(s, 1, at) lead (kept(name) ? name : "<app>") pid "]"
+        s = substr(s, at + size)
+    }
+    return out s
+}
+{
+    s = hide($0, "name=", ",")
+    s = hide(s, "process ", " pid ")
+    s = hide(s, "Process ", " pid ")
+    if (s ~ /[Pp]rocess <app> pid/) s = hide(s, "thread ", " pid ")
+    s = hide(s, "INFO: task ", ":")
+    s = hide(s, "! [", ":")
+    if (s ~ /GPU HANG|[Tt]imedout job|context reset/) { s = hide(s, " in ", " ["); s = hide(s, "[drm] ", "[") }
+    if (s ~ /nouveau/) s = hide_nouveau(s)
+    print s
+}'
+
+# A count of GPU_HANGS lines by kind.
+GPU_KINDS='
+{ n++ }
+/NVRM: Xid/ { c[1]++; next }
+/[Rr]ing [^ ]+ timeout|[Tt]imedout job|job timed out/ { c[2]++; next }
+/GPU HANG|GPU hang|gpu hang/ { c[3]++; next }
+/[Rr]eset/ { c[4]++; next }
+/flip_done timed out|wait timed out/ { c[5]++; next }
+/blocked for more than/ { c[6]++; next }
+/[Ll]ockup|detected stall/ { c[7]++; next }
+/Hardware Error|[Mm]achine check/ { c[8]++; next }
+{ c[9]++ }
+END {
+    split("NVIDIA Xid errors,ring timeouts,GPU hangs,GPU resets,screen update timeouts,stuck tasks,lockups and stalls,hardware errors,others", kind, ",")
+    s = ""
+    for (i = 1; i <= 9; i++) if (c[i]) s = s (s == "" ? "" : ", ") kind[i] " " c[i]
+    printf "%d lines%s\n", n, n ? " (" s ")" : ""
+}'
+
+# How a boot ended, from its last lines: shut down or restarted, or its log just stops (a freeze,
+# a forced power-off, a crash), maybe while it was going to sleep.
+BOOT_END='
+{ last = $1 }
+/Journal stopped|Reached target .*(Shutdown|Power-Off|Power Off|Reboot|Final Step|Halt|Kexec|Exit the Session)|System is (rebooting|powering down|halting)|reboot: (Power down|Restarting system)|systemd-(poweroff|reboot|halt|kexec)\.service|exit\.target/ { clean = 1 }
+/PM: suspend entry|PM: hibernation entry|Performing sleep operation|Reached target .*Sleep/ { asleep = 1 }
+/PM: suspend exit|PM: hibernation exit|System returned from sleep|Stopped target .*Sleep/ { asleep = 0 }
+END {
+    if (!NR) print "its log is not readable here"
+    else if (clean) print "ended cleanly"
+    else if (asleep) printf "no clean end: its log stops at %s, while it was going to sleep\n", last
+    else printf "no clean end: its log stops at %s (a freeze, a forced power-off or a crash)\n", last
+}'
+
+# Graphics settings in an environment, by name.
+GFX_ENV='^(WEBKIT_|GSK_|GDK_|__NV_|__GL_|__GLX_|__EGL_|__VK_|DRI_PRIME|MESA_|VK_|LIBGL_|GBM_)'
+
+# The three switches read from Natter's settings.json, as true or false: nothing else in it is
+# printed, whatever it holds.
+SWITCHES='
+import json, sys
+defaults = {"privacy_blur": False, "blur_when_away": False, "hardware_acceleration": True}
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        values = json.load(f)
+except (OSError, ValueError):
+    values = None
+if not isinstance(values, dict):
+    print("settings.json: not readable as settings")
+    sys.exit(0)
+for key, default in defaults.items():
+    if key not in values:
+        print(key + ": not set (" + json.dumps(default) + " by default)")
+    elif isinstance(values[key], bool):
+        print(key + ": " + json.dumps(values[key]))
+    else:
+        print(key + ": not true or false")
+'
+
+PREV_END="not in the journal"
+GPU_NOW="?"
+GPU_BEFORE="?"
+
+# The GPUs, from /sys/class/drm: each one's driver, render node, whether the firmware started on
+# it, whether it's awake (read before nvidia-smi wakes it), and the screens plugged into it.
+gpu_cards() {
+    gc_found=0
+    for gc_card in "$R_SYS"/class/drm/card[0-9]*; do
+        case ${gc_card##*/} in *-*) continue ;; esac
+        gc_dev=$gc_card/device
+        [ -d "$gc_dev" ] || continue
+        gc_found=1
+        gc_driver=$(readlink "$gc_dev/driver" 2>/dev/null)
+        gc_pci=$(readlink "$gc_dev" 2>/dev/null)
+        gc_vendor=$(cat "$gc_dev/vendor" 2>/dev/null)
+        case $gc_vendor in 0x10de) gc_vendor=NVIDIA ;; 0x1002) gc_vendor=AMD ;; 0x8086) gc_vendor=Intel ;; esac
+        gc_render=""
+        for gc_node in "$gc_dev"/drm/renderD*; do [ -e "$gc_node" ] && gc_render=${gc_node##*/}; done
+        case $(cat "$gc_dev/boot_vga" 2>/dev/null) in 1) gc_boot=yes ;; 0) gc_boot=no ;; *) gc_boot="?" ;; esac
+        gc_screens=""
+        for gc_conn in "$gc_card"-*; do
+            [ "$(cat "$gc_conn/status" 2>/dev/null)" = connected ] || continue
+            gc_name=${gc_conn##*/}
+            gc_screens="$gc_screens, ${gc_name#*-}"
+        done
+        gc_screens=${gc_screens#, }
+        printf '%s: %s %s, driver %s, render node %s, started on at boot: %s, power: %s, screens: %s\n' \
+            "${gc_card##*/}" "${gc_vendor:-?}" "${gc_pci##*/}" "${gc_driver##*/}" "${gc_render:-none}" "$gc_boot" \
+            "$(cat "$gc_dev/power/runtime_status" 2>/dev/null || echo '?')" "${gc_screens:-none}"
+    done
+    [ "$gc_found" = 1 ] || printf 'No GPUs in /sys/class/drm.\n'
+}
+
+gpu_drivers() {
+    if have nvidia-smi; then
+        t nvidia-smi --query-gpu=driver_version,name --format=csv,noheader 2>&1 | sed 's/^/nvidia-smi: /' | capped 4
+    fi
+    if [ -r "$R_PROC/driver/nvidia/version" ]; then
+        head -n 2 "$R_PROC/driver/nvidia/version" | sed 's/^/\/proc\/driver\/nvidia\/version: /'
+    fi
+    for gd_mod in nvidia nvidia_drm amdgpu i915 xe nouveau radeon; do
+        [ -d "$R_SYS/module/$gd_mod" ] || continue
+        gd_v=$(cat "$R_SYS/module/$gd_mod/version" 2>/dev/null)
+        if [ -z "$gd_v" ] && have modinfo; then gd_v=$(t modinfo -F version "$gd_mod" 2>/dev/null | head -n 1); fi
+        if [ -n "$gd_v" ]; then printf '%s: loaded, version %s\n' "$gd_mod" "$gd_v"
+        else printf '%s: loaded, no version of its own (kernel %s)\n' "$gd_mod" "$(uname -r)"; fi
+    done
+    for gd_param in modeset fbdev; do
+        [ -r "$R_SYS/module/nvidia_drm/parameters/$gd_param" ] \
+            && printf 'nvidia_drm %s: %s\n' "$gd_param" "$(cat "$R_SYS/module/nvidia_drm/parameters/$gd_param")"
+    done
+    if [ -r "$R_PROC/driver/nvidia/params" ]; then
+        printf 'NVIDIA options: %s\n' "$(grep -E '^(DynamicPowerManagement|EnableGpuFirmware|PreserveVideoMemoryAllocations|EnableS0ixPowerManagement|OpenRmEnableUnsupportedGpus):' \
+            "$R_PROC/driver/nvidia/params" | tr -d ' ' | tr '\n' ' ')"
+    fi
+    printf 'Kernel options for graphics: %s\n' "$(tr ' ' '\n' 2>/dev/null < "$R_PROC/cmdline" | grep -E '^(nvidia[-_a-z]*\.|amdgpu\.|i915\.|xe\.|radeon\.|nouveau\.|nomodeset$|pcie_aspm|mem_sleep_default=|modprobe\.blacklist=|module_blacklist=|rd\.driver\.blacklist=|amd_iommu|iommu)' | tr '\n' ' ')"
+    for gd_dir in /usr/share/vulkan/icd.d /etc/vulkan/icd.d /usr/share/glvnd/egl_vendor.d /etc/glvnd/egl_vendor.d; do
+        gd_files=""
+        for gd_file in "$gd_dir"/*.json; do [ -e "$gd_file" ] && gd_files="$gd_files ${gd_file##*/}"; done
+        [ -n "$gd_files" ] && printf '%s:%s\n' "$gd_dir" "$gd_files"
+    done
+    if have pacman; then
+        LC_ALL=C pacman -Q linux-firmware linux-firmware-amdgpu linux-firmware-nvidia nvidia-utils nvidia-open \
+            nvidia-open-dkms nvidia-dkms vulkan-radeon vulkan-intel 2>/dev/null
+    elif have dpkg-query; then
+        dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' linux-firmware 'nvidia-driver-*' 'nvidia-kernel-common-*' \
+            mesa-vulkan-drivers libgl1-mesa-dri 2>/dev/null | sed -n 's/^ii  *//p'
+    elif have rpm; then
+        rpm -q linux-firmware amd-gpu-firmware nvidia-gpu-firmware akmod-nvidia xorg-x11-drv-nvidia mesa-vulkan-drivers \
+            2>/dev/null | grep -v 'not installed'
+    fi
+}
+
+# The GPU devices each of Natter's processes has open: which GPU it really draws with (an open
+# /dev/nvidia* also means NVIDIA's driver is loaded there, which wakes that GPU).
+natter_gpus() {
+    if [ ! -s "$T/procs" ]; then
+        printf '%s is not running.\n' "$NAME"
+        return
+    fi
+    while read -r ng_pid _ _ _ _ ng_comm; do
+        ng_open=$(ls -l "$R_PROC/$ng_pid/fd" 2>/dev/null | grep -oE ' -> /dev/(dri/[A-Za-z0-9]+|nvidia[A-Za-z0-9-]*)$' \
+            | sed 's/^ -> //' | sort -u | while IFS= read -r ng_dev; do
+                ng_drv=""
+                case $ng_dev in /dev/dri/*) ng_drv=$(readlink "$R_SYS/class/drm/${ng_dev##*/}/device/driver" 2>/dev/null) ;; esac
+                printf '%s%s\n' "$ng_dev" "${ng_drv:+ (${ng_drv##*/})}"
+            done | awk '{ printf "%s%s", (NR > 1 ? ", " : ""), $0 } END { if (NR) print "" }')
+        printf '%s %s: %s\n' "$ng_comm" "$ng_pid" "${ng_open:-no GPU device open}"
+    done < "$T/procs"
+}
+
+# Graphics settings in the environment of the running natter, and in the one apps started from
+# the menu get (systemd's): only variables with those names.
+natter_env() {
+    awk '$6 == "natter" { print $1 }' "$T/procs" > "$T/natter.pids"
+    {
+        while read -r ne_pid; do
+            tr '\0' '\n' 2>/dev/null < "$R_PROC/$ne_pid/environ" | grep -E "$GFX_ENV" | sed "s/^/natter $ne_pid: /"
+        done < "$T/natter.pids"
+        if have systemctl; then
+            t systemctl --user show-environment 2>/dev/null | grep -E "$GFX_ENV" | sed 's/^/menu launches: /'
+        fi
+    } > "$T/gfx-env"
+    capped 30 < "$T/gfx-env"
+    [ -s "$T/gfx-env" ] || printf 'None set.\n'
+}
+
+# The one read of Natter's settings: the three switches above, never anything else. Without
+# python3, the same three from settings.json's own lines ("  \"key\": true,").
+natter_switches() {
+    ns_file="$CONFIG_HOME/natter/settings.json"
+    if [ ! -f "$ns_file" ]; then
+        printf 'No settings saved: privacy_blur and blur_when_away are off, hardware_acceleration on (the defaults).\n'
+        return
+    fi
+    if have python3 && python3 -I -c "$SWITCHES" "$ns_file" 2>/dev/null; then return; fi
+    ns_found=$(sed -n -E 's/^  "(privacy_blur|blur_when_away|hardware_acceleration)": (true|false),?$/\1: \2/p' "$ns_file" 2>/dev/null)
+    ns_keys=$(sed -n -E 's/^  "(privacy_blur|blur_when_away|hardware_acceleration)": .*/\1/p' "$ns_file" 2>/dev/null)
+    for ns_key in privacy_blur blur_when_away hardware_acceleration; do
+        ns_line=$(printf '%s\n' "$ns_found" | grep "^$ns_key: " | head -n 1)
+        case $ns_key in hardware_acceleration) ns_default=true ;; *) ns_default=false ;; esac
+        if [ -z "$ns_line" ]; then
+            ns_line="$ns_key: not set ($ns_default by default)"
+            printf '%s\n' "$ns_keys" | grep -qx "$ns_key" && ns_line="$ns_key: not true or false"
+        fi
+        printf '%s\n' "$ns_line"
+    done
+}
+
+# The last 5 boots, without their ids, and how each ended.
+boots() {
+    t journalctl --list-boots --no-pager -q 2>/dev/null | awk '
+        $1 ~ /^-?[0-9]+$/ {
+            idx = $1; $1 = ""
+            if (length($2) == 32 && $2 !~ /[^0-9a-f]/) $2 = ""
+            sub(/^ +/, ""); print idx "\t" $0
+        }' | tail -n 5 > "$T/boots"
+    if [ ! -s "$T/boots" ]; then
+        printf 'journalctl lists no boots here.\n'
+        return
+    fi
+    bt_tab=$(printf '\t')
+    while IFS=$bt_tab read -r bt_idx bt_span; do
+        if [ "$bt_idx" = 0 ]; then
+            bt_end="this boot"
+        else
+            bt_end=$(t journalctl -b "$bt_idx" -n 80 -q --no-pager -o short-iso-precise 2>/dev/null | awk "$BOOT_END")
+        fi
+        printf '%s  %s  %s\n' "$bt_idx" "$bt_span" "$bt_end"
+        [ "$bt_idx" = -1 ] && PREV_END=$bt_end
+    done < "$T/boots"
+    if [ "$(wc -l < "$T/boots" | tr -d ' ')" -lt 2 ]; then
+        printf '%s\n' "Only this boot is in the journal: the log isn't kept across restarts here, so a freeze" \
+            "before this boot left nothing to read."
+    fi
+}
+
+# The kernel's GPU_HANGS lines of boot $1 (0 this one, -1 the one before): how many of each kind,
+# then the newest 150.
+gpu_boot() {
+    t journalctl -k -b "$1" -q --no-pager -o short-iso-precise 2>/dev/null | grep -iE "$GPU_HANGS" \
+        | sed 's/^\([^ ]*\) [^ ]* /\1 /' | awk "$HIDE_NAMES" > "$T/gpu.lines"
+    awk "$GPU_KINDS" "$T/gpu.lines"
+    newest 150 "$T/gpu.lines"
+}
+
+section_graphics() {
+    heading "7. Graphics and freezes"
+    part "GPUs (the screens each drives, and whether it's awake)"
+    gpu_cards
+    part "Graphics drivers"
+    gpu_drivers
+    part "The GPU devices Natter's processes have open"
+    natter_gpus
+    part "Graphics settings in the environment"
+    natter_env
+    part "Natter's blur and hardware acceleration switches (nothing else is read from its settings)"
+    natter_switches
+    if ! have journalctl; then
+        printf '\njournalctl is not available here: boots and GPU errors skipped.\n'
+        return
+    fi
+    part "Boots, the last 5, and how each ended"
+    boots
+    if [ -z "$(journalctl -k -n 1 -q --no-pager 2>/dev/null)" ]; then
+        part "GPU hangs and resets"
+        printf "The kernel's messages aren't readable without admin rights here (that's fine).\n"
+        return
+    fi
+    part "GPU hangs and resets, stuck tasks, lockups: this boot"
+    gpu_boot 0
+    GPU_NOW=$(wc -l < "$T/gpu.lines" | tr -d ' ')
+    if cut -f1 "$T/boots" 2>/dev/null | grep -qx -- -1; then
+        part "The same, the boot before (a freeze shows here when the log was saved in time)"
+        gpu_boot -1
+        GPU_BEFORE=$(wc -l < "$T/gpu.lines" | tr -d ' ')
+    fi
+}
+
+# Watches that didn't finish, from the files they kept as they went (see watch_run).
+section_leftovers() {
+    [ -s "$T/leftovers" ] || return 0
+    part "Watches that didn't finish (the computer stopped, or the watch was killed)"
+    while IFS= read -r lo_file; do
+        printf 'The watch of %s:\n' "$(printf '%s\n' "${lo_file##*/}" \
+            | sed 's/^natter-watch-\([0-9]\{4\}\)\([0-9][0-9]\)\([0-9][0-9]\)-\([0-9][0-9]\)\([0-9][0-9]\).*/\1-\2-\3 \4:\5/')"
+        newest_bytes 200000 "$lo_file"
+    done < "$T/leftovers"
+}
+
+# ---- 8. The watch ----------------------------------------------------------------------------
 
 # Times Natter asked the desktop for a notification, from dbus-monitor's Notify calls on stdin,
 # and AddNotification calls to the notification portal (the Flatpak's way, through its proxy).
@@ -1033,7 +1370,7 @@ watch_run() {
     wr_interval=${NATTER_REPORT_TEST_INTERVAL:-5}
     LIMITED=$((wr_secs + 60))  # the followers stop by themselves by then, whatever happens to this script
     hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
-    heading "7. Watch: $WATCH minutes"
+    heading "8. Watch: $WATCH minutes"
     say ""
     say "Watching $NAME for $WATCH minutes, until $(date -d "+$WATCH min" +%H:%M 2>/dev/null || echo "$WATCH minutes from now"). While it runs:"
     say "  1. Leave this running (this terminal can go behind other windows)."
@@ -1042,6 +1379,8 @@ watch_run() {
     say "  4. Try a call, and a video."
     say "  5. Note the times when something goes wrong: no notification, the page reloading, a crash."
     say "Press Ctrl+C to stop early: the report is still written."
+    say "If the computer freezes: restart it and run this again (no --watch needed). What the watch"
+    say "saw is kept in ~/${WATCH_FILE##*/} as it goes, and the next run adds it to its report."
     say ""
     natter_units > "$T/units"
     : > "$T/follow-user"
@@ -1066,7 +1405,14 @@ watch_run() {
     wr_start=$(date +%s)
     wr_first=yes
     wr_shown=0
+    wr_kshown=0
+    wr_nshown=0
     wr_said=0
+    # What the watch sees goes to the home folder too, as it goes (redacted, like the report),
+    # so a freeze doesn't lose it.
+    { printf '%s watch started %s, for %s minutes.\n' "$NAME" "$(date '+%Y-%m-%d %H:%M %Z')" "$WATCH"
+      printf '%s\n' "If this file is still here, the watch didn't finish: run report.sh again, and it adds this" \
+          "file to its report." ""; } > "$WATCH_FILE" 2>/dev/null || WATCH_FILE=""
     : > "$T/samples"
     : > "$T/prev"
     wr_up=$(uptime_s /proc)
@@ -1092,11 +1438,32 @@ watch_run() {
             wr_said=$((wr_elapsed / 60 + 1))
         fi
         sed -n 's/^[^ ]*T\([0-9:]*\) change: \(.*\)/\1  processes \2/p' "$T/sample" >&3
+        # New lines from Natter's log, the kernel (kills and GPU errors) and the notifications.
+        : > "$T/new-user"
+        : > "$T/new-kernel"
+        : > "$T/new-notify"
         wr_lines=$(wc -l < "$T/follow-user" | tr -d ' ')
         if [ "$wr_lines" -gt "$wr_shown" ]; then
             tail -n +"$((wr_shown + 1))" "$T/follow-user" | head -n "$((wr_lines - wr_shown))" | awk "$JFILTER" \
-                | redact | awk '{ t = substr($1, 12, 8); $1 = ""; print t $0 }' | capped 20 >&3
+                | redact > "$T/new-user"
+            awk '{ t = substr($1, 12, 8); $1 = ""; print t $0 }' "$T/new-user" | capped 20 >&3
             wr_shown=$wr_lines
+        fi
+        wr_lines=$(wc -l < "$T/follow-kernel" | tr -d ' ')
+        if [ "$wr_lines" -gt "$wr_kshown" ]; then
+            tail -n +"$((wr_kshown + 1))" "$T/follow-kernel" | head -n "$((wr_lines - wr_kshown))" \
+                | grep -iE "$KILLS|$GPU_HANGS" | sed 's/^\([^ ]*\) [^ ]* /\1 /' | awk "$HIDE_NAMES" | redact > "$T/new-kernel"
+            awk '{ t = substr($1, 12, 8); $1 = ""; print t $0 }' "$T/new-kernel" | capped 5 >&3
+            wr_kshown=$wr_lines
+        fi
+        wr_lines=$(wc -l < "$T/notify" | tr -d ' ')
+        if [ "$wr_lines" -gt "$wr_nshown" ]; then
+            tail -n +"$((wr_nshown + 1))" "$T/notify" | head -n "$((wr_lines - wr_nshown))" > "$T/new-notify"
+            wr_nshown=$wr_lines
+        fi
+        if [ -n "$WATCH_FILE" ]; then
+            cat "$T/sample" "$T/new-user" "$T/new-kernel" "$T/new-notify" | redact >> "$WATCH_FILE"
+            sync "$WATCH_FILE" 2>/dev/null
         fi
         [ "$wr_elapsed" -ge "$wr_secs" ] && break
         sleep "$wr_interval" || true
@@ -1107,9 +1474,9 @@ watch_run() {
     say ""
     say "Watch over after $(($(date +%s) - wr_start)) seconds."
     awk "$JFILTER" "$T/follow-user" > "$T/watch-log"
-    grep -iE "$KILLS" "$T/follow-kernel" | sed 's/^\([^ ]*\) [^ ]* /\1 /' > "$T/watch-kernel"
+    grep -iE "$KILLS|$GPU_HANGS" "$T/follow-kernel" | sed 's/^\([^ ]*\) [^ ]* /\1 /' | awk "$HIDE_NAMES" > "$T/watch-kernel"
     NOTIFICATIONS=$(wc -l < "$T/notify" | tr -d ' ')
-    printf 'Samples: %s; Natter log lines: %s; kernel kill lines: %s; notifications Natter asked for: %s\n\n' \
+    printf 'Samples: %s; Natter log lines: %s; kernel lines (kills, GPU errors): %s; notifications Natter asked for: %s\n\n' \
         "$SAMPLES" "$(wc -l < "$T/watch-log" | tr -d ' ')" "$(wc -l < "$T/watch-kernel" | tr -d ' ')" "$NOTIFICATIONS"
     if ! have dbus-monitor; then printf '(dbus-monitor is not installed: notifications not watched)\n\n'; fi
     cat "$T/samples" "$T/watch-log" "$T/watch-kernel" "$T/notify" | sort -s -k1,1 > "$T/timeline"
@@ -1123,6 +1490,7 @@ header() {
     printf '%s problem report\n' "$NAME"
     printf 'Made %s by tools/report.sh, run by the person whose computer this is.\n' "$STARTED"
     printf 'Logs: the last %s hours.%s\n' "$HOURS" "$([ "$WATCH" -gt 0 ] && printf ' Watch: %s minutes.' "$WATCH")"
+    printf "Run this after a freeze too: it reads the previous boot's log.\n"
     printf '%s' "$NOTES"
     cat <<EOF
 
@@ -1135,13 +1503,18 @@ WHAT THIS FILE CONTAINS
   from the system log; the times it started and quit
 - crashes (signal and stack) of $NAME and WebKit; out-of-memory kills
 - whether notifications, the tray and the Background portal are there for $NAME
-- with --watch: $NAME's memory and CPU every few seconds, and the times it asked the desktop
-  for a notification
+- graphics: the GPUs and their drivers, which GPU $NAME's processes use, graphics settings in
+  the environment, $NAME's blur and hardware acceleration switches, the last boots and whether
+  each ended cleanly, and the kernel's GPU hangs and resets in this boot and the one before
+- with --watch: $NAME's memory and CPU every few seconds, the kernel's GPU errors, and the
+  times it asked the desktop for a notification; and a watch a freeze cut short, if one was
 
 WHAT IT DOES NOT CONTAIN
 - no messages, chat names, contacts or phone numbers, and nothing from WhatsApp's storage:
   $NAME's own folders are listed only by size and number of files
-- no other app's logs, no passwords, no browsing history
+- no other app's logs, no passwords, no browsing history; other apps' names in the kernel's
+  GPU lines are replaced by <app>
+- of $NAME's settings, only the three switches above
 - your home folder, user name, computer name, e-mail, IP and MAC addresses and Wi-Fi names are
   replaced by ~, <user>, <host>, <email>, <ip>, <mac> and <ssid>; numbers of 8 or more digits by
   <digits>
@@ -1156,6 +1529,8 @@ summary() {
         "$([ "${NATTER_RUNNING:-0}" -gt 0 ] && printf 'running (%s processes)' "$NATTER_RUNNING" || printf 'not running')" \
         "$HOURS" "$LOG_LINES" "$WARNINGS" "$TRACEBACKS" "$CRASHES" "$KILLED" \
         "$([ "$WATCH" -gt 0 ] && printf '; watched %s min, %s notifications asked for' "$WATCH" "$NOTIFICATIONS")"
+    printf ' Previous boot: %s. GPU error lines: %s this boot, %s the boot before.' \
+        "$(printf '%s\n' "$PREV_END" | sed 's/: its log stops.*//')" "$GPU_NOW" "$GPU_BEFORE"
 }
 
 main() {
@@ -1170,29 +1545,37 @@ main() {
     redact_setup
     STARTED=$(date '+%Y-%m-%d %H:%M %Z')
     STAMP=$(date +%Y%m%d-%H%M)
+    # Watches a freeze cut short (the newest 3), and this one's file.
+    for mn_file in "$HOME"/natter-watch-*.txt; do [ -f "$mn_file" ] && printf '%s\n' "$mn_file"; done | tail -n 3 > "$T/leftovers"
+    WATCH_FILE="$HOME/natter-watch-$STAMP.txt"
+    mn_n=2
+    while [ -e "$WATCH_FILE" ]; do WATCH_FILE="$HOME/natter-watch-$STAMP-$mn_n.txt"; mn_n=$((mn_n + 1)); done
     say "Collecting what's needed to look into $NAME's problems (it takes a minute)..."
     scan_natter > "$T/procs"
     awk '{ print $1 }' "$T/procs" > "$T/procs.pids"
     section_natter > "$T/s1" 2>&1
     section_system > "$T/s2" 2>&1
     section_notify > "$T/s6" 2>&1
-    if [ "$WATCH" -gt 0 ]; then watch_run > "$T/s7" 2>&1; else : > "$T/s7"; fi
+    if [ "$WATCH" -gt 0 ]; then watch_run > "$T/s8" 2>&1; else : > "$T/s8"; WATCH_FILE=""; fi
     say "Reading the logs..."
     : > "$T/s3.log"
     section_logs > "$T/s3" 2>&1
     section_crashes > "$T/s4" 2>&1
     section_memory > "$T/s5" 2>&1
+    section_graphics > "$T/s7" 2>&1
+    section_leftovers > "$T/s7w" 2>&1
     # Natter's log gets what room is left, so the report stays under its limit with the watch whole.
     capped 300 < "$T/s1" > "$T/s1.cut"
     capped 300 < "$T/s2" > "$T/s2.cut"
     capped 200 < "$T/s6" > "$T/s6.cut"
-    mn_room=$((LIMIT_BYTES - 20000 - $(cat "$T/s1.cut" "$T/s2.cut" "$T/s3" "$T/s4" "$T/s5" "$T/s6.cut" "$T/s7" | wc -c)))
+    capped 400 < "$T/s7" > "$T/s7.cut"
+    mn_room=$((LIMIT_BYTES - 20000 - $(cat "$T/s1.cut" "$T/s2.cut" "$T/s3" "$T/s4" "$T/s5" "$T/s6.cut" "$T/s7.cut" "$T/s7w" "$T/s8" | wc -c)))
     [ "$mn_room" -gt 50000 ] || mn_room=50000
     {
         header
         cat "$T/s1.cut" "$T/s2.cut" "$T/s3"
         newest_bytes "$mn_room" "$T/s3.log"
-        cat "$T/s4" "$T/s5" "$T/s6.cut" "$T/s7"
+        cat "$T/s4" "$T/s5" "$T/s6.cut" "$T/s7.cut" "$T/s7w" "$T/s8"
         printf '\n\n===== End of the report =====\n'
     } | redact | awk '{ if (length($0) > 1000) $0 = substr($0, 1, 1000) " ..."; print }' > "$T/report"
     if [ "$(wc -c < "$T/report")" -gt "$LIMIT_BYTES" ]; then
@@ -1204,6 +1587,9 @@ main() {
     mn_n=2
     while [ -e "$OUT" ]; do OUT="$HOME/natter-report-$STAMP-$mn_n.txt"; mn_n=$((mn_n + 1)); done
     cat "$T/report" > "$OUT" && chmod 600 "$OUT" || { echo "report.sh: couldn't write $OUT" >&2; exit 1; }
+    # The report holds them now.
+    while IFS= read -r mn_file; do rm -f "$mn_file"; done < "$T/leftovers"
+    [ -n "$WATCH_FILE" ] && rm -f "$WATCH_FILE"
     say ""
     say "$OUT"
     say "$(summary | redact)"
@@ -1213,6 +1599,10 @@ main() {
 if [ "${1-}" = --redact ]; then  # test-only: stdin redacted, as the report is
     redact_setup
     redact
+    exit
+fi
+if [ "${1-}" = --gpu-lines ]; then  # test-only: stdin's kernel lines kept and hidden as the report's GPU lines are
+    grep -iE "$GPU_HANGS" | awk "$HIDE_NAMES"
     exit
 fi
 main "$@" < /dev/null

@@ -15,7 +15,7 @@ from . import APP_ID, NAME, media, themes
 from . import lock as applock
 from .launcher import menu_supported
 from .settings import parse_clock
-from .system import in_sandbox
+from .system import calls_report, in_sandbox
 
 SYNC = GObject.BindingFlags.SYNC_CREATE
 APPEARANCES = [("system", "Follow System"), ("light", "Light"), ("dark", "Dark")]
@@ -383,6 +383,7 @@ class Preferences(Adw.PreferencesDialog):
         self.media = Adw.PreferencesGroup(visible=False)
         page.add(self.media)
         self.app.media(self._show_media)
+        self._show_calls()
 
         tray_host = self.app.has_tray_host()
         running = Adw.PreferencesGroup(title="Running")
@@ -587,6 +588,25 @@ class Preferences(Adw.PreferencesDialog):
         self.media.add(row)
         self.media.set_visible(True)
 
+    def _show_calls(self) -> None:
+        """Why calls don't happen inside Natter (app.calls_lacking), and the command that adds what
+        they need. Nothing when they do, or when they were sent elsewhere on purpose."""
+        words, command = calls_report(getattr(self.app, "calls_lacking", []))
+        if not words:
+            return
+        where = "the call window" if getattr(self.app, "calls", None) is not None else "your browser"
+        subtitle = f"Calls open in {where}. Calls inside {NAME} need: {words}."
+        if command:
+            subtitle += f"\nInstall them with: {command}"
+        row = plain_row("Calls", subtitle, subtitle_selectable=True)
+        row.add_prefix(Gtk.Image(icon_name="dialog-warning-symbolic"))
+        if command:
+            copy = icon_button("edit-copy-symbolic", "Copy Command")
+            copy.connect("clicked", lambda button: button.get_clipboard().set(command))
+            row.add_suffix(copy)
+        self.media.add(row)
+        self.media.set_visible(True)
+
     def _notifications(self) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage(name="notifications", title="Notifications",
                                    icon_name="preferences-system-notifications-symbolic")
@@ -625,8 +645,8 @@ class Preferences(Adw.PreferencesDialog):
         group = Adw.PreferencesGroup(description="For working in public or sharing your screen.")
         group.add(self._switch("privacy_blur", "Privacy Blur",
                                "Blurs names, pictures and messages until you point at them. Ctrl+Shift+B"))
-        group.add(self._switch("blur_when_away", "Blur When in the Background",
-                               "Blurs everything while another window is active"))
+        group.add(self._switch("blur_when_away", "Cover When in the Background",
+                               "Covers the whole page while another window is active"))
         page.add(group)
         for device_group in self._device_groups():
             page.add(device_group)

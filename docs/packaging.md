@@ -19,8 +19,8 @@ and asks before installing them with your package manager (apt-get, dnf, pacman 
 through `sudo`), once for the required and recommended ones and once for the optional ones:
 
 - **Required:** for Natter Den to run.
-- **Recommended:** the codecs WhatsApp's videos and voice messages need, and GStreamer's WebRTC
-  parts for calls.
+- **Recommended:** the codecs and players WhatsApp's videos and voice messages need, sound,
+  GStreamer's WebRTC parts for calls, and its PipeWire plugin for the camera.
 - **Optional:** a C compiler, `pkg-config` and GStreamer's headers, to build the camera fix. Asked
   for only with GStreamer 1.28 or newer.
 
@@ -32,7 +32,8 @@ handler (unless another app already has it). It says if `~/.local/bin` isn't on 
 - While Natter Den is running it stops and asks you to quit it first; `--force` goes ahead anyway.
 - `--yes` installs missing packages without asking. `--no-deps` never installs: when a required
   package is missing, it prints the command and stops. A run with no terminal to ask on installs
-  nothing either.
+  nothing either: it says what goes without the missing packages, and the command to run. Every
+  run (and every update through `get.sh`) checks again and offers what's still missing.
 - On a release too old for Natter Den (Ubuntu 22.04, Debian 12, openSUSE Leap 15…) it says so and
   points to the Flatpak.
 - `--uninstall` removes what it installed, and leaves your sessions and settings in
@@ -51,24 +52,28 @@ sudo dnf install python3-gobject gtk4 libadwaita webkitgtk6.0 libsoup3 gdk-pixbu
 # Arch and derivatives
 sudo pacman -S --needed python-gobject gtk4 libadwaita webkitgtk-6.0 libsoup3 gdk-pixbuf2 gstreamer gst-libav gst-plugins-good gst-plugins-base
 # openSUSE
-sudo zypper install python3-gobject python3-gobject-Gdk typelib-1_0-Gtk-4_0 typelib-1_0-Adw-1 typelib-1_0-WebKit-6_0 typelib-1_0-Soup-3_0 typelib-1_0-GdkPixbuf-2_0 typelib-1_0-Gst-1_0 gstreamer-plugin-openh264 gstreamer-plugins-libav gstreamer-plugins-good
+sudo zypper install python3-gobject python3-gobject-Gdk typelib-1_0-Gtk-4_0 typelib-1_0-Adw-1 typelib-1_0-WebKit-6_0 typelib-1_0-Soup-3_0 typelib-1_0-GdkPixbuf-2_0 typelib-1_0-Gst-1_0 gstreamer-plugins-bad gstreamer-plugins-libav gstreamer-plugins-good
 ```
 
 On Fedora, `gstreamer1-plugin-openh264` comes from the fedora-cisco-openh264 repository; on a
 RHEL-like, `gstreamer1-plugin-libav` from EPEL. RPM Fusion's ffmpeg is the other way to H.264.
+Fedora and openSUSE both have a stand-in OpenH264 library that plays nothing; Natter Den notices
+it. On Fedora, `sudo dnf swap noopenh264 openh264` puts Cisco's in its place; on openSUSE,
+`libopenh264-8` is Cisco's once the openh264 repository is enabled (Packman's ffmpeg also works).
 
-For calls inside Natter Den, GStreamer's WebRTC plugins (webrtcbin, SCTP, DTLS), libnice's
-GStreamer plugin, and the GstWebRTC and GstSdp introspection data:
+For calls inside Natter Den, GStreamer's WebRTC plugins (webrtcbin, SCTP, DTLS, SRTP), libnice's
+GStreamer plugin, and the GstWebRTC and GstSdp introspection data; and for the camera,
+GStreamer's PipeWire plugin, which the desktop's camera portal needs:
 
 ```sh
 # Debian, Ubuntu and derivatives
-sudo apt install gstreamer1.0-plugins-bad gstreamer1.0-nice gir1.2-gst-plugins-bad-1.0 gir1.2-gst-plugins-base-1.0
+sudo apt install gstreamer1.0-plugins-bad gstreamer1.0-nice gir1.2-gst-plugins-bad-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-pipewire
 # Fedora and RHEL-likes
-sudo dnf install gstreamer1-plugins-bad-free libnice-gstreamer1 gstreamer1-plugins-bad-free-libs gstreamer1-plugins-base
+sudo dnf install gstreamer1-plugins-bad-free libnice-gstreamer1 gstreamer1-plugins-bad-free-libs gstreamer1-plugins-base pipewire-gstreamer
 # Arch and derivatives
-sudo pacman -S --needed gst-plugins-bad libnice gst-plugins-bad-libs gst-plugins-base-libs
+sudo pacman -S --needed gst-plugins-bad libnice gst-plugins-bad-libs gst-plugins-base-libs gst-plugin-pipewire
 # openSUSE
-sudo zypper install gstreamer-plugins-bad gstreamer-libnice typelib-1_0-GstWebRTC-1_0 typelib-1_0-GstSdp-1_0
+sudo zypper install gstreamer-plugins-bad gstreamer-libnice typelib-1_0-GstWebRTC-1_0 typelib-1_0-GstSdp-1_0 gstreamer-plugin-pipewire
 ```
 
 For the camera fix, with GStreamer 1.28 or newer:
@@ -88,10 +93,10 @@ On Fedora Atomic, `rpm-ostree install` can layer Fedora's packages instead (they
 a restart); the Flatpak is the other way there, and on Bazzite and SteamOS.
 
 Then download the latest release and install it. Its tag is the one marked *Latest* on the
-[Releases page](https://github.com/Officialbabs/natter/releases); put it in place of `v0.1.2` below:
+[Releases page](https://github.com/Officialbabs/natter/releases); put it in place of `v0.1.3` below:
 
 ```sh
-tag=v0.1.2   # the latest release's tag
+tag=v0.1.3   # the latest release's tag
 mkdir -p ~/.local/lib/natter/source && cd ~/.local/lib/natter/source
 curl -fsSL "https://github.com/Officialbabs/natter/archive/refs/tags/$tag.tar.gz" | tar -xz --strip-components=1
 ./install.sh   # adds Natter Den to your apps and `natter` to ~/.local/bin

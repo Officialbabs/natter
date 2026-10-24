@@ -67,11 +67,15 @@ class Piece:
     packages: dict  # apt, dnf, pacman, zypper → package names, space-separated
 
 
-# Every name checked against each distribution's current repositories (Ubuntu 24.04, Debian 13,
-# Fedora 43, Arch, openSUSE Tumbleweed; October 2026). Fedora and Arch put the introspection data
-# (typelibs) in the library's own package. openSUSE's python3-gobject(-Gdk) are capabilities its
-# python3XX-gobject packages provide; its openh264 comes from the openh264 repository it enables
-# by default, Fedora's from fedora-cisco-openh264.
+# Every name checked against each distribution's current repositories and file lists (Debian 13,
+# Ubuntu 24.04 to 26.10, Fedora 43 to 45, Arch and CachyOS, openSUSE Tumbleweed and Leap 16;
+# 24 October 2026): each package exists and ships the typelib, plugin or headers its piece is for.
+# Fedora and Arch put the introspection data (typelibs) in the library's own package. openSUSE's
+# python3-gobject(-Gdk) are capabilities its python3XX-gobject packages provide. OpenH264: Fedora's
+# real one is in fedora-cisco-openh264, openSUSE's in the openh264 repository it enables by
+# default; both also have a stand-in that decodes nothing (system.openh264_stub). Tumbleweed's
+# openh264 repository still has an old gstreamer-plugin-openh264 that can't install, so openSUSE
+# asks for the plugin's real package and the library instead.
 PIECES = (
     Piece("gi", REQUIRED, "PyGObject (GTK for Python)",
           {"apt": "python3-gi", "dnf": "python3-gobject", "pacman": "python-gobject", "zypper": "python3-gobject"}),
@@ -88,14 +92,17 @@ PIECES = (
     # The codec check and calls ask GStreamer through it.
     Piece("Gst", REQUIRED, "GStreamer for Python",
           {"apt": "gir1.2-gstreamer-1.0", "dnf": "gstreamer1", "pacman": "gstreamer", "zypper": "typelib-1_0-Gst-1_0"}),
-    # What WhatsApp's videos (H.264, AAC, in MP4) and voice messages (Opus) need from GStreamer.
-    Piece("codecs", RECOMMENDED, "codecs for WhatsApp's videos and voice messages (H.264, AAC, Opus)",
+    # What WhatsApp's videos (H.264, AAC, in MP4) and voice messages (Opus, in Ogg) need from
+    # GStreamer, and its good and base plugins: sound out, the microphone, the camera's v4l2
+    # fallback, and the rtpbin webrtcbin is built on.
+    Piece("codecs", RECOMMENDED, "codecs for WhatsApp's videos and voice messages (H.264, AAC, Opus), and sound",
           {"apt": "gstreamer1.0-libav gstreamer1.0-plugins-good gstreamer1.0-plugins-base",
            "dnf": "gstreamer1-plugin-openh264 gstreamer1-plugin-libav gstreamer1-plugins-good",
            "pacman": "gst-libav gst-plugins-good gst-plugins-base",
-           "zypper": "gstreamer-plugin-openh264 gstreamer-plugins-libav gstreamer-plugins-good"}),
-    # Calls (rtc.available()): webrtcbin with SCTP and DTLS, libnice's ICE, and their Python bindings.
-    Piece("webrtc", RECOMMENDED, "GStreamer's WebRTC plugins (webrtcbin, SCTP, DTLS), for calls",
+           "zypper": "gstreamer-plugins-bad gstreamer-plugins-libav gstreamer-plugins-good"}),
+    # Calls (natter.__main__.CALL_ELEMENTS): webrtcbin with SCTP, DTLS and SRTP, libnice's ICE,
+    # and their Python bindings.
+    Piece("webrtc", RECOMMENDED, "GStreamer's WebRTC plugins (webrtcbin, SCTP, DTLS, SRTP), for calls",
           {"apt": "gstreamer1.0-plugins-bad", "dnf": "gstreamer1-plugins-bad-free", "pacman": "gst-plugins-bad",
            "zypper": "gstreamer-plugins-bad"}),
     Piece("nice", RECOMMENDED, "libnice's GStreamer plugin, for calls",
@@ -106,6 +113,11 @@ PIECES = (
     Piece("GstSdp", RECOMMENDED, "GstSdp for Python, for calls",
           {"apt": "gir1.2-gst-plugins-base-1.0", "dnf": "gstreamer1-plugins-base", "pacman": "gst-plugins-base-libs",
            "zypper": "typelib-1_0-GstSdp-1_0"}),
+    # The camera: WebKit asks the desktop's camera portal, which hands over a PipeWire stream.
+    # Not pulled in by WebKit, nor on KDE (GNOME Shell depends on it).
+    Piece("pipewire", RECOMMENDED, "GStreamer's PipeWire plugin, for the camera",
+          {"apt": "gstreamer1.0-pipewire", "dnf": "pipewire-gstreamer", "pacman": "gst-plugin-pipewire",
+           "zypper": "gstreamer-plugin-pipewire"}),
     # The camera fix's build (install.sh's build_camfix), wanted with GStreamer 1.28 or newer only.
     Piece("cc", OPTIONAL, "a C compiler",
           {"apt": "gcc libc6-dev", "dnf": "gcc", "pacman": "gcc", "zypper": "gcc"}),
@@ -154,6 +166,15 @@ OLD_DEBIAN = {"stretch": "9", "buster": "10", "bullseye": "11", "bookworm": "12"
 # fedora-cisco-openh264 repository, a RHEL-like's gstreamer1-plugin-libav in EPEL. RPM Fusion has
 # neither, but its full ffmpeg gives gstreamer1-plugin-libav the H.264 decoder ffmpeg-free lacks.
 RPM_FUSION = {"gstreamer1-plugin-libav", "gstreamer1-plugin-openh264"}
+# With OpenH264's stand-in in place (system.openh264_stub), what gives H.264 video: installing the
+# plugin again changes nothing.
+REAL_OPENH264 = {
+    "dnf": "Your OpenH264 is Fedora's stand-in, which plays no H.264 video: swap in Cisco's with"
+           " sudo dnf swap noopenh264 openh264 (from the fedora-cisco-openh264 repository), or use"
+           " RPM Fusion's ffmpeg: https://rpmfusion.org/Howto/Multimedia",
+    "zypper": "Your OpenH264 is openSUSE's stand-in, which plays no H.264 video: enable the openh264"
+              " repository (repo-openh264) and run this again, or use Packman's ffmpeg.",
+}
 
 def os_release(text: Optional[str] = None) -> dict[str, str]:
     """os-release's fields. It's KEY=value lines, values quoted the shell's way."""
@@ -308,7 +329,7 @@ def known_packages(manager: str, names: list[str], ask: Callable[[list[str]], Op
 
 
 def report(release: dict[str, str], missing: Iterable[str], old: Iterable[str] = (), optional: bool = True,
-           ask: Callable[[list[str]], Optional[str]] = _ask) -> list[str]:
+           ask: Callable[[list[str]], Optional[str]] = _ask, stub: bool = False) -> list[str]:
     """What install.sh reads (natter.__main__.deps prints it): one line each, a word then the rest.
 
       manager apt|dnf|pacman|zypper   the package manager install.sh may run ("" elsewhere: none)
@@ -320,7 +341,8 @@ def report(release: dict[str, str], missing: Iterable[str], old: Iterable[str] =
       too-old REASON                  Natter can't run and installing won't change that: the Flatpak
       note TEXT                       for the person, as it is
 
-    `missing` are piece names (PIECES); `old` the versions too old to run, in words (FLOORS).
+    `missing` are piece names (PIECES); `old` the versions too old to run, in words (FLOORS);
+    `stub`: OpenH264 is a stand-in (system.openh264_stub), which a note says how to replace.
     Packages the manager's lists don't have are left out, with a note; when one of the required
     ones is among them, the release is too old for Natter."""
     missing = set(missing)
@@ -355,6 +377,8 @@ def report(release: dict[str, str], missing: Iterable[str], old: Iterable[str] =
                          " EPEL has gstreamer1-plugin-libav), or RPM Fusion's ffmpeg:"
                          " https://rpmfusion.org/Howto/Multimedia")
             lines.append(note)
+    if stub and manager in REAL_OPENH264:
+        lines.append(f"note {REAL_OPENH264[manager]}")
     lines.insert(0, f"manager {manager}")
     for group in GROUPS:
         if names[group]:

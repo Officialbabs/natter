@@ -1,29 +1,44 @@
 /* Natter's additions to WhatsApp Web. Each rule hangs off a class Natter sets on <html>. */
 
-/* Privacy blur: names, pictures and messages stay blurred until the pointer is over them. */
-html.natter-blur #pane-side [role="listitem"],
-html.natter-blur #pane-side [role="row"],
-html.natter-blur #main header,
-html.natter-blur #main [role="row"],
-html.natter-blur #main .message-in,
-html.natter-blur #main .message-out,
-html.natter-blur footer [contenteditable="true"] {
-  filter: blur(7px);
-  transition: filter 120ms ease-out;
+/* Privacy blur: names, pictures, messages and the message box can't be read until the pointer is
+   over them, or the message box has the keys. Never a CSS filter: a filter paints each row again
+   on its own on every repaint, and WhatsApp's lists make and repaint rows all the time as they
+   scroll (with one on every row, a PC froze). Here the words are see-through, with a soft shadow
+   in WhatsApp's own text colour, and pictures aren't drawn at all: no extra pass for either.
+   !important, as a user style sheet's rules otherwise give way to WhatsApp's own. */
+html.natter-blur #pane-side [role="listitem"]:not(:hover),
+html.natter-blur #pane-side [role="listitem"]:not(:hover) :not(svg, svg *),
+html.natter-blur #pane-side [role="row"]:not(:hover),
+html.natter-blur #pane-side [role="row"]:not(:hover) :not(svg, svg *),
+html.natter-blur #main header:not(:hover),
+html.natter-blur #main header:not(:hover) :not(svg, svg *),
+html.natter-blur #main [role="row"]:not(:hover),
+html.natter-blur #main [role="row"]:not(:hover) :not(svg, svg *),
+html.natter-blur #main .message-in:not(:hover),
+html.natter-blur #main .message-in:not(:hover) :not(svg, svg *),
+html.natter-blur #main .message-out:not(:hover),
+html.natter-blur #main .message-out:not(:hover) :not(svg, svg *),
+html.natter-blur footer [contenteditable="true"]:not(:hover):not(:focus),
+html.natter-blur footer [contenteditable="true"]:not(:hover):not(:focus) * {
+  color: transparent !important;
+  -webkit-text-fill-color: transparent !important;
+  text-shadow: 0 0 12px var(--WDS-content-default, #8a8a8a) !important;
+  background-image: none !important;
 }
-html.natter-blur #pane-side [role="listitem"]:hover,
-html.natter-blur #pane-side [role="row"]:hover,
-html.natter-blur #main header:hover,
-html.natter-blur #main [role="row"]:hover,
-html.natter-blur #main .message-in:hover,
-html.natter-blur #main .message-out:hover,
-html.natter-blur footer [contenteditable="true"]:hover,
-html.natter-blur footer [contenteditable="true"]:focus {
-  filter: none;
+/* Icons keep their shape, in one quiet colour: a read tick's blue says nothing. */
+html.natter-blur #pane-side [role="listitem"]:not(:hover) svg,
+html.natter-blur #pane-side [role="row"]:not(:hover) svg,
+html.natter-blur #main header:not(:hover) svg,
+html.natter-blur #main [role="row"]:not(:hover) svg {
+  color: var(--WDS-content-deemphasized, #8a8a8a) !important;
 }
-
-/* While Natter's window is in the background, nothing in it is readable. */
-html.natter-away #app {
-  filter: blur(16px) saturate(0.6);
-  transition: filter 160ms ease-out;
+/* Pictures (avatars, emoji, photos, videos, stickers) aren't drawn: what's behind them shows. */
+html.natter-blur #pane-side [role="listitem"]:not(:hover) :is(img, image, canvas, video),
+html.natter-blur #pane-side [role="row"]:not(:hover) :is(img, image, canvas, video),
+html.natter-blur #main header:not(:hover) :is(img, image, canvas, video),
+html.natter-blur #main [role="row"]:not(:hover) :is(img, image, canvas, video),
+html.natter-blur #main .message-in:not(:hover) :is(img, image, canvas, video),
+html.natter-blur #main .message-out:not(:hover) :is(img, image, canvas, video),
+html.natter-blur footer [contenteditable="true"]:not(:hover):not(:focus) img {
+  visibility: hidden !important;
 }

@@ -355,8 +355,78 @@ class MediaTest(unittest.TestCase):
             self.skipTest("needs GStreamer for Python")
         ubuntu = os_release("ID=ubuntu\nID_LIKE=debian\n")
         missing, hint = media_report(ubuntu)
-        self.assertLessEqual(set(missing), {label for label, _ in system.CODECS})
+        self.assertLessEqual(set(missing), {label for label, _ in system.CODECS + system.PLAYERS})
         self.assertEqual(hint, "sudo apt install " + MEDIA["apt"] if missing else "")
+
+    def gst(self):
+        import gi
+
+        try:
+            gi.require_version("Gst", "1.0")
+        except ValueError:
+            self.skipTest("needs GStreamer for Python")
+        from gi.repository import Gst
+
+        Gst.init(None)
+        return Gst
+
+    def test_players_count_too(self):
+        """gst-libav alone has the decoders: without the good and base plugins nothing plays."""
+        Gst = self.gst()
+        find = Gst.ElementFactory.find
+        gone = {"qtdemux", "pulsesink"}
+        with mock.patch.object(Gst.ElementFactory, "find", lambda name: None if name in gone else find(name)):
+            missing, hint = media_report(os_release("ID=arch\n"))
+        self.assertIn("MP4 videos (qtdemux)", missing)
+        self.assertIn("sound (autoaudiosink, pulsesink)", missing)
+        self.assertEqual(hint, "sudo pacman -S --needed " + MEDIA["pacman"])
+
+    def test_openh264_stand_in(self):
+        """OpenH264 on its stand-in library (Fedora's noopenh264) decodes nothing: no H.264."""
+        Gst = self.gst()
+        if Gst.ElementFactory.find("openh264dec") is None:
+            self.skipTest("needs openh264dec")
+        h264 = Gst.Caps.from_string("video/x-h264")
+        listed = Gst.ElementFactory.list_get_elements
+
+        def only_openh264(kind, rank):
+            return [factory for factory in listed(kind, rank)
+                    if factory.get_name() == "openh264dec" or not factory.can_sink_any_caps(h264)]
+
+        fedora = os_release("ID=fedora\n")
+        with mock.patch.object(Gst.ElementFactory, "list_get_elements", only_openh264):
+            with mock.patch.object(system, "openh264_stub", return_value=True):
+                missing, hint = media_report(fedora)
+            self.assertIn("H.264 video", missing)
+            self.assertTrue(hint.endswith(" && sudo dnf swap noopenh264 openh264"), hint)
+            with mock.patch.object(system, "openh264_stub", return_value=False):
+                missing, _ = media_report(fedora)
+            self.assertNotIn("H.264 video", missing)
+
+    def test_openh264_stub(self):
+        """Asked once a process; the real library (where there is one) isn't the stand-in."""
+        Gst = self.gst()
+        with mock.patch.object(system, "_stub", None):
+            with mock.patch.object(Gst.ElementFactory, "find", lambda name: None):
+                self.assertFalse(system.openh264_stub())  # no plugin: nothing to say
+            with mock.patch.object(Gst.ElementFactory, "find", side_effect=AssertionError("asked again")):
+                self.assertFalse(system.openh264_stub())
+        with mock.patch.object(system, "_stub", None):
+            stub = system.openh264_stub()
+        self.assertIsInstance(stub, bool)
+        if Gst.ElementFactory.find("openh264dec") is not None and distro.package_manager(distro.os_release()) == "apt":
+            self.assertFalse(stub)  # Debian and Ubuntu have no stand-in
+
+    def test_calls_report(self):
+        ubuntu = os_release("ID=ubuntu\nID_LIKE=debian\n")
+        self.assertEqual(system.calls_report([], ubuntu), ("", ""))
+        words, command = system.calls_report(["webrtc", "nice"], ubuntu)
+        self.assertIn("SRTP", words)
+        self.assertIn("libnice", words)
+        self.assertEqual(command, "sudo apt install gstreamer1.0-plugins-bad gstreamer1.0-nice")
+        words, command = system.calls_report(["GstWebRTC"], os_release("ID=cachyos\nID_LIKE=arch\n"))
+        self.assertEqual(command, "sudo pacman -S --needed gst-plugins-bad-libs")
+        self.assertEqual(system.calls_report(["nice"], os_release("ID=nixos\n"))[1], "")
 
 
 class VersionGateTest(unittest.TestCase):

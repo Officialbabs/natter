@@ -19,8 +19,12 @@ the old file rather than half of the new one.
 scripts, at document start, on `https://web.whatsapp.com/*` only). `natter/rtc.js` runs there too:
 it puts ceilings on what the page's video decoders and encoders hold, and with calls in the page it
 stands in for WebRTC (below). A user style sheet, `natter/style.css`, adds the privacy blur and
-Natter Den's other touches, each hung off a class Natter Den sets on `<html>`. The bridge tells
-Natter Den:
+Natter Den's other touches, each hung off a class Natter Den sets on `<html>`. The privacy blur
+uses no CSS filter, which would paint every row again on its own each time WhatsApp's lists
+scroll: words turn see-through with a soft shadow in WhatsApp's text colour, and pictures aren't
+drawn. *Cover When in the Background* isn't in the page at all: while another window is in front,
+an opaque cover in the window's colour lies over the page, and goes the moment Natter Den is
+in front again. The bridge tells Natter Den:
 
 - **Notifications:** WhatsApp's `new Notification(…)` comes to Natter Den, which shows it over
   `org.freedesktop.Notifications`, or through GNotification (the notification portal) inside a

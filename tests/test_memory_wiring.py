@@ -154,7 +154,7 @@ class StaysDownTest(unittest.TestCase):
     def test_no_reload_for_a_switch_turned_on(self):
         page = self.stopped()
         page.refused_since_load = {"camera": True, "microphone": False}
-        page.reload = lambda: self.fail("reloaded")
+        page.reload = lambda *_why: self.fail("reloaded")
         page.media_allowed_again("camera")
 
 

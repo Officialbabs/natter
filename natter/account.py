@@ -39,9 +39,29 @@ CHUNK = 4 * 1024 * 1024  # bytes per call when handing a file to the page
 # for a moment, and the call's packets go through the same page.
 CALL_CHUNK = 256 * 1024
 CALL_GAP_MS = 15
-# What a ringing call's notification says (WhatsApp's English words, as bridge.js GENERIC has them):
-# one counts as a call from then (rtc.py ring), in case WhatsApp makes its channels only on answering.
-RINGING = re.compile(r"\W*incoming\s+(voice\s+|video\s+)?call[\s.!…]*", re.IGNORECASE)
+# What a ringing call's notification says, in its title or body: one counts as a call from then
+# (rtc.py ring), in case WhatsApp makes its channels only on answering. WhatsApp's English words
+# (as bridge.js GENERIC has them), and the same in other common languages: those are this file's
+# best guess at WhatsApp's own, so a log line says when one rang (_rang). Each only as the whole
+# text, so a message that merely mentions a call doesn't count.
+RINGING_WORDS = (
+    r"incoming\s+(voice\s+|video\s+)?call",  # English
+    r"eingehender\s+(sprach|video)?anruf",  # German
+    r"(video)?llamada\s+(de\s+(voz|v[ií]deo)\s+)?entrante",  # Spanish
+    r"appel\s+(vocal\s+|vid[ée]o\s+)?entrant",  # French
+    r"(video)?chiamata\s+(vocale\s+)?in\s+arrivo",  # Italian
+    r"(chamada|liga[çc][ãa]o)\s+(de\s+(voz|v[íi]deo)\s+)?(recebida|a\s+receber|entrante)",  # Portuguese
+    r"(recebendo|a\s+receber)\s+(chamada|liga[çc][ãa]o)(\s+de\s+(voz|v[íi]deo))?",  # Portuguese
+    r"inkomende\s+(spraak|video)?-?oproep",  # Dutch
+    r"входящий\s+(голосовой\s+|аудио|видео)?звонок",  # Russian
+    r"gelen\s+(sesli\s+|g[öo]r[üu]nt[üu]l[üu]\s+)?arama",  # Turkish
+    r"przychodz[ąa]ce\s+po[łl][ąa]czenie(\s+(g[łl]osowe|wideo))?",  # Polish
+    r"panggilan\s+(suara\s+|video\s+)?masuk",  # Indonesian, Malay
+    r"simu\s+(ya\s+(sauti|video)\s+)?inayoingia",  # Swahili
+    r"مكالمة\s+(صوتية\s+|فيديو\s+)?واردة",  # Arabic
+    r"इनकमिंग\s+(वॉइस\s+|वीडियो\s+)?कॉल",  # Hindi
+)
+RINGING = re.compile(r"\W*(" + "|".join(RINGING_WORDS) + r")[\s.!…]*", re.IGNORECASE)
 PICK_TAG = "application/x-natter-files"  # the accept= of the bridge's own file input (bridge.js pick)
 LARGEST = 256 * 1024 * 1024  # the most the piece-by-piece fallback sends (attach has no limit of its own)
 READY_WAIT = 20  # seconds a call into the page waits for WhatsApp's chat list before giving up
@@ -170,6 +190,11 @@ OUTSIDE = ("http", "https", "mailto", "tel")  # links Natter hands to the browse
 # make WebKit start a fresh process for it, leaving the first, blank one idle: ~100 MB of
 # cold memory that the background reclaim hands back.)
 FEATURES_OFF = ("ProcessSwapOnCrossSiteNavigation", "UsesBackForwardCache", "SpeechRecognition",
+                # A hidden page's timers run once a second at most (HiddenPageDOMTimerThrottling,
+                # turned off during a call: _apply_throttle). With this they'd slow further, the
+                # longer it stays hidden: a ringing call's work could take minutes. Off already in
+                # WebKitGTK 2.52; kept off whatever a later one does.
+                "HiddenPageDOMTimerThrottlingAutoIncreases",
                 # WhatsApp's service worker passes every download through itself, and in WebKitGTK
                 # some arrive damaged: emoji sprite sheets drew as slivers, blanks and magnified
                 # squares. Without it they draw whole; it's only there for offline caching.
@@ -447,6 +472,17 @@ class _Reply:
     asked: float = 0.0  # when the page's turn came (time.monotonic), before any loan: the page is told how long ago
 
 
+def say_reload(account, why: str, ended: bool = False) -> None:
+    """The log's one line for each time Natter loads an account's page again, or ends it for
+    good (`ended`): why, and whether a call was on in it then. Natter's own words, never a chat's;
+    the account's name only when there are several."""
+    rtc_host = getattr(account, "rtc", None)
+    call = rtc_host is not None and rtc_host.calling
+    several = len(getattr(getattr(account, "app", None), "accounts", None) or ()) > 1
+    print(f"natter: page: {'ended' if ended else 'reloaded'} because {why}" + (", during a call" if call else "")
+          + (f" ({account.name})" if several else ""), flush=True)
+
+
 def reload_delay(crashes: list[float]) -> Optional[int]:
     """Seconds to wait before reloading a page that crashed at these times; None in a crash loop.
 
@@ -564,6 +600,17 @@ class Account(GObject.Object):
         # sound pauses meanwhile (app.py voice_note). Over once the page goes, whatever it said.
         self.recording = False
         self._reload_timer = 0
+        # Why Natter loads the page again when _reload_timer fires (a crash, its memory, the
+        # network process), for its line in the log (say_reload).
+        self._reload_why = ""
+        # A load of Natter's own is under way (_load, the first one too): a page that replaces
+        # this one without it was WhatsApp loading itself again (_on_load_changed).
+        self._own_load = True
+        # WebKit's network process stopped during a call: the page is loaded again once the call
+        # is over (network_lost, _on_page_call).
+        self._network_lost_later = False
+        self._fresh_why = ""  # why a fresh page held for a reply was asked for (fresh_page)
+        self._unresponsive_at: Optional[float] = None  # since when the page hasn't answered WebKit
         self._page_timer = 0  # looks at a page that's loading or just loaded (_watch_page)
         self._progress = (-1.0, 0.0)  # the loading page's progress, and since when (_page_stalled)
         self._stall_look = 0.0  # time.monotonic() of _page_stalled's last look
@@ -690,6 +737,7 @@ class Account(GObject.Object):
                                 ("permission-request", self._on_permission),
                                 ("show-notification", self._on_webkit_notification),
                                 ("web-process-terminated", self._on_crash),
+                                ("notify::is-web-process-responsive", self._on_responsive),
                                 ("load-failed", self._on_load_failed),
                                 ("load-changed", self._on_load_changed),
                                 ("context-menu", self._on_context_menu),
@@ -1038,7 +1086,7 @@ class Account(GObject.Object):
         if self._fresh_held:
             # First: whatever was held then runs in the new page, once it's up.
             self._fresh_held = False
-            self.fresh_page()
+            self.fresh_page(getattr(self, "_fresh_why", "") or "a fresh page was asked for")
         for run in actions:
             run()
 
@@ -1078,6 +1126,7 @@ class Account(GObject.Object):
             return True
         target = chat_link(uri)
         if not self.ready or self._link is not None:
+            say_reload(self, "a link was opened")
             self._load(target)
             return True
         # Calls wait while the link opens, as they would for a reload.
@@ -1090,6 +1139,7 @@ class Account(GObject.Object):
             if taken:
                 self._link_timer = GLib.timeout_add_seconds(LINK_WAIT, self._link_expired, target)
             else:
+                say_reload(self, "a link was opened (the page didn't take it)")
                 self._load(target)
 
         self.run("return window.__natter ? window.__natter.openLink(href) : false", {"href": short_link(uri)}, clicked)
@@ -1103,17 +1153,20 @@ class Account(GObject.Object):
         code = link.rstrip("/").rsplit("/", 1)[-1]
         address = WHATSAPP_URL + ("accept?channel_invite_code=" if "/channel/" in link else "accept?code=") + quote(code)
         if not self.ready or self._link is not None:
+            say_reload(self, "a group or channel link was opened")
             self._load(address)
             return
 
         def clicked(taken) -> None:
             if not taken:
+                say_reload(self, "a group or channel link was opened (the page didn't take it)")
                 self._load(address)
 
         self.run("return window.__natter ? window.__natter.openLink(href) : false", {"href": link}, clicked)
 
     def _link_expired(self, target: str) -> bool:
         self._link_timer = 0
+        say_reload(self, "a link was opened (its chat didn't open in the page)")
         self._load(target)
         return GLib.SOURCE_REMOVE
 
@@ -1245,21 +1298,24 @@ class Account(GObject.Object):
     def set_hardware_acceleration(self, on: bool) -> None:
         self.view.get_settings().set_hardware_acceleration_policy(_acceleration(on))
 
-    def fresh_page(self) -> None:
+    def fresh_page(self, why: str = "a fresh page was asked for") -> None:
         """WhatsApp again in a new web process. After a call, WhatsApp keeps its call engine
         loaded: twenty threads and memory that WebKit can't give back (it only grows), well over
         a gigabyte. Only a new process lets it go. The chat that was open opens again. A page
         that stopped (crashing) stays stopped until Try Again. With a reply in the page, once it
-        has answered (_held): a new page under it would turn "sent" into "unknown"."""
+        has answered (_held): a new page under it would turn "sent" into "unknown". Never during
+        a call, ringing or connected. `why` is for the log."""
         if self.removed or self.calling or self.crashing:
             return
         if self._in_page:
             self._fresh_held = True
+            self._fresh_why = why
             return
         self.fresh_at = time.monotonic()
         self._reopen_after_load()
         if self.rtc:
             self.rtc.close()
+        say_reload(self, why)
         self.view.terminate_web_process()  # reported as TERMINATED_BY_API: not a crash
         self._load(self.home)
 
@@ -1314,13 +1370,22 @@ class Account(GObject.Object):
 
         self.run("return window.__natter ? await window.__natter.openChat(name) : false", {"name": chat}, opened)
 
-    def reload(self) -> None:
+    def reload(self, why: str = "Reload or Try Again was chosen") -> None:
         """Load WhatsApp again, also after a crash loop, back on the chat that was open."""
         self.failed = None
         self.crashing = self.memory_stopped = False
         self._crashes.clear()
         self._memory_ends.clear()
         self._reopen_after_load()
+        say_reload(self, why)
+        if getattr(self, "_network_lost_later", False):
+            # WebKit's network process stopped during the call this ends: a reload in the same
+            # web process stays cut off from the new one (network_lost), so a new process now,
+            # not a second reload once the call is over.
+            self._network_lost_later = False
+            if self.rtc:
+                self.rtc.close()
+            self.view.terminate_web_process()  # reported as TERMINATED_BY_API: not a crash
         self._load(self.home)
         self.emit("state-changed")
 
@@ -1339,6 +1404,7 @@ class Account(GObject.Object):
         self.ready = False
         self.loaded_at = time.monotonic()
         self.look = self.look_dark = None  # the new page says again how it looks
+        self._own_load = True
         self._set_reloading(uri == self.home)  # not for a link opened in the page
         self.view.load_uri(uri)
 
@@ -1368,6 +1434,7 @@ class Account(GObject.Object):
         self._fallback.clear()
         self.ready = False
         self.set_recording(False)
+        say_reload(self, "its account was removed", ended=True)
         self.view.terminate_web_process()
 
         def cleared(manager, result) -> None:
@@ -1398,6 +1465,7 @@ class Account(GObject.Object):
                 self.rtc.close()
         finally:
             self.ready = False
+            say_reload(self, f"{NAME} is quitting", ended=True)
             self.view.terminate_web_process()  # reported as TERMINATED_BY_API (_on_crash): not a crash
 
     # ---- What the page tells Natter --------------------------------------------------------
@@ -1459,7 +1527,27 @@ class Account(GObject.Object):
     def ringing(self) -> None:
         """A call is being placed from Natter (app.py start_call): it counts as on from now (rtc.py ring)."""
         if self.rtc is not None:
-            self.rtc.ring()
+            self.rtc.ring(why="the call button in the window's header")
+
+    def _rang(self, chat: str) -> None:
+        """A ringing call's notification came from the page: the call is on from now, before its
+        channels are made, if they wait for the answer (rtc.py ring). The log says so, with
+        whether the window was hidden and whether Natter shows the notification (it doesn't
+        while notifications are off, paused, or muted for that chat), never who's calling."""
+        self.rtc.ring(why="a ringing notification")
+        app, why = self.app, ""
+        try:
+            settings = app.settings
+            muted = getattr(getattr(app, "notifier", None), "muted", {}).get((self.id, chat), 0) > time.time()
+            why = ("notifications are off" if not settings["notifications"]
+                   else "notifications are paused" if settings.notifications_paused()
+                   else "that chat's notifications are muted" if muted else "")
+            window = getattr(app, "window", None)
+            where = "window hidden" if window is None or not window.get_visible() else "window shown"
+        except (AttributeError, KeyError, TypeError):
+            where = "window unknown"
+        print(f"natter: rtc: a ringing notification from the page ({where}); "
+              + (f"not shown: {why}" if why else "shown"), flush=True)
 
     def _seen_chats(self, rows: list) -> bool:
         """Chats seen in the page (ChatIndex.add), or kept for after the call. True if the order changed."""
@@ -1484,11 +1572,16 @@ class Account(GObject.Object):
         self.emit("in-call", active)
         if not active and self._chats_later:
             self._chats_after_call()
+        if not active and getattr(self, "_network_lost_later", False):
+            # WebKit's network process stopped during the call: the page is cut off from it.
+            # Its new page ends what WebKit would hand out again too (_fresh_after_call).
+            self.network_lost()
+            return
         if not active and self._fresh_after_call:
             # A device switched off during the call: WebKit would still hand it out without asking.
             kinds, self._fresh_after_call = self._fresh_after_call, set()
             if any(self._media_blocked(kind) for kind in kinds):
-                self.fresh_page()
+                self.fresh_page("the microphone or camera was switched off during the call")
 
     def _on_message(self, _content, value) -> None:
         if not self._trusted():
@@ -1510,8 +1603,8 @@ class Account(GObject.Object):
             self.emit("notify-message", message["id"], message["title"], message["body"], message["tag"],
                       message["icon"])
             self._seen_chats([(message["title"], 0)])
-            if self.rtc is not None and RINGING.fullmatch(message["body"]):
-                self.rtc.ring()  # a call rings: on before its channels are made, if they wait for the answer
+            if self.rtc is not None and (RINGING.fullmatch(message["body"]) or RINGING.fullmatch(message["title"])):
+                self._rang(message["tag"] or message["title"])
         elif kind == "unnotify":
             self.emit("unnotify", message["id"])
         elif kind == "chats":
@@ -1744,7 +1837,7 @@ class Account(GObject.Object):
             if self.calling:
                 self._fresh_after_call.add(kind)
             else:
-                self.fresh_page()
+                self.fresh_page(f"the {kind} was switched off")
         return False
 
     def _grant_lives(self, kind: str) -> bool:
@@ -1768,7 +1861,7 @@ class Account(GObject.Object):
         a page that stopped: that waits for Try Again)."""
         if (self.refused_since_load[kind] and not self.calling and not self.removed and not self.crashing
                 and not self._media_blocked(kind)):
-            self.reload()
+            self.reload(f"the {kind} was switched back on")
 
     def _on_capture_state(self, _view, pspec) -> None:
         """The backstop. Should the page capture a kind that's off all the same (a grant WebKit
@@ -1830,6 +1923,10 @@ class Account(GObject.Object):
         # Not ready once a new page replaces the old one. (A load that never gets that far, a
         # download or a blocked navigation, leaves the old page, still ready, where it was.)
         if event == WebKit.LoadEvent.COMMITTED:
+            if not getattr(self, "_own_load", True):
+                # Not one of Natter's: WhatsApp loaded itself again (or something in it navigated).
+                say_reload(self, "the page loaded itself again (WhatsApp's own reload)")
+            self._own_load = False
             self.ready = False
             self.set_recording(False)  # the old page's microphone went with it
             self.loaded_at = time.monotonic()
@@ -1896,10 +1993,12 @@ class Account(GObject.Object):
         self._blank_reloads = [at for at in self._blank_reloads if now - at < BLANK_WINDOW]
         if len(self._blank_reloads) >= BLANK_TRIES:
             print(f"natter: {self.name}'s page {what} again; leaving it (Reload tries again)", flush=True)
+            say_reload(self, f"it {what} again and again: not loading it again", ended=True)
             self._set_reloading(False)  # Natter has stopped trying: the header shouldn't say it hasn't
             return
         self._blank_reloads.append(now)
         print(f"natter: {self.name}'s page {what}; loading it again", flush=True)
+        say_reload(self, f"it {what}")
         self._load(self.home)
 
     def _on_load_failed(self, _view, _event, uri: str, error: GLib.Error) -> bool:
@@ -1913,6 +2012,11 @@ class Account(GObject.Object):
         return True
 
     def _on_crash(self, _view, reason) -> None:
+        # Said with why it's loaded again: the call's gone with the page by then (rtc.close).
+        during = ", during a call" if self.rtc is not None and self.rtc.calling else ""
+        # The next page has a web process of its own: nothing is left of a network process lost
+        # during the call to load it again for (network_lost), nor to count or log twice.
+        self._network_lost_later = False
         self.ready = False
         self.set_recording(False)
         self._watch_page(0, None)  # the crash path below reloads it
@@ -1925,18 +2029,19 @@ class Account(GObject.Object):
         # loop) opens the chat that was open again.
         self._reopen_after_load()
         if reason == WebKit.WebProcessTerminationReason.EXCEEDED_MEMORY_LIMIT:
-            self._on_memory_ended("WebKit")
+            self._on_memory_ended("WebKit" + during)
             return
         # Natter's guard, and the kernel at the unit's limit, end a page with SIGKILL: to WebKit, a crash.
         by = self.app.ended_for_memory() if reason == WebKit.WebProcessTerminationReason.CRASHED else None
         if by:
-            self._on_memory_ended(by)
+            self._on_memory_ended(by + during)
             return
         self._crashes = self._crashes[-(LOOP_CRASHES + len(BACKOFF)):] + [time.monotonic()]
         delay = reload_delay(self._crashes)
         if delay is None:
             print(f"natter: {self.name}'s page stopped ({reason.value_nick}), "
                   f"{LOOP_CRASHES} times in {LOOP_SECONDS} s; not reloading")
+            say_reload(self, f"it stopped ({reason.value_nick}){during} again and again: not reloading", ended=True)
             self.crashing = True
             self.reloading = False
             self._drop_pending()
@@ -1945,11 +2050,14 @@ class Account(GObject.Object):
             print(f"natter: {self.name}'s page stopped ({reason.value_nick}); reloading in {delay} s")
             if self._reload_timer:
                 GLib.source_remove(self._reload_timer)
+            self._reload_why = f"it stopped ({reason.value_nick}){during}"
             self._reload_timer = GLib.timeout_add_seconds(delay, self._reload_after_crash)
         self.emit("state-changed")
 
     def _reload_after_crash(self) -> bool:
         self._reload_timer = 0
+        say_reload(self, getattr(self, "_reload_why", "") or "it stopped")
+        self._reload_why = ""
         self._load(self.home)
         return GLib.SOURCE_REMOVE
 
@@ -1968,12 +2076,14 @@ class Account(GObject.Object):
         if len(self._memory_ends) > 1:
             print(f"natter: {self.name}'s page was ended for its memory ({by}), again within "
                   f"{MEMORY_AGAIN // 60} minutes; not reloading", flush=True)
+            say_reload(self, f"it was ended for its memory ({by}) again: not reloading", ended=True)
             self.crashing = self.memory_stopped = True
             self.reloading = False
             self._drop_pending()
         else:
             print(f"natter: {self.name}'s page was ended for its memory ({by}); a fresh page", flush=True)
             self.fresh_at = now
+            self._reload_why = f"it was ended for its memory ({by})"
             self._reload_timer = GLib.timeout_add_seconds(1, self._reload_after_crash)
             self.reloading = True
         self.emit("state-changed")
@@ -1982,13 +2092,24 @@ class Account(GObject.Object):
     def network_lost(self) -> None:
         """WebKit's network process died (app.py), and this page's database, websocket and loads
         with it. A reload in the same web process kept failing, so a new one, back on the chat
-        that was open. Counted like a crash: one that keeps happening stops in a crash loop."""
+        that was open. Counted like a crash: one that keeps happening stops in a crash loop.
+
+        Not during a call, ringing or connected: its sound and video don't go through WebKit's
+        network process (rtc.py), so it can go on, and the page is loaded again once it's over
+        (_on_page_call)."""
         if self.removed or self.crashing:
             return
+        if self.calling:
+            if not getattr(self, "_network_lost_later", False):
+                print("natter: page: WebKit's network process stopped during a call; "
+                      "reloading once the call is over", flush=True)
+            self._network_lost_later = True
+            return
+        self._network_lost_later = False
         self.ready = False
         self._end_link()
         if self.rtc:
-            self.rtc.close()  # a call is over: its signalling went with the websocket
+            self.rtc.close()
         self.fresh_at = time.monotonic()
         self._reopen_after_load()
         self.view.terminate_web_process()  # reported as TERMINATED_BY_API: not counted twice
@@ -2000,13 +2121,28 @@ class Account(GObject.Object):
         if delay is None:
             print(f"natter: {self.name}'s page lost its connections {LOOP_CRASHES} times in "
                   f"{LOOP_SECONDS} s; not reloading", flush=True)
+            say_reload(self, "WebKit's network process stopped again and again: not reloading", ended=True)
             self.crashing = True
             self.reloading = False
             self._drop_pending()
         else:
             self.reloading = True  # from the moment it's known, not only once the load starts
+            self._reload_why = "WebKit's network process stopped"
             self._reload_timer = GLib.timeout_add_seconds(delay, self._reload_after_crash)
         self.emit("state-changed")
+
+    def _on_responsive(self, view, _pspec) -> None:
+        """WebKit's word on whether the page answers it: logged, as a page that stops answering
+        freezes in the window (WebKitGTK ends nothing for it, nor does Natter). Whether a call
+        was on, and how long it went without answering."""
+        if view.get_is_web_process_responsive():
+            if self._unresponsive_at is not None:
+                print(f"natter: page: answering again after {time.monotonic() - self._unresponsive_at:.1f} s",
+                      flush=True)
+            self._unresponsive_at = None
+        elif self._unresponsive_at is None:
+            self._unresponsive_at = time.monotonic()
+            print("natter: page: not answering" + (", during a call" if self.calling else ""), flush=True)
 
     def _on_context_menu(self, _view, menu: WebKit.ContextMenu, hit: WebKit.HitTestResult) -> bool:
         drop = {WebKit.ContextMenuAction.OPEN_LINK_IN_NEW_WINDOW, WebKit.ContextMenuAction.OPEN_IMAGE_IN_NEW_WINDOW,

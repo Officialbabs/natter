@@ -47,7 +47,7 @@ class PackageListTest(unittest.TestCase):
         text = (ROOT / "docs" / "packaging.md").read_text()
         groups = (
             [piece for piece in PIECES if piece.group == REQUIRED] + [PIECE["codecs"]],
-            [PIECE[name] for name in ("webrtc", "nice", "GstWebRTC", "GstSdp")],
+            [PIECE[name] for name in ("webrtc", "nice", "GstWebRTC", "GstSdp", "pipewire")],
             [piece for piece in PIECES if piece.group == OPTIONAL],
         )
         for manager in AUTO:

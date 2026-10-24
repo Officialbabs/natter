@@ -144,10 +144,13 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>Fixes for replying from notifications.</p>"
+RELEASE_NOTES = ("<p>A lighter privacy blur, steadier calls, and a dependency check for every distribution.</p>"
                  "<ul>"
-                 "<li>Replies from a notification are confirmed by more of WhatsApp's current page: the chat list's open chat, the notified message without WhatsApp's old markup, and the chat's picture</li>"
-                 "<li>The page lent to the reply card is drawn, so WhatsApp keeps working while a reply is sent</li>"
+                 "<li>Privacy blur without a graphics filter, and a cover (not a blur) while another window is in front: both cost next to nothing now</li>"
+                 "<li>Other apps' audio pauses while you record a voice message, and plays again after</li>"
+                 "<li>Calls: packets leave from their own thread, a network-process loss waits for the call to end, incoming calls are recognised in more languages, and the log says why every reload happened</li>"
+                 "<li>The installer checks and names every piece calls, videos, sound and the camera need, on Arch, Debian, Ubuntu, Fedora and openSUSE</li>"
+                 "<li>The problem report lists graphics-driver hangs from the previous boot too</li>"
                  "</ul>")
 
 
@@ -198,6 +201,17 @@ def memory_pressure(limit: Optional[str], thresholds: Optional[str]) -> Optional
     if not 0 < conservative < strict < 1:
         conservative, strict = MEMORY_THRESHOLDS
     return megabytes, conservative, strict
+
+
+def network_process_alive(pid: int, proc: Path = Path("/proc")) -> bool:
+    """Whether `pid` is still a WebKit network process. Only a process that's gone, or whose pid
+    went to something else, isn't: one /proc can't be read for now still counts as there."""
+    try:
+        return (proc / str(pid) / "comm").read_text().startswith("WebKitNetwork")
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
 
 
 def kill_threshold(limit_mb: int, total: int) -> float:
@@ -608,6 +622,8 @@ class Natter(Adw.Application):
         self.calls: Optional[CallWindow] = None
         # Calls made by WhatsApp in Natter's own page, its data channels done by GStreamer (rtc.py).
         self.calls_in_page = False
+        # What those calls lack here (piece names, __main__.calls_missing): Preferences says so.
+        self.calls_lacking: list[str] = []
         self._pending_call: Optional[tuple[str, bool]] = None  # (chat, video) waiting for the call window
         self.ada_style: Optional[AdaStyle] = None  # Ada's own light or dark, on Ada (do_startup)
         # The line under Preferences → Style while WhatsApp has a look of its own (_show_style_hint),
@@ -681,7 +697,11 @@ class Natter(Adw.Application):
         self._start_theme()
         # Decided now however Natter was started (D-Bus starts it as a service for a search, and
         # for its menu entry on some desktops): WebKit's processes, started later, need it set.
-        self.calls_in_page = GLib.getenv("NATTER_CALLS") != "window" and rtc.available()
+        if GLib.getenv("NATTER_CALLS") != "window":
+            from .__main__ import calls_missing
+
+            self.calls_lacking = calls_missing()
+        self.calls_in_page = GLib.getenv("NATTER_CALLS") != "window" and not self.calls_lacking and rtc.available()
         self._make_web_context()
         # WebKit's own limit (MEMORY_KILL) can't stop a page that grows while it's busy, or into
         # swap: the guard looks at every page from a thread of Natter's own, window shown or not,
@@ -1405,7 +1425,10 @@ class Natter(Adw.Application):
         open_uri(WHATSAPP_URL, self.window)
         if self.window and "calls" not in self._told:
             self._told.add("calls")
-            self.window.toast("Calls open in your browser — find the chat there and press call. "
+            # Calls in the page lacking plugins: say so, once. Preferences names them.
+            why = f" (calls inside {NAME} need plugins that aren't installed: see Preferences)" \
+                if self.calls_lacking else ""
+            self.window.toast(f"Calls open in your browser{why} — find the chat there and press call. "
                               "The first time, link the browser with your phone.", timeout=10)
 
     # ---- Calls ------------------------------------------------------------------------------
@@ -1841,9 +1864,9 @@ class Natter(Adw.Application):
             account = self.window.account
             if account:
                 self.notifier.withdraw(account.id)
-        away = not active and self.settings["blur_when_away"]
-        for account in self.accounts:
-            account.set_class("natter-away", away)
+        # Cover When in the Background: a cover over the pages, drawn by GTK (Window.set_away).
+        if self.window is not None:
+            self.window.set_away(not active and self.settings["blur_when_away"])
 
     def on_page_changed(self) -> None:
         if self.window and self.window.is_active() and self.window.account and not self.locked:
@@ -1881,7 +1904,7 @@ class Natter(Adw.Application):
         if available:
             for account in self.accounts:
                 if account.failed:
-                    account.reload()
+                    account.reload("the network came back")
 
     # ---- Media -----------------------------------------------------------------------------
 
@@ -2238,7 +2261,7 @@ class Natter(Adw.Application):
                       f"{own_swap() >> 20} MB of it in swap)", flush=True)
                 self._memory_waiting = None
                 self._after_call.pop(account, None)
-                account.fresh_page()
+                account.fresh_page(f"of its memory: {why}")
                 return True
             first = first or (account, kind, why, wait)
         account, kind, why, (waits, words) = first
@@ -2302,7 +2325,10 @@ class Natter(Adw.Application):
         self._last_look, self._memory_events = now, events
         self._note_oom_kills(events if in_own_scope() else {}, now)
         found = network_processes()
-        lost = self._network_processes - found
+        # Only one that's really gone: a look that couldn't read /proc (out of file descriptors,
+        # say) finds none, and that alone would reload every page, a call's too.
+        lost = {pid for pid in self._network_processes - found if not network_process_alive(pid)}
+        found |= self._network_processes - lost
         self._network_processes = found
         if lost and not self._quitting:
             print("natter: WebKit's network process stopped; WhatsApp gets a fresh page", flush=True)

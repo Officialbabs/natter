@@ -402,7 +402,7 @@ class ReplyWindow(Adw.Window):
             self.remove_css_class("natter-hc")
 
     def apply_privacy(self) -> None:
-        """Privacy blur, Blur When in the Background, and the title the desktop sees, as the
+        """Privacy blur, Cover When in the Background, and the title the desktop sees, as the
         settings are now."""
         settings = self.app.settings
         sender = settings["notify_sender"] and not settings["privacy_blur"]

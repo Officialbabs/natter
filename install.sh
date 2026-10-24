@@ -225,6 +225,16 @@ run_install() {
     if have_tty; then "$@" </dev/tty; else "$@" </dev/null; fi
 }
 
+# What doesn't work without the recommended packages, and the one command that installs them.
+LACKS=""
+LACKS_COMMAND=""
+say_lacks() {
+    echo "Without the recommended ones, $APP_NAME goes without: $LACKS."
+    case "$LACKS" in
+        *"for calls"*) echo "Calls then open in your browser (or the call window) instead of inside $APP_NAME." ;;
+    esac
+}
+
 # This system is too old for Natter as it is, for the reason $1: the Flatpak is the way.
 too_old() {
     echo "$APP_NAME can't run here as it is: $1."
@@ -276,7 +286,7 @@ get_missing() {
         echo "    $required"
     fi
     if [ -n "$recommended" ]; then
-        echo "  Recommended, for WhatsApp's videos and voice messages, and for calls:"
+        echo "  Recommended, for WhatsApp's videos and voice messages, sound, the camera and calls:"
         echo "    $recommended"
     fi
     if [ -n "$optional" ]; then
@@ -295,7 +305,7 @@ get_missing() {
     elif [ -z "$can" ]; then
         echo "There's no sudo here to install them with: install them as root."
     elif [ -z "$YES" ] && ! have_tty; then
-        echo "There's no terminal to ask on, so nothing was installed: run this with --yes to install them."
+        echo "There's no terminal to ask on, so nothing was installed: run the command below in a terminal."
     else
         left=""
         if [ -n "$main" ]; then
@@ -334,6 +344,12 @@ get_missing() {
     if [ -n "$left" ]; then
         echo "To install them yourself:"
         echo "  $(shown "$left")"
+    fi
+    # The recommended ones still missing (declined, not asked, or failed): what goes without them.
+    if [ -n "$recommended" ] && { [ -z "$installed" ] || [ "${installed#"$main"}" = "$installed" ]; }; then
+        LACKS="$(field recommended-words)"
+        LACKS_COMMAND="$(shown "$left")"
+        say_lacks
     fi
     if [ -z "$PYTHON" ]; then
         if [ -n "$installed" ] && [ -n "$main" ] && [ "${installed#"$main"}" != "$installed" ]; then
@@ -427,20 +443,27 @@ if command -v xdg-mime >/dev/null; then
     esac
 fi
 
-# WhatsApp's videos and voice messages play through GStreamer: say if codecs are missing, or
-# if they couldn't be checked.
-"$PYTHON" -c '
+# Again at the end, so it's the last thing read: what's still missing, and the command.
+if [ -n "$LACKS" ]; then
+    echo "Not installed yet:"
+    echo "  $LACKS_COMMAND"
+    say_lacks
+else
+    # WhatsApp's videos and voice messages play through GStreamer: say if what they need is
+    # missing, or if it couldn't be checked.
+    "$PYTHON" -c '
 import sys
 sys.path.insert(0, sys.argv[1])
 from natter.system import media_report
 missing, hint = media_report()
 if missing:
-    print("Some WhatsApp media needs codecs GStreamer lacks here:", ", ".join(missing))
+    print("GStreamer lacks what some WhatsApp media needs here:", ", ".join(missing))
     if hint:
         print("  " + hint)
 elif hint:
     print(hint)
 ' "$HERE" 2>/dev/null || true
+fi
 
 # Again at the end: an old Natter still running (--force) may have written its entries back.
 retire_old

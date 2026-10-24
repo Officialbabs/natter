@@ -911,11 +911,58 @@ CODECS = (
     ("AAC audio", "audio/mpeg, mpegversion=(int)4"),
     ("Opus audio", "audio/x-opus"),
 )
+# And what plays them, beyond the decoders: gst-libav alone has those, but not these, which come
+# with GStreamer's good and base plugins (Arch's gst-libav pulls in neither).
+PLAYERS = (
+    ("MP4 videos (qtdemux)", ("qtdemux",)),
+    ("Ogg voice messages (oggdemux)", ("oggdemux",)),
+    ("playback (playbin)", ("playbin",)),
+    ("sound (autoaudiosink, pulsesink)", ("autoaudiosink", "pulsesink")),
+)
+_stub: Optional[bool] = None
+
+
+def openh264_stub() -> bool:
+    """Whether GStreamer's OpenH264 plugin runs on a stand-in library that decodes nothing
+    (Fedora's noopenh264, openSUSE's libopenh264 "~noopenh264"): the plugin loads and offers
+    openh264dec, but no H.264 video plays. Loads the plugin and asks the library for a decoder,
+    as openh264dec would; once a process. Never raises."""
+    global _stub
+    if _stub is None:
+        _stub = False
+        try:
+            import ctypes
+
+            import gi
+
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gst
+
+            Gst.init(None)
+            factory = Gst.ElementFactory.find("openh264dec")
+            if factory is not None and factory.load() is not None:
+                with open("/proc/self/maps") as maps:
+                    paths = sorted({line.split(None, 5)[5].strip() for line in maps
+                                    if "/libopenh264" in line and len(line.split(None, 5)) == 6})
+                if paths:
+                    library = ctypes.CDLL(paths[0])
+                    library.WelsCreateDecoder.restype = ctypes.c_long
+                    library.WelsCreateDecoder.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+                    library.WelsDestroyDecoder.argtypes = [ctypes.c_void_p]
+                    decoder = ctypes.c_void_p()
+                    if library.WelsCreateDecoder(ctypes.byref(decoder)) == 0 and decoder.value:
+                        library.WelsDestroyDecoder(decoder)
+                    else:
+                        _stub = True
+        except Exception:
+            pass
+    return _stub
 
 
 def media_report(release: Optional[dict[str, str]] = None) -> tuple[list[str], str]:
-    """The codecs WhatsApp's videos and voice messages need that GStreamer lacks here, and the
-    command that installs them on this distribution ("" when nothing's missing or it's unknown).
+    """What WhatsApp's videos and voice messages need that GStreamer lacks here (codecs, and
+    what plays them), and the command that installs it on this distribution ("" when nothing's
+    missing or it's unknown).
 
     Without GStreamer for Python the check can't run (WebKit plays media without it): then
     nothing is listed, and the hint says so and names the package the check needs. The first
@@ -933,12 +980,38 @@ def media_report(release: Optional[dict[str, str]] = None) -> tuple[list[str], s
     try:
         Gst.init(None)
         decoders = Gst.ElementFactory.list_get_elements(Gst.ELEMENT_FACTORY_TYPE_DECODER, Gst.Rank.MARGINAL)
-        missing = [label for label, caps in CODECS
-                   if not any(factory.can_sink_any_caps(Gst.Caps.from_string(caps)) for factory in decoders)]
+        stub = False
+        missing = []
+        for label, caps in CODECS:
+            able = [factory.get_name() for factory in decoders if factory.can_sink_any_caps(Gst.Caps.from_string(caps))]
+            # OpenH264 on its stand-in decodes nothing: it doesn't count.
+            if able and set(able) <= {"openh264dec"} and openh264_stub():
+                able, stub = [], True
+            if not able:
+                missing.append(label)
+        missing += [label for label, names in PLAYERS if not all(Gst.ElementFactory.find(name) for name in names)]
     except Exception as error:
         print(f"natter: couldn't ask GStreamer about codecs: {error}")
         return [], ""
-    return missing, _install_command(MEDIA, release) if missing else ""
+    if not missing:
+        return [], ""
+    command = _install_command(MEDIA, release)
+    if stub and command.startswith("sudo dnf install "):
+        command += " && sudo dnf swap noopenh264 openh264"  # the plugin's there: the library is the stand-in
+    return missing, command
+
+
+def calls_report(lacking: list[str], release: Optional[dict[str, str]] = None) -> tuple[str, str]:
+    """What calls in WhatsApp's page lack here, in words, and the command that installs it on this
+    distribution ("" when it's unknown). `lacking` are piece names (natter.__main__.calls_missing);
+    ("", "") when there are none."""
+    from .distro import AUTO, PIECE, packages
+
+    pieces = [PIECE[name] for name in lacking if name in PIECE]
+    if not pieces:
+        return "", ""
+    words = "; ".join(piece.words for piece in pieces)
+    return words, _install_command({manager: " ".join(packages(pieces, manager)) for manager in AUTO}, release)
 
 
 def _install_command(packages: dict[str, str], release: Optional[dict[str, str]]) -> str:
