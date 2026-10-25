@@ -9,5 +9,5 @@ OLD_APP_ID = "io.natter.Natter"
 APP_ID = os.environ.get("NATTER_APP_ID") or DEFAULT_APP_ID
 OBJECT_PATH = "/" + APP_ID.replace(".", "/")
 NAME = "Natter Den"
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 WHATSAPP_URL = "https://web.whatsapp.com/"

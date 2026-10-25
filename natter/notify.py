@@ -15,6 +15,7 @@ chat: each notification has a random reference instead.
 from __future__ import annotations
 
 import base64
+import hashlib
 import math
 import re
 import secrets
@@ -104,6 +105,12 @@ def replyable(tag: str, page_id: int) -> bool:
     """Whether a notification can be answered: one of WhatsApp's own (not WebKit's fallback, whose
     ids are negative) for a message in a chat."""
     return page_id > 0 and bool(CHAT_ID.fullmatch(tag or ""))
+
+
+def avatar_key(url: str) -> str:
+    """A short digest of a picture's address, to tell one picture from another without keeping
+    the address: a data: URL is the whole picture. "" for no address."""
+    return hashlib.sha256(url.encode("utf-8", "surrogateescape")).hexdigest()[:32] if url else ""
 
 
 def picture_allowed(url: str) -> bool:
@@ -197,7 +204,13 @@ class Shown:
     title: str
     page_id: int  # the id WhatsApp's page gave it, for routing the click back
     body: str = ""
-    icon: str = ""
+    # The sender's picture, decoded and circled, as the avatars cache has it; a digest of the
+    # address WhatsApp gave for it (avatar_key), to tell a new picture from the cached one; and
+    # that address itself only until the picture is decoded (a data: URL is the whole picture,
+    # base64: hundreds of kilobytes a bubble, which stayed in every Shown and the cache before).
+    icon: Optional[GdkPixbuf.Pixbuf] = None
+    icon_key: str = ""
+    icon_url: str = ""
     account_name: Optional[str] = None
     count: int = 1
     server_id: int = 0  # the notification server's id for it
@@ -258,6 +271,8 @@ class Notifier:
         self.given: OrderedDict[int, None] = OrderedDict()  # GIVEN_IDS
         self.tokens: dict[int, str] = {}
         self.muted: dict[tuple[str, str], float] = {}
+        # Each chat's picture, decoded and circled, with the digest of the address it came from
+        # (avatar_key): never the address itself, which may be the picture in base64.
         self.avatars: OrderedDict[tuple[str, str], tuple[str, GdkPixbuf.Pixbuf]] = OrderedDict()
         self.http = Soup.Session(timeout=8, max_conns=4)
         self.server: Optional[str] = None  # the notification server's unique name, when Natter talks to it
@@ -335,11 +350,12 @@ class Notifier:
         shown = self.shown.get(key)
         if shown:
             shown.count += 1
-            shown.page_id, shown.title, shown.body, shown.icon = page_id, title, body, icon
+            shown.page_id, shown.title, shown.body = page_id, title, body
             shown.account_name = account_name
         else:
-            shown = self.shown[key] = Shown(account_id, key[1], title, page_id, body, icon, account_name)
+            shown = self.shown[key] = Shown(account_id, key[1], title, page_id, body, account_name=account_name)
             self.by_ref[shown.ref] = shown
+        self._take_icon(shown, icon)
         if body:
             shown.messages = (shown.messages + [clip(body, BODY_CHARS)])[-MESSAGES:]
         shown.replyable = replyable(key[1], page_id)  # Reply opens the chat by the latest message's notification
@@ -360,7 +376,21 @@ class Notifier:
         """A copy of what the reply window needs of `shown`."""
         cached = self.avatars.get((shown.account, shown.chat))
         return ReplyTarget(shown.account, shown.chat, shown.title, shown.page_id, list(shown.messages), shown.count,
-                           cached[1] if cached else None, shown.account_name)
+                           shown.icon or (cached[1] if cached else None), shown.account_name)
+
+    def _take_icon(self, shown: Shown, url: str) -> None:
+        """The picture WhatsApp named for `shown`'s latest message: the cached one when it's the
+        same (by digest), else its address, kept only until it's fetched (_picture). The old
+        picture stays on the bubble meanwhile, and if the new one can't be had."""
+        key, digest = (shown.account, shown.chat), avatar_key(url)
+        cached = self.avatars.get(key)
+        if cached and cached[0] == digest:
+            self.avatars.move_to_end(key)
+            shown.icon, shown.icon_key, shown.icon_url = cached[1], digest, ""
+        elif digest:
+            shown.icon_key, shown.icon_url = digest, url
+        else:
+            shown.icon, shown.icon_key, shown.icon_url = None, "", ""
 
     def _reply_ok(self, shown: Shown) -> bool:
         """Whether `shown` offers Reply: a chat's message, unless Preferences turned Reply off."""
@@ -377,10 +407,10 @@ class Notifier:
             shown.again = True
             return
         shown.sending = True
-        if shown.icon and self._reveal()[0]:
+        if shown.icon_url and self._reveal()[0]:
             self._picture(shown, lambda picture: self._send(shown, picture))
         else:
-            self._send(shown, None)
+            self._send(shown, shown.icon)
 
     def _send(self, shown: Shown, picture: Optional[GdkPixbuf.Pixbuf]) -> None:
         shown.again = False
@@ -509,24 +539,30 @@ class Notifier:
             self._deliver(shown)
 
     def _picture(self, shown: Shown, then: Callable[[Optional[GdkPixbuf.Pixbuf]], None]) -> None:
-        """The sender's picture, circled: kept per chat, fetched again when its address changes."""
-        key, url = (shown.account, shown.chat), shown.icon
+        """The sender's picture, circled: kept per chat, by a digest of its address (avatar_key),
+        fetched again when that changes. Once decoded, the bubble keeps the picture and drops
+        the address; one that can't be had is tried again at the next delivery, with the picture
+        the bubble already has meanwhile."""
+        key, url, digest = (shown.account, shown.chat), shown.icon_url, shown.icon_key
         cached = self.avatars.get(key)
-        if cached and cached[0] == url:
+        if cached and cached[0] == digest:
             self.avatars.move_to_end(key)
+            shown.icon, shown.icon_url = cached[1], ""
             then(cached[1])
             return
 
         def got(raw: Optional[bytes]) -> None:
             picture = decode_image(raw) if raw else None
             if picture is None:
-                then(cached[1] if cached else None)
+                then(shown.icon or (cached[1] if cached else None))
                 return
             picture = circle(picture)
-            self.avatars[key] = (url, picture)
+            self.avatars[key] = (digest, picture)
             self.avatars.move_to_end(key)
             while len(self.avatars) > AVATARS:
                 self.avatars.popitem(last=False)
+            if shown.icon_key == digest:  # not a newer address that came meanwhile
+                shown.icon, shown.icon_url = picture, ""
             then(picture)
 
         self._download(url, got)

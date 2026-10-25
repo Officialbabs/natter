@@ -57,10 +57,14 @@ CALL_MARGIN = GiB // 2
 CALL_GRACE = 60.0
 # Natter's unit (system.py) is the kernel's backstop, for when the guard couldn't act: room for
 # one page at its limit, the call engine of every account's page, and Natter itself; never more
-# than this share of the computer's memory. Its swap is capped too: what's swapped is still held,
-# and a runaway parked in swap filled the computer's once.
+# than this share of the computer's memory. Its swap is capped too, at one page's limit
+# (scope_limits): what's swapped is still held, and a runaway parked in swap filled the
+# computer's once. A fixed 1.5 GiB sat full all morning on 24 Oct 2026 with the page idle (half
+# a gigabyte of its heap and the GPU's buffers in swap), and the guard, counting RssAnon and
+# VmSwap, still ends a page that parks its growth there. Never more than UNIT_SWAP_SHARE of the
+# computer's swap, so a small swap file isn't Natter's alone.
 ACCOUNT_ROOM, NATTER_ROOM, UNIT_SHARE = int(1.5 * GiB), GiB // 2, 0.6
-UNIT_SWAP = int(1.5 * GiB)
+UNIT_SWAP_SHARE = 0.5
 # Growth diagnostics. A page growing faster than GROWTH_RATE at two looks in a row gets its
 # busiest threads logged (once a spell); at every STEP it passes above QUIET, its largest
 # regions. An idle page passes 512 and 1024 MB at every start: that isn't news.
@@ -109,13 +113,26 @@ def page_limit(total: int) -> int:
     return min(limit, total // 2)  # 4 GB of memory: 2 GB
 
 
-def scope_limits(total: int, accounts: int) -> tuple[int, int]:
+def swap_total(meminfo: Optional[str] = None) -> int:
+    """The computer's swap in bytes, SwapTotal (0 when there's none or it can't be read)."""
+    for line in (_read("/proc/meminfo") if meminfo is None else meminfo).splitlines():
+        if line.startswith("SwapTotal:") and line.split()[1:2] and line.split()[1].isdigit():
+            return int(line.split()[1]) * 1024
+    return 0
+
+
+def scope_limits(total: int, accounts: int, swap: int = 0) -> tuple[int, int]:
     """(MemoryMax, MemorySwapMax) for Natter's unit with `accounts` pages, on a computer with
-    `total` bytes of memory (0: unknown)."""
+    `total` bytes of memory and `swap` bytes of swap (0: unknown). The swap cap is one page's
+    limit (page_limit), with its bounds, and at most UNIT_SWAP_SHARE of the swap when that's
+    known."""
     memory_max = page_limit(total) + ACCOUNT_ROOM * max(1, accounts) + NATTER_ROOM
     if total > 0:
         memory_max = min(memory_max, int(total * UNIT_SHARE))
-    return memory_max, UNIT_SWAP
+    swap_max = page_limit(total)
+    if swap > 0:
+        swap_max = min(swap_max, int(swap * UNIT_SWAP_SHARE))
+    return memory_max, swap_max
 
 
 def page_ceiling(total: int) -> int:
@@ -125,7 +142,9 @@ def page_ceiling(total: int) -> int:
     acts first: past the unit's limit, which only a scope of Natter's own has (system.py), the
     kernel would end the page itself. Under a launcher's unit, which gets no limit, it's simply
     the most the guard lets a page hold. It only comes below the call's room on small
-    computers, where the unit is held to UNIT_SHARE."""
+    computers, where the unit is held to UNIT_SHARE. The computer's own swap is left out: where
+    it's small the unit's swap cap is smaller (scope_limits), and the kernel may end a page
+    there before the guard would; that ends the page only, as the unit keeps Natter running."""
     memory_max, swap_max = scope_limits(total, 1)
     return memory_max + swap_max - NATTER_ROOM - CALL_MARGIN
 
@@ -194,6 +213,35 @@ def held(pid: int, proc: Path = PROC) -> Optional[int]:
         if key in ("RssAnon", "VmSwap") and value.split() and value.split()[0].isdigit():
             values[key] = int(value.split()[0]) * 1024
     return sum(values.values()) if "RssAnon" in values else None
+
+
+_GEM_UNITS = {"": 1, "kib": 1024, "mib": MiB, "gib": GiB}
+
+
+def gem_held(pid: int, proc: Path = PROC) -> int:
+    """Bytes of GPU buffers the process owns in system memory, by its DRM files' fdinfo
+    (drm-total-system…: the i915 driver backs them with shmem). None of it is in the process's
+    RssAnon or VmSwap, or in any limit of Natter's or WebKit's: the page's held 542 MB of them on
+    24 Oct 2026, seen only as its unit's shmem. Each DRM client once, however many descriptors
+    it has (drm-client-id); 0 when there's nothing to read."""
+    try:
+        entries = os.listdir(proc / str(pid) / "fdinfo")
+    except OSError:
+        return 0
+    clients: dict[str, int] = {}
+    for entry in entries:
+        client, total = None, None
+        for line in _read(proc / str(pid) / "fdinfo" / entry).splitlines():
+            key, _, value = line.partition(":")
+            parts = value.split()
+            if key == "drm-client-id" and parts:
+                client = parts[0]
+            elif key.startswith("drm-total-system") and parts and parts[0].isdigit():
+                unit = parts[1].lower() if len(parts) > 1 else ""
+                total = (total or 0) + int(parts[0]) * _GEM_UNITS.get(unit, 1)
+        if total is not None:
+            clients[client or entry] = total
+    return sum(clients.values())
 
 
 def descends(pid: int, ancestor: int, proc: Path = PROC, depth: int = 4) -> bool:
@@ -336,19 +384,23 @@ class MemoryGuard:
     hold. `calling()`, when given, says whether a call is on in any page (it's asked from the
     guard's thread). `on_kill(pid, held)` runs on the main loop after a kill: the kill itself
     and its log line don't wait for it. Each page's oom_score_adj is set to `oom_score_adj`,
-    unless that's None (see OOM_SCORE_ADJ)."""
+    unless that's None (see OOM_SCORE_ADJ). `charge()`, when given, says what the kernel charges
+    Natter's unit beside its pages' private memory ({"shmem": bytes, "zswap": bytes},
+    system.unit_charge), for the step line only: none of it counts towards ending a page."""
 
     def __init__(self, limit_bytes: int, on_kill: Optional[Callable[[int, int], None]] = None,
                  poll: float = GUARD_POLL, calling: Optional[Callable[[], bool]] = None, *,
                  ceiling: Optional[int] = None, pid: Optional[int] = None, proc: Path = PROC,
                  flatpak: Optional[bool] = None, killer: Optional[Callable[[int], bool]] = None,
-                 idle_add: Optional[Callable] = None, oom_score_adj: Optional[int] = OOM_SCORE_ADJ) -> None:
+                 idle_add: Optional[Callable] = None, oom_score_adj: Optional[int] = OOM_SCORE_ADJ,
+                 charge: Optional[Callable[[], dict[str, int]]] = None) -> None:
         self.limit = limit_bytes
         self.oom_score_adj = oom_score_adj
         self.ceiling = ceiling
         self.on_kill = on_kill
         self.poll = poll
         self.calling = calling
+        self.charge = charge
         self.pid = os.getpid() if pid is None else pid
         self.proc = proc
         self.flatpak = in_flatpak() if flatpak is None else flatpak
@@ -503,7 +555,25 @@ class MemoryGuard:
             page.step = size // STEP
             regions = anon_regions(_read(self.proc / str(pid) / "smaps"))
             print(f"natter: memory: page {pid} holds {size >> 20} MB, growing {rate} MB/s; largest regions: "
-                  + ("; ".join(describe_region(region) for region in regions) or "unreadable"), flush=True)
+                  + ("; ".join(describe_region(region) for region in regions) or "unreadable")
+                  + self._beside(pid), flush=True)
+
+    def _beside(self, pid: int) -> str:
+        """What the page holds that its size (RssAnon + VmSwap) doesn't count, for the step line:
+        its GPU buffers (gem_held), and what the kernel charges the unit as shmem and zswap
+        (`charge`). Said only where there's something to say."""
+        parts = []
+        gem = gem_held(pid, self.proc)
+        if gem:
+            parts.append(f"GPU buffers {gem >> 20} MB")
+        if self.charge is not None:
+            try:
+                charged = self.charge()
+            except Exception:
+                charged = {}
+            if any(charged.values()):
+                parts.append("the unit's " + ", ".join(f"{name} {bytes_ >> 20} MB" for name, bytes_ in charged.items()))
+        return f"; besides, {', '.join(parts)}" if parts else ""
 
     def _raise_oom_score(self, pid: int) -> None:
         if self.oom_score_adj is None:

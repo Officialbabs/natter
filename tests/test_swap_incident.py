@@ -14,8 +14,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from natter.app import (FRESH_AGAIN, HIDDEN_BEFORE_FRESH, HIDDEN_BEFORE_RECLAIM, MEMORY_LIMIT, QUIET_BEFORE_FRESH,
-                        SETTLE_BEFORE_RECLAIM)
+from natter.app import (FRESH_AGAIN, GROWN_FLOOR, GROWN_FOR, GROWN_SHARE, HIDDEN_BEFORE_FRESH, HIDDEN_BEFORE_RECLAIM,
+                        IDLE_AFTER_LOAD, IDLE_WITHIN, MEMORY_LIMIT, QUIET_BEFORE_FRESH, SETTLE_BEFORE_RECLAIM)
 
 MEMINFO = "MemTotal: 15000000 kB\nMemAvailable: 9000000 kB\nSwapTotal: {total} kB\nSwapFree: {free} kB\n"
 GiB = 1024 ** 3
@@ -64,6 +64,19 @@ class SwapTest(unittest.TestCase):
                 mock.patch.object(system, "memory_stalls", side_effect=lambda: next(pressure)):
             reclaimer._run()
         self.assertEqual(len(steps), 2)
+
+    def test_short_of_memory_uses_the_reclaimers_swap_share(self):
+        # Under a tenth available, and swap past 60% in use (the Reclaimer's own line), not
+        # "all but full": on 24 Oct 2026 the unit's swap sat at its cap all morning while the
+        # computer's was never 85% full, and nothing counted it as short.
+        from natter.system import memory_tight
+
+        low = "MemTotal: 10000000 kB\nMemAvailable: 500000 kB\nSwapTotal: {total} kB\nSwapFree: {free} kB\n"
+        self.assertTrue(memory_tight(low.format(total=1000, free=300)))  # 70% in use
+        self.assertFalse(memory_tight(low.format(total=1000, free=500)))  # 50%
+        self.assertTrue(memory_tight(low.format(total=0, free=0)))  # no swap: available alone
+        self.assertFalse(memory_tight("MemTotal: 10000000 kB\nMemAvailable: 5000000 kB\n"
+                                      "SwapTotal: 1000 kB\nSwapFree: 10 kB\n"))  # plenty available
 
     def test_memory_stalls(self):
         from natter.system import memory_stalls
@@ -124,6 +137,7 @@ class ScopeLimitsTest(unittest.TestCase):
                       mock.patch.object(system, "_told_oom_policy", False),
                       mock.patch.object(system, "in_sandbox", return_value=False),
                       mock.patch.object(system, "mem_total", return_value=16 * GiB),
+                      mock.patch.object(system, "swap_total", return_value=16 * GiB),
                       mock.patch.object(system, "own_cgroup", return_value=self.cgroup),
                       mock.patch.object(system, "_has_owner", return_value=True),
                       mock.patch.object(system.Gio, "bus_get_sync", return_value=self.bus),
@@ -143,7 +157,7 @@ class ScopeLimitsTest(unittest.TestCase):
         properties = dict(properties)
         self.assertEqual((unit, mode), (name, "fail"))
         self.assertEqual(properties["MemoryMax"], 6 * GiB)
-        self.assertEqual(properties["MemorySwapMax"], int(1.5 * GiB))
+        self.assertEqual(properties["MemorySwapMax"], 4 * GiB)  # one page's limit on 16 GB
         self.assertEqual(properties["OOMPolicy"], "continue")
         self.assertNotIn("MemoryHigh", properties)
         self.assertEqual(properties["Slice"], "app.slice")
@@ -171,8 +185,10 @@ class ScopeLimitsTest(unittest.TestCase):
     def test_a_launchers_unit_that_stops_all_of_natter_gets_no_limit(self):
         # KDE's app-…@….service, GNOME's and Ada's scopes: OOMPolicy=stop, theirs to change. A
         # MemoryMax there turned a page past it into all of Natter stopping (Ada, 22 Oct 2026).
+        # No swap cap either: the launcher's "max" stays as it is.
         self.assertFalse(self.system.limit_own_scope())
         self.assertEqual(self.bus.sent("SetUnitProperties"), [])
+        self.assertEqual((self.cgroup / "memory.swap.max").read_text().strip(), "max")
         said = self.out.getvalue()
         self.assertIn(f"{self.cgroup.name} has OOMPolicy=stop", said)
         self.assertIn("sets no memory limit on it; the guard ends a page that grows without end, alone", said)
@@ -195,10 +211,10 @@ class ScopeLimitsTest(unittest.TestCase):
         self.assertTrue(self.system.limit_own_scope())
         (unit, runtime, properties), = self.bus.sent("SetUnitProperties")
         self.assertEqual((unit, runtime), (self.cgroup.name, True))
-        self.assertEqual(properties, [("MemoryMax", 6 * GiB), ("MemorySwapMax", int(1.5 * GiB))])
+        self.assertEqual(properties, [("MemoryMax", 6 * GiB), ("MemorySwapMax", 4 * GiB)])
         self.assertTrue(self.system.limit_own_scope(accounts=2))
         self.assertEqual(self.bus.sent("SetUnitProperties")[-1][2],
-                         [("MemoryMax", int(7.5 * GiB)), ("MemorySwapMax", int(1.5 * GiB))])
+                         [("MemoryMax", int(7.5 * GiB)), ("MemorySwapMax", 4 * GiB)])
         self.assertEqual(self.out.getvalue(), "")
         self.assertTrue(self.system.pages_end_alone())
 
@@ -214,10 +230,10 @@ class ScopeLimitsTest(unittest.TestCase):
 
     def test_accounts_change_natters_own_scope(self):
         with mock.patch.object(self.system, "_made_scope", self.cgroup.name):
-            self.limits(6 * GiB, int(1.5 * GiB))  # as Natter made it
+            self.limits(6 * GiB, 4 * GiB)  # as Natter made it
             self.assertTrue(self.system.limit_own_scope(accounts=2))
         self.assertEqual(self.bus.sent("SetUnitProperties")[0][2],
-                         [("MemoryMax", int(7.5 * GiB)), ("MemorySwapMax", int(1.5 * GiB))])
+                         [("MemoryMax", int(7.5 * GiB)), ("MemorySwapMax", 4 * GiB)])
         self.assertEqual(self.bus.sent("GetUnit"), [])  # OOMPolicy=continue was set at the start
         self.assertEqual(self.out.getvalue(), "")
         with mock.patch.object(self.system, "_made_scope", self.cgroup.name):
@@ -274,7 +290,7 @@ class Page:
     def __init__(self, world, name, loaded_at):
         self.world, self.id, self.name = world, name, name
         self.ready, self.reloading, self.crashing, self.calling = True, False, False, False
-        self.replying = 0
+        self.replying, self.recording = 0, False
         self.loaded_at, self.notified_at = loaded_at, None
         self.fresh = []
 
@@ -282,10 +298,15 @@ class Page:
         self.fresh.append(self.world.clock.now)
         self.loaded_at = self.world.clock.now
         self.world.pages[self.name] = 900 * MiB
+        self.world.new_process(self.name)
+
+    def own_reload(self):
+        """WhatsApp loading itself again: a new load in the same web process."""
+        self.loaded_at = self.world.clock.now
 
 
 class Reclaimer:
-    available = True
+    possible = available = True
 
     def __init__(self):
         self.started = 0
@@ -300,6 +321,7 @@ class Reclaimer:
 class Window:
     def __init__(self):
         self.visible = True
+        self.loans = {}  # account id: its page's loan to a reply window (Window.lend_page)
 
     def get_visible(self):
         return self.visible
@@ -316,6 +338,7 @@ class World:
 
         self.module, self.clock = app_module, Clock()
         self.pages = {name: 1200 * MiB for name in accounts}
+        self.pids = {name: 4000 + i for i, name in enumerate(accounts)}  # each page's web process
         self.tight, self.swapped, self.held = False, 0, None
         self.out = io.StringIO()
 
@@ -326,6 +349,9 @@ class World:
             _fresh_pages_for_memory = Natter._fresh_pages_for_memory
             _memory_reason = Natter._memory_reason
             _memory_wait = Natter._memory_wait
+            _growth_ceiling = Natter._growth_ceiling
+            _measure_idle = Natter._measure_idle
+            _pages_busy = Natter._pages_busy
             _reclaim = Natter._reclaim
             _reclaim_wait = Natter._reclaim_wait
             _check_memory = Natter._check_memory
@@ -337,6 +363,7 @@ class World:
         app.settings = {"light_background": True}
         app._reclaim_timer, app._hidden_at, app._call_ended_at = 0, None, None
         app._call_held, app._after_call, app._memory_waiting = {}, {}, None
+        app._seen, app._idle, app._grown_since, app._fresh_at = {}, {}, None, None
         app.call_sound = types.SimpleNamespace(start=lambda: None, stop=lambda: None)
         app.voice_pause = types.SimpleNamespace(call_started=lambda: None, call_over=lambda: None)
         for name in ("_refresh_tray", "_write_menu_chats", "_check_media", "_apply_page_sound"):
@@ -346,7 +373,7 @@ class World:
         self.patches = [mock.patch.object(app_module.time, "monotonic", self.clock),
                         mock.patch.object(app_module, "GLib", self.timers),
                         mock.patch.object(app_module, "page_sizes",
-                                          lambda: {4000 + i: size for i, size in enumerate(self.pages.values())}),
+                                          lambda: {self.pids[name]: size for name, size in self.pages.items()}),
                         mock.patch.object(app_module, "footprint", lambda: sum(self.pages.values()) + 300 * MiB),
                         mock.patch.object(app_module, "own_swap", lambda: self.swapped),
                         mock.patch.object(app_module, "memory_tight", lambda: self.tight),
@@ -363,6 +390,13 @@ class World:
 
     def account(self, name="Main"):
         return next(account for account in self.app.accounts if account.name == name)
+
+    def new_process(self, name):
+        self.pids[name] = max(self.pids.values()) + 1
+
+    def idle(self, name="Main"):
+        """The idle size measured for `name`'s web process, None while it isn't."""
+        return self.app._idle.get(self.pids[name])
 
     def hide(self):
         self.app.window.visible = False
@@ -519,7 +553,7 @@ class HiddenFreshPageTest(unittest.TestCase):
             world.pages["Main"] = (MEMORY_LIMIT + 200) * MiB
             world.run(1)
             self.assertEqual(world.fresh(), 1)
-            self.assertIn("a fresh page for Main: the computer is short of memory, and a page holds 1736 MB",
+            self.assertIn("a fresh page for Main: the computer is short of memory, and a page holds 2248 MB",
                           world.out.getvalue())
 
     def test_swap_alone_is_no_shortage(self):
@@ -628,6 +662,290 @@ class HiddenFreshPageTest(unittest.TestCase):
             self.assertEqual(world.fresh(), 0)
 
 
+class GrownPageTest(unittest.TestCase):
+    """A hidden page that has grown big and stayed so gets a fresh one (app.py _memory_reason,
+    "grown"): past GROWN_FLOOR, or GROWN_SHARE times its idle size when that's more, for
+    GROWN_FOR, under every gate the other reasons have. In three days of October 2026 no page
+    was ever reloaded for memory; the desktop closed Natter and the kernel ended two pages."""
+
+    def test_the_ceiling_with_and_without_an_idle_size(self):
+        with World() as world:
+            app = world.app
+            self.assertEqual(app._growth_ceiling(4000), GROWN_FLOOR * MiB)  # not measured yet: the floor
+            app._idle = {4000: 1200 * MiB}
+            self.assertEqual(app._growth_ceiling(4000), GROWN_FLOOR * MiB)  # 1.5 x 1200 is under it
+            app._idle = {4000: 1644 * MiB}  # the Den's page: 1137 MB resident, 507 MB swapped
+            self.assertEqual(app._growth_ceiling(4000), int(1644 * MiB * GROWN_SHARE))
+            self.assertEqual(app._growth_ceiling(4001), GROWN_FLOOR * MiB)  # another process: its own
+            self.assertEqual(GROWN_SHARE, 1.5)
+            self.assertEqual(GROWN_FLOOR, 2048)
+
+    def test_the_idle_size_is_measured_at_the_first_quiet_look_after_the_load(self):
+        with World(loaded_hours_ago=0) as world:
+            main = world.account()
+            world.run(IDLE_AFTER_LOAD // 60 - 1)
+            self.assertIsNone(world.idle())  # too soon after the load
+            main.notified_at = world.clock.now  # a message: not quiet
+            world.run(QUIET_BEFORE_FRESH // 60 - 1)
+            self.assertIsNone(world.idle())
+            world.pages["Main"] = 1300 * MiB
+            world.run(2)
+            self.assertEqual(world.idle(), 1300 * MiB)
+            self.assertIn("natter: memory: idle, a page holds 1300 MB; hidden, it may grow to 2048 MB",
+                          world.out.getvalue())
+            world.pages["Main"] = 1900 * MiB
+            world.run(60)
+            self.assertEqual(world.idle(), 1300 * MiB)  # once per process
+            main.fresh_page()  # a new process: measured afresh
+            world.pages["Main"] = 1500 * MiB
+            world.run(IDLE_AFTER_LOAD // 60 + 1)
+            self.assertEqual(world.idle(), 1500 * MiB)
+            self.assertEqual(world.app._growth_ceiling(world.pids["Main"]), 2250 * MiB)
+
+    def test_never_measured_after_the_first_hour_of_a_process(self):
+        # Busy groups: a notification every few minutes keeps the page from ever being quiet.
+        # Hours later it has crept; its size then must not become its idle size.
+        with World(loaded_hours_ago=0) as world:
+            main = world.account()
+            for _ in range(IDLE_WITHIN // 60 + 30):
+                main.notified_at = world.clock.now
+                world.run(1)
+            self.assertIsNone(world.idle())
+            world.pages["Main"] = 2400 * MiB
+            world.run(QUIET_BEFORE_FRESH // 60 + 60)
+            self.assertIsNone(world.idle())  # the floor alone
+            self.assertEqual(world.app._growth_ceiling(world.pids["Main"]), GROWN_FLOOR * MiB)
+
+    def test_whatsapps_own_reload_measures_nothing_again(self):
+        # It stays in the same web process, with what that process kept.
+        with World(loaded_hours_ago=0) as world:
+            main = world.account()
+            world.run(IDLE_AFTER_LOAD // 60 + 1)
+            self.assertEqual(world.idle(), 1200 * MiB)
+            world.run(3 * 60)
+            world.pages["Main"] = 2000 * MiB
+            main.own_reload()
+            world.run(IDLE_AFTER_LOAD // 60 + 5)
+            self.assertEqual(world.idle(), 1200 * MiB)
+            # Nor one never measured: its first hour is long gone.
+            world.app._idle.clear()
+            world.run(IDLE_AFTER_LOAD // 60 + 5)
+            self.assertIsNone(world.idle())
+
+    def test_another_accounts_fresh_page_leaves_this_ones_idle_size(self):
+        with World(accounts=("Main", "Work"), loaded_hours_ago=0) as world:
+            world.run(IDLE_AFTER_LOAD // 60 + 1)
+            self.assertEqual((world.idle("Main"), world.idle("Work")), (1200 * MiB, 1200 * MiB))
+            world.run(5 * 60)
+            world.pages["Work"] = 2100 * MiB  # Work's page has crept
+            world.account("Main").fresh_page()  # Main, the other one, gets a fresh page
+            world.run(IDLE_AFTER_LOAD // 60 + 1)
+            self.assertEqual(world.idle("Main"), 900 * MiB)  # its new process, measured
+            self.assertEqual(world.idle("Work"), 1200 * MiB)  # not raised to what it holds now
+            self.assertEqual(world.app._growth_ceiling(world.pids["Work"]), GROWN_FLOOR * MiB)
+            world.hide()
+            world.run(GROWN_FOR // 60 + 2)
+            self.assertEqual(len(world.account("Work").fresh), 1)  # still reloaded for its growth
+
+    def test_not_measured_during_a_call_a_reply_a_recording_or_a_load(self):
+        for state in ("call", "reply", "recording", "loading", "call ended"):
+            with self.subTest(state), World() as world:
+                main = world.account()
+                world.run(IDLE_AFTER_LOAD // 60 - 1)  # its process seen, not measured yet
+                if state == "call":
+                    main.calling = True
+                elif state == "reply":
+                    main.replying = 1
+                elif state == "recording":
+                    main.recording = True
+                elif state == "loading":
+                    main.ready = False
+                else:
+                    world.app._call_ended_at = world.clock.now
+                world.run(3)
+                self.assertIsNone(world.idle(), state)
+                main.calling, main.replying, main.recording, main.ready = False, 0, False, True
+                world.run(QUIET_BEFORE_FRESH // 60 + 1)
+                self.assertIsNotNone(world.idle(), state)
+
+    def grown(self, world, size=2100 * MiB):
+        """The idle size measured (1200 MB), then the page grown to `size` and the window hidden."""
+        world.run(IDLE_AFTER_LOAD // 60 + 1)
+        self.assertEqual(world.idle(), 1200 * MiB)
+        world.pages["Main"] = size
+        world.hide()
+
+    def test_a_grown_hidden_page_gets_a_fresh_one_after_half_an_hour(self):
+        with World() as world:
+            self.grown(world)
+            world.run(GROWN_FOR // 60)  # the growth was first seen a minute after the hide
+            self.assertEqual(world.fresh(), 0)
+            said = world.out.getvalue()
+            self.assertNotIn("a fresh page", said)
+            world.run(1)
+            self.assertEqual(world.fresh(), 1)
+            said = world.out.getvalue()
+            self.assertIn("natter: a fresh page for Main: a page grew to 2100 MB while hidden, past 2048 MB for 30 min "
+                          "(Natter Den holds 2400 MB, 0 MB of it in swap)", said)
+            self.assertIn("natter: page: reloaded because it grew to 2100 MB while hidden (idle 1200 MB)", said)
+            world.run(6 * 60)
+            self.assertEqual(world.fresh(), 1)  # the fresh page is small again
+
+    def test_without_an_idle_size_the_floor_alone(self):
+        # Never quiet long enough to be measured: 2 GB is the ceiling, and the log says so.
+        with World() as world:
+            world.app._measure_idle = lambda now: None
+            world.pages["Main"] = 2100 * MiB
+            world.hide()
+            world.run(GROWN_FOR // 60 + 1)
+            self.assertEqual(world.fresh(), 1)
+            self.assertEqual(world.app._idle, {})
+            self.assertIn("natter: page: reloaded because it grew to 2100 MB while hidden "
+                          f"(idle not measured, floor {GROWN_FLOOR} MB)", world.out.getvalue())
+
+    def test_a_page_under_the_ceiling_is_left_alone(self):
+        with World() as world:
+            self.grown(world, size=2000 * MiB)
+            world.run(8 * 60)
+            self.assertEqual(world.fresh(), 0)
+            self.assertNotIn("grew to", world.out.getvalue())
+
+    def test_a_bigger_idle_size_raises_the_ceiling(self):
+        with World() as world:
+            world.pages["Main"] = 1700 * MiB
+            world.run(IDLE_AFTER_LOAD // 60 + 1)
+            self.assertEqual(world.idle(), 1700 * MiB)
+            world.pages["Main"] = 2400 * MiB  # under 1.5 x 1700
+            world.hide()
+            world.run(4 * 60)
+            self.assertEqual(world.fresh(), 0)
+            world.pages["Main"] = 2600 * MiB
+            world.run(GROWN_FOR // 60 + 2)
+            self.assertEqual(world.fresh(), 1)
+            self.assertIn("past 2550 MB for 30 min", world.out.getvalue())
+
+    def test_growth_counts_only_while_hidden(self):
+        with World() as world:
+            self.grown(world)
+            world.run(20)
+            world.show()
+            world.run(20)
+            self.assertEqual(world.fresh(), 0)
+            world.hide()  # hidden again: half an hour from now
+            world.run(GROWN_FOR // 60)
+            self.assertEqual(world.fresh(), 0)
+            world.run(2)
+            self.assertEqual(world.fresh(), 1)
+
+    def test_every_gate(self):
+        for state in ("call", "call ended", "reply", "recording", "loading", "notified", "crashing"):
+            with self.subTest(state), World() as world:
+                self.grown(world)
+                main = world.account()
+                world.run(GROWN_FOR // 60 - 1)
+                self.assertEqual(world.fresh(), 0)
+                if state == "call":
+                    main.calling = True
+                    world.app._on_page_call(main, True)
+                elif state == "call ended":
+                    main.calling = True
+                    world.app._on_page_call(main, True)
+                    main.calling = False
+                    world.app._on_page_call(main, False)
+                elif state == "reply":
+                    main.replying = 1
+                elif state == "recording":
+                    main.recording = True
+                elif state == "loading":
+                    main.ready = False
+                elif state == "crashing":
+                    main.crashing = True
+                elif state == "notified":
+                    main.notified_at = world.clock.now
+                world.run(3)
+                self.assertEqual(world.fresh(), 0, state)
+                if state == "call":
+                    main.calling = False
+                    world.app._on_page_call(main, False)
+                main.replying, main.recording, main.ready, main.crashing = 0, False, True, False
+                world.run(QUIET_BEFORE_FRESH // 60 + 1)
+                self.assertEqual(world.fresh(), 1, state)
+                if state in ("call", "call ended"):  # nothing is decided during a call, and then it waits
+                    self.assertIn("not yet: a call ended a moment ago", world.out.getvalue())
+                elif state == "recording":
+                    self.assertIn("not yet: a voice message is being recorded", world.out.getvalue())
+
+    def test_never_within_fresh_again_of_the_last_load(self):
+        with World(loaded_hours_ago=1) as world:
+            self.grown(world)
+            world.run(2 * 60)
+            self.assertEqual(world.fresh(), 0)
+            self.assertIn("could do with a fresh page (a page grew to 2100 MB while hidden", world.out.getvalue())
+            self.assertIn("not yet: its page loaded", world.out.getvalue())
+            world.run(60 + 2)
+            self.assertEqual(world.fresh(), 1)
+
+    def test_never_while_shown(self):
+        with World() as world:
+            world.run(1)
+            world.pages["Main"] = 3000 * MiB
+            world.run(24 * 60)
+            self.assertEqual(world.fresh(), 0)
+
+    def test_several_accounts_one_page_a_minute(self):
+        with World(accounts=("Work", "Main")) as world:
+            world.account("Main").loaded_at -= 3600
+            world.run(IDLE_AFTER_LOAD // 60 + 1)  # both idle sizes measured, 1200 MB
+            world.pages["Work"] = world.pages["Main"] = 2100 * MiB
+            world.hide()
+            world.run(GROWN_FOR // 60 + 1)
+            self.assertEqual((len(world.account("Main").fresh), len(world.account("Work").fresh)), (1, 0))
+            world.run(1)
+            self.assertEqual((len(world.account("Main").fresh), len(world.account("Work").fresh)), (1, 1))
+            world.run(6 * 60)
+            self.assertEqual(world.fresh(), 2)
+
+    def test_never_while_the_page_is_lent(self):
+        # A reply window has the page (loan.py): a fresh page would pull it from under the reply.
+        with World() as world:
+            self.grown(world)
+            world.app.window.loans["Main"] = object()
+            world.run(GROWN_FOR // 60 + 5)
+            self.assertEqual(world.fresh(), 0)
+            self.assertIn("not yet: its page is lent to a reply window", world.out.getvalue())
+            world.app.window.loans.clear()
+            world.run(1)
+            self.assertEqual(world.fresh(), 1)
+
+    def test_one_page_a_minute_whoever_looks(self):
+        # _reclaim and _thawed look too, between the minute looks: still one page a minute.
+        with World(accounts=("Work", "Main")) as world:
+            world.account("Main").loaded_at -= 3600
+            world.run(IDLE_AFTER_LOAD // 60 + 1)  # both idle sizes measured, 1200 MB
+            world.pages["Work"] = world.pages["Main"] = 2100 * MiB
+            world.hide()
+            world.run(GROWN_FOR // 60 + 1)
+            self.assertEqual(world.fresh(), 1)
+            world.clock.minutes(0.5)
+            self.assertFalse(world.app._fresh_pages_for_memory())
+            self.assertEqual(world.fresh(), 1)
+            self.assertIn("not yet: another page was made fresh a moment ago", world.out.getvalue())
+            world.clock.minutes(0.5)
+            self.assertTrue(world.app._fresh_pages_for_memory())
+            self.assertEqual(world.fresh(), 2)
+
+    def test_the_fresh_page_is_the_one_that_reopens_the_chat(self):
+        import inspect
+
+        from natter.account import Account
+        from natter.app import Natter
+
+        # The same path as every other reason (Account.fresh_page), which remembers the chat that
+        # was open and opens it again once the new page is up.
+        self.assertIn("account.fresh_page(f\"of its memory: {why}\")", inspect.getsource(Natter._fresh_pages_for_memory))
+        self.assertIn("self._reopen_after_load()", inspect.getsource(Account.fresh_page))
+
+
 class ReclaimerToSwapTest(unittest.TestCase):
     """The Reclaimer, run on a stand-in unit until it stops at its own budget, then Natter's next
     looks: no fresh page (it made one each time before October 2026)."""
@@ -732,6 +1050,16 @@ class KillThresholdTest(unittest.TestCase):
                 self.assertGreaterEqual(fraction, MEMORY_KILL)
                 self.assertGreaterEqual(fraction * limit * MiB, hard + KILL_ROOM * MiB, (total, limit))
         self.assertEqual(kill_threshold(4096, 8 * GiB), MEMORY_KILL)  # already past it: as it was
+
+    def test_a_bigger_limit_rescales_the_kill_not_moves_it(self):
+        # MEMORY_LIMIT went from 1536 to 2048 MB: the share comes down, so the kill itself stays
+        # where it was, about 6.5 GB on the Den's 15.3 GB (KILL_ROOM above the guard in a call).
+        from natter.app import kill_threshold
+
+        total = int(15.3 * GiB)
+        self.assertLess(kill_threshold(2048, total), kill_threshold(1536, total))
+        self.assertAlmostEqual(kill_threshold(2048, total) * 2048, kill_threshold(1536, total) * 1536, places=3)
+        self.assertTrue(6.2 * GiB < kill_threshold(MEMORY_LIMIT, total) * MEMORY_LIMIT * MiB < 6.6 * GiB)
 
 class CloseWhileHiddenTest(unittest.TestCase):
     def test_a_hidden_window_asked_to_close_quits(self):

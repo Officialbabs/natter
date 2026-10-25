@@ -49,6 +49,13 @@ class FakeProc:
         status.write_text(f"Name:\t{comm}\nPPid:\t{parent}\nRssAnon:\t{anon_mb * 1024} kB\n"
                           f"RssFile:\t1000 kB\nVmSwap:\t{swap_mb * 1024} kB\n")
 
+    def fdinfo(self, pid, files):
+        """The process's open files' fdinfo: {fd: text}."""
+        folder = self.root / str(pid) / "fdinfo"
+        folder.mkdir(parents=True, exist_ok=True)
+        for fd, text in files.items():
+            (folder / fd).write_text(text)
+
     def threads(self, pid, ticks):
         """Threads of `pid`: {tid: (name, CPU ticks)}."""
         for tid, (name, used) in ticks.items():
@@ -90,15 +97,30 @@ class LimitsTest(unittest.TestCase):
         self.assertEqual(memguard.page_limit(0), int(2.5 * GiB))
 
     def test_scope_limits(self):
-        swap = int(1.5 * GiB)
-        self.assertEqual(memguard.scope_limits(4 * GiB, 1), (int(4 * GiB * 0.6), swap))
-        self.assertEqual(memguard.scope_limits(8 * GiB, 1), (int(4.5 * GiB), swap))
-        self.assertEqual(memguard.scope_limits(8 * GiB, 2), (int(8 * GiB * 0.6), swap))
-        self.assertEqual(memguard.scope_limits(16 * GiB, 1), (6 * GiB, swap))
-        self.assertEqual(memguard.scope_limits(16 * GiB, 2), (int(7.5 * GiB), swap))
-        self.assertEqual(memguard.scope_limits(64 * GiB, 1), (8 * GiB, swap))
-        self.assertEqual(memguard.scope_limits(64 * GiB, 3), (11 * GiB, swap))
+        # The swap cap is one page's limit, bounds and all: a fixed 1.5 GiB sat full with the
+        # page idle (24 Oct 2026). The guard counts what's swapped, so the kernel's cap needn't.
+        self.assertEqual(memguard.scope_limits(4 * GiB, 1), (int(4 * GiB * 0.6), 2 * GiB))
+        self.assertEqual(memguard.scope_limits(8 * GiB, 1), (int(4.5 * GiB), int(2.5 * GiB)))
+        self.assertEqual(memguard.scope_limits(8 * GiB, 2), (int(8 * GiB * 0.6), int(2.5 * GiB)))
+        self.assertEqual(memguard.scope_limits(16 * GiB, 1), (6 * GiB, 4 * GiB))
+        self.assertEqual(memguard.scope_limits(16 * GiB, 2), (int(7.5 * GiB), 4 * GiB))
+        self.assertEqual(memguard.scope_limits(64 * GiB, 1), (8 * GiB, 6 * GiB))
+        self.assertEqual(memguard.scope_limits(64 * GiB, 3), (11 * GiB, 6 * GiB))
+        self.assertEqual(memguard.scope_limits(0, 1), (int(2.5 * GiB) + int(1.5 * GiB) + GiB // 2, int(2.5 * GiB)))
         self.assertEqual(memguard.scope_limits(16 * GiB, 0), memguard.scope_limits(16 * GiB, 1))
+        for total in (4 * GiB, 8 * GiB, int(14.8 * GiB), 64 * GiB, 0):
+            self.assertEqual(memguard.scope_limits(total, 1)[1], memguard.page_limit(total))
+
+    def test_scope_swap_is_at_most_half_the_computers(self):
+        # A 2 GB swap file on 8 GB: the unit may take 1 GB of it, not all of it (page_limit, 2.5 GiB).
+        self.assertEqual(memguard.scope_limits(8 * GiB, 1, 2 * GiB), (int(4.5 * GiB), GiB))
+        self.assertEqual(memguard.scope_limits(4 * GiB, 1, 2 * GiB)[1], GiB)
+        # Plenty of swap, or none known: one page's limit.
+        self.assertEqual(memguard.scope_limits(16 * GiB, 1, 16 * GiB), (6 * GiB, 4 * GiB))
+        self.assertEqual(memguard.scope_limits(16 * GiB, 1, 0), (6 * GiB, 4 * GiB))
+        self.assertEqual(memguard.swap_total("MemTotal: 100 kB\nSwapTotal: 2097152 kB\n"), 2 * GiB)
+        self.assertEqual(memguard.swap_total("MemTotal: 100 kB\nSwapTotal: 0 kB\n"), 0)
+        self.assertEqual(memguard.swap_total(""), 0)
 
     def test_the_guard_comes_first(self):
         # Even in a call, the most the guard lets a page hold fits under the unit's limit, swap and
@@ -117,7 +139,7 @@ class LimitsTest(unittest.TestCase):
         for total in (int(7.6 * GiB), 8 * GiB, int(14.8 * GiB), 16 * GiB, 64 * GiB):
             limit = memguard.page_limit(total)
             self.assertGreater(memguard.page_ceiling(total), limit + CALL_ROOM + CALL_MARGIN, total)
-        self.assertEqual(memguard.page_ceiling(4 * GiB), int(4 * GiB * 0.6) + int(1.5 * GiB) - GiB)
+        self.assertEqual(memguard.page_ceiling(4 * GiB), int(4 * GiB * 0.6) + 2 * GiB - GiB)
         guard = memguard.MemoryGuard(2 * GiB, ceiling=memguard.page_ceiling(4 * GiB), idle_add=lambda *a: None)
         self.assertEqual(guard.limits(False), (2 * GiB, memguard.page_ceiling(4 * GiB)))
         self.assertEqual(guard.limits(True), (memguard.page_ceiling(4 * GiB),) * 2)
@@ -135,6 +157,35 @@ class LimitsTest(unittest.TestCase):
     def test_mem_total(self):
         self.assertEqual(memguard.mem_total("MemTotal:       15551240 kB\nMemFree: 1 kB\n"), 15551240 * 1024)
         self.assertEqual(memguard.mem_total(""), 0)
+
+
+class GemTest(unittest.TestCase):
+    """What a page owns on the GPU, by its DRM files' fdinfo (gem_held): i915 writes the totals
+    in bytes, KiB or MiB, once per client however many descriptors it has, and stolen memory
+    under a key of its own."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.proc = FakeProc(Path(self.tmp.name))
+        self.proc.page(3000, 3001, 3002, anon_mb=1200)
+
+    def test_each_client_once_in_any_unit(self):
+        self.proc.fdinfo(3002, {
+            "5": "drm-driver:\ti915\ndrm-client-id:\t30\ndrm-total-system0:\t1048576\ndrm-total-stolen-system0:\t4096\n",
+            "6": "drm-driver:\ti915\ndrm-client-id:\t30\ndrm-total-system0:\t1048576\n",
+            "8": "drm-driver:\ti915\ndrm-client-id:\t31\ndrm-total-system0:\t512 MiB\n",
+            "9": "drm-driver:\tamdgpu\ndrm-client-id:\t40\ndrm-total-system:\t2048 KiB\n",
+            "10": "pos:\t0\nflags:\t02\nmnt_id:\t41\n",
+            "11": "drm-driver:\ti915\ndrm-client-id:\t32\ndrm-total-system0:\tlots\n",
+        })
+        self.assertEqual(memguard.gem_held(3002, self.proc.root), MiB + 512 * MiB + 2 * MiB)
+
+    def test_nothing_to_read(self):
+        self.assertEqual(memguard.gem_held(3002, self.proc.root), 0)  # no fdinfo at all
+        self.proc.fdinfo(3002, {"5": "pos:\t0\n"})
+        self.assertEqual(memguard.gem_held(3002, self.proc.root), 0)
+        self.assertEqual(memguard.gem_held(99999, self.proc.root), 0)
 
 
 class GuardBase(unittest.TestCase):
@@ -431,6 +482,44 @@ class GrowthTest(GuardBase):
         self.guard.check(now=CALL_GRACE + 3)  # the call and the guard's own grace over: told now
         self.assertIn("natter: memory: page 3002 holds 2100 MB", self.out.getvalue())
         self.assertIn("largest regions: 703 MB", self.out.getvalue())
+
+    def test_the_step_line_says_what_the_size_leaves_out(self):
+        # The page's GPU buffers (fdinfo) and the unit's shmem and zswap pool (charge): seen on
+        # 24 Oct 2026 as 542 MB of GEM objects, in no RssAnon and under no limit.
+        (self.proc.root / "3002" / "smaps").write_text(SMAPS)
+        self.proc.fdinfo(3002, {"5": "drm-client-id:\t30\ndrm-total-system0:\t542 MiB\ndrm-total-stolen-system0:\t9 MiB\n",
+                                "6": "drm-client-id:\t30\ndrm-total-system0:\t542 MiB\n",  # the same client, dup'd
+                                "7": "pos:\t0\nflags:\t02\n"})
+        guard = self.make(charge=lambda: {"shmem": 400 * MiB, "zswap": 100 * MiB})
+        self.proc.set(3002, anon_mb=1600)
+        guard.check(now=0)
+        self.proc.set(3002, anon_mb=2100)
+        guard.check(now=2)
+        self.assertIn("natter: memory: page 3002 holds 2100 MB, growing 250 MB/s; largest regions: 703 MB in 703 MB "
+                      "(1.5 MiB multiple, no reservation); 450 MB in 512 MB (not a 1.5 MiB multiple, in a 64 GiB "
+                      "reservation); 100 MB in 100 MB (not a 1.5 MiB multiple, no reservation); besides, GPU buffers "
+                      "542 MB, the unit's shmem 400 MB, zswap 100 MB\n", self.out.getvalue())
+        self.assertEqual(self.killed, [])
+
+    def test_the_step_line_without_anything_beside(self):
+        (self.proc.root / "3002" / "smaps").write_text(SMAPS)
+        guard = self.make(charge=lambda: {"shmem": 0, "zswap": 0})
+        self.proc.set(3002, anon_mb=1600)
+        guard.check(now=0)
+        self.proc.set(3002, anon_mb=2100)
+        guard.check(now=2)
+        self.assertNotIn("besides", self.out.getvalue())
+        self.assertIn("no reservation)\n", self.out.getvalue())
+
+    def test_gpu_buffers_and_the_charge_never_count_towards_ending_a_page(self):
+        self.proc.fdinfo(3002, {"5": "drm-client-id:\t30\ndrm-total-system0:\t2147483648\n"})  # 2 GiB, in bytes
+        guard = self.make(charge=lambda: {"shmem": 3 * GiB, "zswap": GiB})
+        self.assertEqual(guard.limits(False), (3 * GiB, 3 * GiB + CALL_ROOM))
+        self.proc.set(3002, anon_mb=3 * 1024 - 1)  # just under its limit, with 2 GiB of GEM beside
+        for now in (0, 2, 4):
+            self.assertEqual(guard.check(now=now), [])
+        self.assertEqual(self.killed, [])
+        self.assertEqual(memguard.gem_held(3002, self.proc.root), 2 * GiB)
 
     def test_an_idle_page_loading_is_not_news(self):
         self.proc.set(3002, anon_mb=30)

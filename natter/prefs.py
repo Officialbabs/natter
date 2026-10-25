@@ -396,9 +396,16 @@ class Preferences(Adw.PreferencesDialog):
             command = f"flatpak run {APP_ID} --background" if in_sandbox() else "natter --background"
             login.set_subtitle(f"Your desktop may not start apps by itself: add “exec {command}” to its config")
         running.add(login)
-        if self.app.reclaimer.available:
-            running.add(self._switch("light_background", "Use Less Memory in the Background",
-                                     "While the window is closed, memory that isn't in use goes back to the system"))
+        if self.app.reclaimer.possible:
+            # Shown only where giving memory back is possible at all; greyed, with the reason,
+            # while it would do nothing (swap full already), like the tray switch below.
+            lighter = self._switch("light_background", "Use Less Memory in the Background",
+                                   "While the window is closed, memory that isn't in use goes back to the system")
+            why_not = self.app.reclaimer.why_not()
+            if why_not:
+                lighter.set_sensitive(False)
+                lighter.set_subtitle(why_not)
+            running.add(lighter)
         tray = self._switch("tray_icon", "Tray Icon", "Shows the unread count; click it to open the window")
         if not tray_host:
             tray.set_sensitive(False)

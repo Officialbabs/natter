@@ -51,11 +51,19 @@ class ChatIdTest(unittest.TestCase):
 class MemoryTest(unittest.TestCase):
     def test_defaults(self):
         self.assertEqual(memory_pressure(None, None), (MEMORY_LIMIT, *MEMORY_THRESHOLDS))
-        self.assertEqual(memory_pressure("", ""), (1536, 0.55, 0.8))
+        self.assertEqual(memory_pressure("", ""), (2048, 0.65, 0.85))
+
+    def test_the_lines_sit_above_an_idle_page(self):
+        # At 1536 MB and (0.55, 0.8) the strict line, 1229 MB, lay under an idle page's 1260 MB
+        # resident, so WebKit's full release ran at every 30 s poll all day (24 Oct 2026).
+        limit, conservative, strict = memory_pressure(None, None)
+        self.assertEqual((limit, conservative, strict), (2048, 0.65, 0.85))
+        self.assertGreater(limit * conservative, 1300)
+        self.assertGreater(limit * strict, 1700)
 
     def test_overrides(self):
-        self.assertEqual(memory_pressure("2048", None), (2048, 0.55, 0.8))
-        self.assertEqual(memory_pressure(None, "0.4,0.7"), (1536, 0.4, 0.7))
+        self.assertEqual(memory_pressure("1536", None), (1536, 0.65, 0.85))
+        self.assertEqual(memory_pressure(None, "0.4,0.7"), (2048, 0.4, 0.7))
         self.assertEqual(memory_pressure("1024", " 0.2 , 0.3 "), (1024, 0.2, 0.3))
 
     def test_zero_keeps_webkit_defaults(self):
@@ -63,7 +71,7 @@ class MemoryTest(unittest.TestCase):
         self.assertIsNone(memory_pressure("-5", None))
 
     def test_nonsense_falls_back(self):
-        self.assertEqual(memory_pressure("lots", None), (1536, 0.55, 0.8))
+        self.assertEqual(memory_pressure("lots", None), (2048, 0.65, 0.85))
         for thresholds in ("0.8,0.55", "0.5", "0.5,0.6,0.7", "0,0.5", "0.5,1", "a,b", "0.5,0.5"):
             self.assertEqual(memory_pressure(None, thresholds)[1:], MEMORY_THRESHOLDS, thresholds)
 

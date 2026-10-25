@@ -27,7 +27,7 @@ from gi.repository import Gio, GLib
 
 from . import APP_ID, NAME
 from .distro import GST_PYTHON, MEDIA, install_hint
-from .memguard import mem_total, scope_limits
+from .memguard import mem_total, scope_limits, swap_total
 
 SYSTEMD = "org.freedesktop.systemd1"
 PORTAL = "org.freedesktop.portal.Desktop"
@@ -308,7 +308,7 @@ def limit_own_scope(accounts: int = 1) -> bool:
                   f"one page there would stop all of {NAME}, so {NAME} sets no memory limit on it; the guard "
                   "ends a page that grows without end, alone", flush=True)
         return False
-    memory_max, swap_max = scope_limits(mem_total(), accounts)
+    memory_max, swap_max = scope_limits(mem_total(), accounts, swap_total())
     if launcher:
         if _launcher_limits is None:  # read before Natter set anything of its own
             _launcher_limits = (_cgroup_limit(cgroup, "memory.max"), _cgroup_limit(cgroup, "memory.swap.max"))
@@ -347,7 +347,7 @@ def move_to_own_scope(timeout: float = 0.5, accounts: int = 1) -> Optional[str]:
         return None
     pid = os.getpid()
     name = scope_name(pid)
-    memory_max, swap_max = scope_limits(mem_total(), accounts)
+    memory_max, swap_max = scope_limits(mem_total(), accounts, swap_total())
     properties = [
         ("PIDs", GLib.Variant("au", [pid])),
         ("Description", GLib.Variant("s", NAME)),
@@ -415,22 +415,40 @@ def can_reclaim(cgroup: Optional[Path], swaps: str, zswap: str) -> bool:
     return _read(cgroup / "memory.swap.max").strip() != "0" and cheap_swap(swaps, zswap)
 
 
+def memory_stat(cgroup: Optional[Path], *names: str) -> dict[str, int]:
+    """The named counts of a unit's memory.stat, in bytes, each 0 when it isn't there."""
+    found = dict.fromkeys(names, 0)
+    for line in (_read(cgroup / "memory.stat") if cgroup else "").splitlines():
+        name, _, value = line.partition(" ")
+        if name in found and value.strip().isdigit():
+            found[name] = int(value)
+    return found
+
+
+def unit_charge(cgroup: Optional[Path] = None) -> dict[str, int]:
+    """What the kernel charges Natter's unit beside its pages' private memory, in bytes: `shmem`,
+    shared memory, which is where WebKit's GPU buffers live on Intel (the i915 driver backs them
+    with shmem: 542 MB of a page's on 24 Oct 2026), and `zswap`, the pool its compressed swap
+    takes. No process's RssAnon or VmSwap has either, so no limit of WebKit's or the guard's
+    counts them, and nothing here does: they're reported, no more. Zeros when unreadable."""
+    return memory_stat(cgroup or own_cgroup(), "shmem", "zswap")
+
+
 def footprint(cgroup: Optional[Path] = None) -> int:
     """Bytes Natter's unit really holds: its private memory (anon) plus what's been swapped
-    out, not the file cache the kernel can drop whenever it likes. 0 when it can't be read."""
+    out, and its shared memory (unit_charge's shmem, the GPU's buffers), not the file cache the
+    kernel can drop whenever it likes. Not the zswap pool: what's in it is swapped already, and
+    counted so (memory.swap.current); the step lines report the pool on its own. For the log
+    only. 0 when it can't be read."""
     cgroup = cgroup or own_cgroup()
     if cgroup is None:
         return 0
-    anon = 0
-    for line in _read(cgroup / "memory.stat").splitlines():
-        if line.startswith("anon "):
-            anon = int(line.split()[1])
-            break
+    anon = memory_stat(cgroup, "anon")["anon"]
     try:
         swapped = int(_read(cgroup / "memory.swap.current") or 0)
     except ValueError:
         swapped = 0
-    return anon + swapped
+    return anon + swapped + unit_charge(cgroup)["shmem"]
 
 
 def memory_events(cgroup: Optional[Path] = None) -> dict[str, int]:
@@ -448,18 +466,19 @@ def memory_events(cgroup: Optional[Path] = None) -> dict[str, int]:
 
 def memory_tight(meminfo: Optional[str] = None) -> bool:
     """Whether the whole computer is short of memory: under a tenth of it available, and swap
-    (if any) all but full. Some desktops ask apps to close then; Natter, hidden, has no
-    window to close, so it answers by giving back what it can (a fresh page)."""
+    (if any) past SWAP_SHARE in use, the Reclaimer's own line. Some desktops ask apps to close
+    then; Natter, hidden, has no window to close, so it answers by giving back what it can (a
+    fresh page)."""
     values = {}
     for line in (meminfo if meminfo is not None else _read("/proc/meminfo")).splitlines():
         name, _, rest = line.partition(":")
         if rest.split():
             values[name] = int(rest.split()[0])
     total, available = values.get("MemTotal", 0), values.get("MemAvailable", 0)
-    swap, swap_free = values.get("SwapTotal", 0), values.get("SwapFree", 0)
+    swap = values.get("SwapTotal", 0)
     if not total:
         return False
-    return available < total / 10 and (swap == 0 or swap_free < swap * 0.15)
+    return available < total / 10 and (swap == 0 or swap_share(meminfo) > SWAP_SHARE)
 
 
 # Swap is for what's cold and will be wanted again. WhatsApp's leaked heap never is: parked in
@@ -519,9 +538,12 @@ class Reclaimer:
     arrive.
 
     Pages WhatsApp hasn't touched in a while go to (compressed) swap in small steps; anything
-    it needs again comes straight back. It stops at `floor` MB, when swap has taken all it
-    should (swap_full), when the computer is already waiting on memory (RECLAIM_PRESSURE), or
-    when the kernel can't find more to take.
+    it needs again comes straight back. It stops at `floor` MB of the unit's private memory
+    (memory.stat anon: the floor is about WhatsApp's own heap, not the file cache or the GPU's
+    shmem beside it), when swap has taken all it should (swap_full), when the computer is
+    already waiting on memory (RECLAIM_PRESSURE), or when the kernel can't find more to take.
+    Where swap is full already it doesn't start, and `available` says so (why_not): on 24 Oct
+    2026 the unit's swap sat full all morning, and the switch promised what never ran.
     """
 
     STEP = "64M"
@@ -546,20 +568,34 @@ class Reclaimer:
         return cgroup if can_reclaim(cgroup, swaps, zswap) else None
 
     @property
-    def available(self) -> bool:
+    def possible(self) -> bool:
+        """Whether giving memory back is possible here at all: a unit of Natter's own that may
+        swap, and swap that's cheap (can_reclaim)."""
         return self._reclaimable() is not None
 
+    def why_not(self) -> str:
+        """Why giving memory back wouldn't do anything now, in words; "" when it would."""
+        cgroup = self._reclaimable()
+        if cgroup is None:
+            return "Giving memory back isn't possible here"
+        if swap_full(cgroup):
+            return "Swap is full already, so there's nowhere for it to go"
+        return ""
+
+    @property
+    def available(self) -> bool:
+        """Whether a run now would give memory back: possible, and swap not full already."""
+        return not self.why_not()
+
     def usage(self) -> int:
-        try:
-            return int((self.cgroup / "memory.current").read_text())
-        except (OSError, ValueError, TypeError):
-            return 0
+        """Bytes of private memory the unit holds (memory.stat anon), the floor's measure."""
+        return memory_stat(self.cgroup, "anon")["anon"] if self.cgroup is not None else 0
 
     def start(self) -> bool:
         if self._thread and self._thread.is_alive():
             return False
         self.cgroup = self._reclaimable()
-        if self.cgroup is None:
+        if self.cgroup is None or swap_full(self.cgroup):
             return False
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="natter-reclaim", daemon=True)

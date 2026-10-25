@@ -311,7 +311,7 @@ class Host:
     def __init__(self, settings):
         self.settings, self._rows = settings, {}
         self.app = SimpleNamespace(media=lambda _show: None, has_tray_host=lambda: True,
-                                   reclaimer=SimpleNamespace(available=False))
+                                   reclaimer=SimpleNamespace(possible=False, available=False, why_not=lambda: ""))
 
     def __getattr__(self, name):
         member = getattr(Preferences, name)
@@ -491,6 +491,41 @@ class ThemePickerTest(unittest.TestCase):
         host.show_style_hint(hint)
         host.show_style_hint("")
         self.assertEqual(style.called("set_subtitle"), [(hint,), ("",)])
+
+
+class LighterSwitchTest(unittest.TestCase):
+    """Use Less Memory in the Background: shown only where giving memory back is possible, and
+    greyed with the reason while it would do nothing (swap full), like the tray switch."""
+
+    TITLE = "Use Less Memory in the Background"
+
+    def setUp(self):
+        patches = mock.patch.multiple(prefs, **STAND_INS)
+        patches.start()
+        self.addCleanup(patches.stop)
+
+    def rows(self, possible, why_not=""):
+        host = Host(Settings())
+        host.app.reclaimer = SimpleNamespace(possible=possible, available=not why_not, why_not=lambda: why_not)
+        page = host._general()
+        running, = [group for group in page.added() if group.props.get("title") == "Running"]
+        return {row.props.get("title"): row for row in running.added()}
+
+    def test_hidden_where_impossible(self):
+        self.assertNotIn(self.TITLE, self.rows(possible=False))
+
+    def test_shown_where_possible(self):
+        row = self.rows(possible=True)[self.TITLE]
+        self.assertEqual(row.called("set_sensitive"), [])
+        self.assertEqual(row.called("set_subtitle"), [])
+        self.assertEqual(row.props["subtitle"],
+                         "While the window is closed, memory that isn't in use goes back to the system")
+
+    def test_greyed_with_the_reason_while_swap_is_full(self):
+        why = "Swap is full already, so there's nowhere for it to go"
+        row = self.rows(possible=True, why_not=why)[self.TITLE]
+        self.assertEqual(row.called("set_sensitive"), [(False,)])
+        self.assertEqual(row.called("set_subtitle"), [(why,)])
 
 
 class CustomColourTest(unittest.TestCase):

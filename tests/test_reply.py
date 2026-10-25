@@ -5,6 +5,7 @@ the app's side of it, locked and not (app.py), and starting again when calls hav
 microphone and camera. A stand-in notification server and stand-in widgets: no display, no
 bus, nothing reaches the desktop."""
 
+import base64
 import io
 import os
 import subprocess
@@ -23,7 +24,7 @@ import gi
 
 gi.require_version("Gdk", "4.0")
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gdk, GLib, Gtk
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
 
 from natter import NAME, notify, reply
 from natter.app import RESTARTER, Natter, banner_for, own_children, restart_command, start_again
@@ -235,6 +236,70 @@ class ActionsTest(NotifierTest):
         self.assertEqual((target.chat, target.title, target.page_id, target.count), (PERSON, "Mum", 14, 5))
         target.messages.append("more")  # a copy: the window's changes stay the window's
         self.assertEqual(len(shown.messages), 3)
+
+
+class AvatarTest(NotifierTest):
+    """The sender's picture: cached per chat by a digest of its address and kept decoded; the
+    address itself (a data: URL is the whole picture, base64) is dropped once decoded, so no
+    Shown and no cache entry holds hundreds of kilobytes of string."""
+
+    def data_url(self, colour):
+        pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 8, 8)
+        pixbuf.fill(colour)
+        ok, png = pixbuf.save_to_bufferv("png", [], [])
+        self.assertTrue(ok)
+        return "data:image/png;base64," + base64.b64encode(bytes(png)).decode()
+
+    def test_cached_by_digest_and_kept_decoded(self):
+        notifier = self.make()
+        url = self.data_url(0xff0000ff)
+        decoded, original = [], notify.decode_image
+        with mock.patch.object(notify, "decode_image", side_effect=lambda raw: decoded.append(1) or original(raw)):
+            notifier.show("main", None, 7, "Mum", "Dinner?", PERSON, url)
+            shown = notifier.shown[("main", PERSON)]
+            self.assertEqual(len(decoded), 1)
+            self.assertIsInstance(shown.icon, GdkPixbuf.Pixbuf)
+            self.assertEqual(shown.icon_key, notify.avatar_key(url))
+            self.assertEqual(shown.icon_url, "")
+            digest, picture = notifier.avatars[("main", PERSON)]
+            self.assertEqual(digest, notify.avatar_key(url))
+            self.assertEqual(len(digest), 32)
+            self.assertIs(picture, shown.icon)
+            self.assertNotIn(url, repr(vars(shown)) + repr(notifier.avatars))
+            (_actions, hints), = notifier.bus.notified()
+            self.assertIn("image-data", hints)
+            self.assertIs(notifier.target(shown).picture, shown.icon)
+            notifier.show("main", None, 8, "Mum", "Hello?", PERSON, url)  # the same picture: from the cache
+            self.assertEqual(len(decoded), 1)
+            self.assertIs(shown.icon, picture)
+            other = self.data_url(0x00ff00ff)
+            notifier.show("main", None, 9, "Mum", "Still there?", PERSON, other)  # a new one: fetched, cached
+            self.assertEqual(len(decoded), 2)
+            self.assertIsNot(shown.icon, picture)
+            self.assertEqual(notifier.avatars[("main", PERSON)][0], notify.avatar_key(other))
+            self.assertEqual(shown.icon_url, "")
+            notifier.show("main", None, 10, "Mum", "?", PERSON, "")  # none named: none shown
+            self.assertIsNone(shown.icon)
+            self.assertEqual((shown.icon_key, shown.icon_url), ("", ""))
+
+    def test_one_that_cannot_be_had_keeps_the_picture_the_bubble_has(self):
+        notifier = self.make()
+        url = self.data_url(0xff0000ff)
+        notifier.show("main", None, 7, "Mum", "Dinner?", PERSON, url)
+        shown = notifier.shown[("main", PERSON)]
+        picture = shown.icon
+        broken = "data:image/png;base64,AAAA"
+        notifier.show("main", None, 8, "Mum", "Hello?", PERSON, broken)
+        self.assertIs(shown.icon, picture)  # the old one stays on the bubble
+        self.assertEqual(shown.icon_url, broken)  # tried again at the next delivery
+        self.assertEqual(notifier.avatars[("main", PERSON)][0], notify.avatar_key(url))
+        self.assertEqual(len(notifier.bus.notified()), 2)
+
+    def test_avatar_key(self):
+        self.assertEqual(notify.avatar_key(""), "")
+        self.assertEqual(notify.avatar_key("https://pps.whatsapp.net/a"), notify.avatar_key("https://pps.whatsapp.net/a"))
+        self.assertNotEqual(notify.avatar_key("https://pps.whatsapp.net/a"), notify.avatar_key("https://pps.whatsapp.net/b"))
+        self.assertEqual(len(notify.avatar_key("x" * 300_000)), 32)
 
 
 class SignalTest(NotifierTest):

@@ -43,7 +43,7 @@ from .search import SearchProvider
 from .settings import AUTOSTART, CACHE, CONFIG, DATA, Chat, ChatIndex, Settings, private_folder
 from .system import (AudioFollower, CallSound, LoopMeter, Reclaimer, footprint, give_system_bus, in_own_scope,
                      in_sandbox, limit_own_scope, media_report, memory_events, memory_tight, move_to_own_scope,
-                     network_processes, open_uri, own_swap, pages_end_alone, request_background)
+                     network_processes, open_uri, own_swap, pages_end_alone, request_background, unit_charge)
 from .tray import MenuItem, Tray, tray_host_available
 
 HERE = Path(__file__).resolve().parent
@@ -69,8 +69,16 @@ def app_icon() -> Gio.Icon:
     return Gio.FileIcon.new(Gio.File.new_for_path(str(svg))) if svg.is_file() else Gio.ThemedIcon.new(DEFAULT_APP_ID)
 
 
-MEMORY_LIMIT = 1536  # MB
-MEMORY_THRESHOLDS = (0.55, 0.8)  # conservative, strict: fractions of the limit
+# WebKit's limit, and its two lines as fractions of it: past the conservative one, at every poll,
+# it drops its caches (Skia's too) and trims malloc; past the strict one it also deletes its
+# compiled code and asks for a GC, again at every poll, not once at the crossing. WebKit counts
+# resident memory (VmRSS). At 1536 MB with (0.55, 0.8) the strict line, 1229 MB, lay under the
+# page's idle 1260-1280 MB, so the critical release ran every 30 s all day (24 Oct 2026). Now
+# 1331 and 1741 MB: the strict line well above an idle page, the conservative one just above it,
+# so an idle page that creeps has its caches dropped (cheap) at every poll again within about
+# half an hour.
+MEMORY_LIMIT = 2048  # MB
+MEMORY_THRESHOLDS = (0.65, 0.85)  # conservative, strict: fractions of the limit
 MEMORY_POLL = 30  # seconds between WebKit's memory checks
 # Past this many times the limit, WebKit ends the page and Natter starts a fresh one (a plan,
 # not a crash: Account._on_crash). Without it the limit only ever freed caches, while what
@@ -95,14 +103,29 @@ NETWORK_CHECK_EARLY, NETWORK_EARLY_LOOKS = 1, 120
 THAW_GAP = 20
 # A fresh page (Account.fresh_page) reloads WhatsApp: for a while no messages arrive, so no
 # notifications and no ringing. While the window is hidden a page gets one for its memory only
-# when it's past the guard's limit for a page, when the computer is really short of memory, or
-# after a call that left a lot behind (_fresh_pages_for_memory); then only once the window has
-# been hidden a while, the page has been quiet a while, and, but for a call's leftovers (once a
-# call), never more often than FRESH_AGAIN.
+# when it's past the guard's limit for a page, when the computer is really short of memory,
+# when it has grown big and stayed so (below), or after a call that left a lot behind
+# (_fresh_pages_for_memory); then only once the window has been hidden a while, the page has
+# been quiet a while, and, but for a call's leftovers (once a call), never more often than
+# FRESH_AGAIN.
 FRESH_AGAIN = 4 * 60 * 60  # seconds after a page's last load before it gets a fresh one for memory
 HIDDEN_BEFORE_FRESH = 10 * 60  # seconds the window stays hidden first
 QUIET_BEFORE_FRESH = 5 * 60  # seconds since the page's last notification, and since a call ended
+FRESH_GAP = 60  # seconds between two fresh pages for memory, whichever pages they are
 CALL_GROWTH = 512  # MB a call has to leave behind (what the pages grew since it began) for a fresh page after it
+# Grown: a hidden page past its growth ceiling for GROWN_FOR. The ceiling is GROWN_FLOOR, or
+# GROWN_SHARE times the page's idle size when that's more. The idle size is what a page's web
+# process holds (the guard's measure: resident and swapped) at the first quiet look between
+# IDLE_AFTER_LOAD and IDLE_WITHIN after Natter first saw that process (_measure_idle), once per
+# process; until it's measured, or if no look in that hour was quiet, the floor alone applies. In
+# three days of October 2026 no page was ever reloaded for memory: an idle page of 1.6 GB grew
+# about 140 MB an hour, a call added a gigabyte it kept, runs peaked at 2.5-4.9 GB, and the
+# desktop closed Natter or the kernel ended the page instead.
+GROWN_FLOOR = 2048  # MB
+GROWN_SHARE = 1.5
+GROWN_FOR = 30 * 60  # seconds past the ceiling, hidden, before a fresh page
+IDLE_AFTER_LOAD = 10 * 60  # seconds after a load before the idle size is measured
+IDLE_WITHIN = 60 * 60  # and no later than this after its process came: by then it may have grown
 HIDDEN_BEFORE_RECLAIM = 90  # seconds hidden before Natter gives memory back
 RECLAIM_AGAIN = 15 * 60  # and again this often while it stays hidden
 SETTLE_BEFORE_RECLAIM = 10 * 60  # seconds after a page's last load before its memory goes to swap
@@ -144,13 +167,13 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>A lighter privacy blur, steadier calls, and a dependency check for every distribution.</p>"
+RELEASE_NOTES = ("<p>Memory: what grows is given back, and WebKit stops working against an idle page.</p>"
                  "<ul>"
-                 "<li>Privacy blur without a graphics filter, and a cover (not a blur) while another window is in front: both cost next to nothing now</li>"
-                 "<li>Other apps' audio pauses while you record a voice message, and plays again after</li>"
-                 "<li>Calls: packets leave from their own thread, a network-process loss waits for the call to end, incoming calls are recognised in more languages, and the log says why every reload happened</li>"
-                 "<li>The installer checks and names every piece calls, videos, sound and the camera need, on Arch, Debian, Ubuntu, Fedora and openSUSE</li>"
-                 "<li>The problem report lists graphics-driver hangs from the previous boot too</li>"
+                 "<li>A hidden page that has grown well past its own idle size gets a fresh page, with its chat opened again: memory that nothing freed before comes back</li>"
+                 "<li>WebKit no longer drops all its caches and code every 30 seconds at idle: its memory lines now sit above WhatsApp's idle size</li>"
+                 "<li>The swap the app may use follows its page limit, at most half the computer's swap</li>"
+                 "<li>Graphics memory now shows in the memory lines in the log</li>"
+                 "<li>Use Less Memory in the Background is greyed out, with the reason, when it can't run</li>"
                  "</ul>")
 
 
@@ -187,7 +210,7 @@ def awake_time() -> float:
 
 def memory_pressure(limit: Optional[str], thresholds: Optional[str]) -> Optional[tuple[int, float, float]]:
     """WebKit's memory limit in MB and its conservative and strict thresholds, from
-    NATTER_MEMORY_LIMIT and NATTER_MEMORY_THRESHOLDS ("0.55,0.8"). None keeps WebKit's own."""
+    NATTER_MEMORY_LIMIT and NATTER_MEMORY_THRESHOLDS ("0.65,0.85"). None keeps WebKit's own."""
     try:
         megabytes = int(limit) if limit else MEMORY_LIMIT
     except ValueError:
@@ -597,6 +620,12 @@ class Natter(Adw.Application):
         self._after_call: dict = {}
         self._call_packets = 0  # the pages' call packets (rtc.Host.packets) when the call began
         self._memory_waiting: Optional[tuple] = None  # what the last "not yet" said (_memory_wait)
+        # The idle size (_measure_idle): by web process, when Natter first saw it and the bytes it
+        # held when idle; and since when a page has been past its growth ceiling while hidden.
+        self._seen: dict[int, float] = {}
+        self._idle: dict[int, int] = {}
+        self._grown_since: Optional[float] = None
+        self._fresh_at: Optional[float] = None  # when the last fresh page for memory began (FRESH_GAP)
         # The app lock (lock.py): while locked, the window shows only the passcode, and what
         # would show a chat waits for the unlock.
         self.locked = False
@@ -711,7 +740,8 @@ class Natter(Adw.Application):
         # whose OOMPolicy is "continue" (system.py). Elsewhere that would stop all of Natter.
         total = mem_total()
         self.memory_guard = MemoryGuard(page_limit(total), calling=lambda: self.calling, ceiling=page_ceiling(total),
-                                        oom_score_adj=OOM_SCORE_ADJ if pages_end_alone() else None)
+                                        oom_score_adj=OOM_SCORE_ADJ if pages_end_alone() else None,
+                                        charge=unit_charge)
         self.memory_guard.start()
         self._apply_spelling()
 
@@ -2140,7 +2170,7 @@ class Natter(Adw.Application):
         # No fresh page now: closing the window isn't a reason to reload WhatsApp, and messages
         # that come during a reload come without notifications. _check_memory looks every minute
         # (and _thawed after a freeze) once the window has been hidden HIDDEN_BEFORE_FRESH.
-        if self.settings["light_background"] and self.reclaimer.available:
+        if self.settings["light_background"] and self.reclaimer.possible:
             self._reclaim_timer = GLib.timeout_add_seconds(HIDDEN_BEFORE_RECLAIM, self._reclaim)
 
     @property
@@ -2206,6 +2236,7 @@ class Natter(Adw.Application):
         # pushing it to swap only hides it, and filled 9.7 GB of swap one day. A fresh page frees it.
         # Not while a page loads or has just loaded, or a reply is being sent: the page would be
         # pushed out under it. What the Reclaimer puts in swap is never a reason for a fresh page.
+        # With swap full already the Reclaimer doesn't start (system.py): nothing to say each time.
         if not self._fresh_pages_for_memory() and not self._reclaim_wait(time.monotonic()):
             self.reclaimer.start()
         self._reclaim_timer = GLib.timeout_add_seconds(RECLAIM_AGAIN, self._reclaim)
@@ -2232,13 +2263,20 @@ class Natter(Adw.Application):
             self._memory_waiting = None
             if self.window is not None:
                 self._hidden_at = None  # shown: the next hide counts from then, whatever told it
+            self._grown_since = None  # growth counts while hidden; shown, it starts again
             return False
         if self.calling:
             return False  # nothing to decide (_memory_wait), and the pages aren't read meanwhile
         now, pages = time.monotonic(), held_by_page(self.memory_guard)
         biggest, total = max(pages.values(), default=0), sum(pages.values())
+        over = {pid: size for pid, size in pages.items() if size > self._growth_ceiling(pid)}
+        grown = max(over, key=over.get) if over else None  # the biggest page past its own ceiling
+        if grown is not None:
+            self._grown_since = now if self._grown_since is None else self._grown_since
+        else:
+            self._grown_since = None
         wanted = []  # (account, (what kind of reason, its words)), in the order they'd go
-        reason = self._memory_reason(biggest)
+        reason = self._memory_reason(biggest, now, grown, over.get(grown, 0))
         if reason:
             wanted += [(account, reason) for account in sorted(self.accounts, key=lambda a: a.loaded_at)]
         for account, (began, ended) in list(self._after_call.items()):
@@ -2259,8 +2297,14 @@ class Natter(Adw.Application):
             if not wait:
                 print(f"natter: a fresh page for {account.name}: {why} ({NAME} holds {footprint() >> 20} MB, "
                       f"{own_swap() >> 20} MB of it in swap)", flush=True)
+                if kind == "grown":
+                    measured = self._idle.get(grown)
+                    idle = f"idle {measured >> 20} MB" if measured else f"idle not measured, floor {GROWN_FLOOR} MB"
+                    print(f"natter: page: reloaded because it grew to {over[grown] >> 20} MB while hidden ({idle})",
+                          flush=True)
                 self._memory_waiting = None
                 self._after_call.pop(account, None)
+                self._fresh_at = now
                 account.fresh_page(f"of its memory: {why}")
                 return True
             first = first or (account, kind, why, wait)
@@ -2271,26 +2315,83 @@ class Natter(Adw.Application):
                   flush=True)
         return False
 
-    def _memory_reason(self, biggest: int) -> Optional[tuple[str, str]]:
+    def _memory_reason(self, biggest: int, now: float, grown: Optional[int] = None,
+                       grown_size: int = 0) -> Optional[tuple[str, str]]:
         """Why the pages need a fresh one, for the biggest of them holding `biggest` bytes:
         (what kind of reason, its words), or None when they don't. A page past the guard's own
-        limit for one (memguard.py), or the whole computer short of memory (memory_tight: little
-        available and swap all but full) with a page holding more than WebKit's limit for one.
-        Never what's in swap alone, and never what Natter's own Reclaimer put there: it does
-        that while hidden, by design."""
+        limit for one (memguard.py); the whole computer short of memory (memory_tight: little
+        available and swap past the Reclaimer's share) with a page holding more than WebKit's
+        limit for one; or a page (`grown`, a web process holding `grown_size`) past its growth
+        ceiling (_growth_ceiling), with some page kept past its own, hidden, for GROWN_FOR
+        (_grown_since). Never what's in swap alone, and never what Natter's own Reclaimer put
+        there: it does that while hidden, by design."""
         limit = self.memory_guard.limit if self.memory_guard is not None else page_limit(mem_total())
         if biggest > limit:
             return "limit", f"a page holds {biggest >> 20} MB, past the guard's limit of {limit >> 20} MB"
         webkit = (memory_pressure(GLib.getenv("NATTER_MEMORY_LIMIT"), None) or (MEMORY_LIMIT, 0, 0))[0]
         if biggest > webkit * MiB and memory_tight():
             return "short", f"the computer is short of memory, and a page holds {biggest >> 20} MB"
+        if grown is not None and self._grown_since is not None and now - self._grown_since >= GROWN_FOR:
+            return "grown", (f"a page grew to {grown_size >> 20} MB while hidden, past "
+                             f"{self._growth_ceiling(grown) >> 20} MB for {(now - self._grown_since) / 60:.0f} min")
         return None
+
+    def _growth_ceiling(self, pid: Optional[int] = None) -> int:
+        """Bytes the page in web process `pid` may hold, hidden, before it counts as grown:
+        GROWN_FLOOR, or GROWN_SHARE times its idle size (_measure_idle) when that's more; the
+        floor alone while that process's idle size isn't known."""
+        floor, idle = GROWN_FLOOR * MiB, self._idle.get(pid, 0)
+        return max(floor, int(idle * GROWN_SHARE))
+
+    def _measure_idle(self, now: float) -> None:
+        """The idle size (_idle), by web process: what a page's process holds at the first quiet
+        look between IDLE_AFTER_LOAD and IDLE_WITHIN after Natter first saw it, shown or hidden.
+        Quiet: no call on or just ended, every page up and none loaded within IDLE_AFTER_LOAD
+        (WhatsApp's own reloads too), no reply, recording or notification lately. Once per
+        process, and never later: a page that was never quiet in that hour, or that WhatsApp
+        reloaded in the same process, may have grown since, and its size would raise its own
+        ceiling. A fresh page or a crash brings a new process, measured afresh; another
+        account's fresh page leaves this one's as it was."""
+        pages = held_by_page(self.memory_guard)
+        if not pages:
+            return
+        for pid in [pid for pid in self._seen if pid not in pages]:  # gone: forget it
+            self._seen.pop(pid)
+            self._idle.pop(pid, None)
+        for pid in pages:
+            self._seen.setdefault(pid, now)
+        latest = max((account.loaded_at for account in self.accounts), default=None)
+        if latest is None or now - latest < IDLE_AFTER_LOAD or self.calling or self._pages_busy(now):
+            return
+        for pid, size in pages.items():
+            if pid not in self._idle and IDLE_AFTER_LOAD <= now - self._seen[pid] <= IDLE_WITHIN:
+                self._idle[pid] = size
+                print(f"natter: memory: idle, a page holds {size >> 20} MB; hidden, it may grow to "
+                      f"{self._growth_ceiling(pid) >> 20} MB", flush=True)
+
+    def _pages_busy(self, now: float) -> str:
+        """Why the pages aren't quiet now, in words; "" when they are: a call ended within
+        QUIET_BEFORE_FRESH, or a page not up, replying, recording, or notified within it."""
+        if self._call_ended_at is not None and now - self._call_ended_at < QUIET_BEFORE_FRESH:
+            return "a call ended a moment ago"
+        for account in self.accounts:
+            if account.crashing or account.reloading or not account.ready:
+                return "a page isn't up"
+            if account.replying:
+                return "a reply is being sent"
+            if account.recording:
+                return "a voice message is being recorded"
+            if account.notified_at is not None and now - account.notified_at < QUIET_BEFORE_FRESH:
+                return "a notification came a moment ago"
+        return ""
 
     def _memory_wait(self, account: Account, now: float, kind: str = "") -> Optional[tuple[str, str]]:
         """Why `account` can't have a fresh page for its memory now: (a key, the words), or None
         when it can. Not before the window has been hidden HIDDEN_BEFORE_FRESH, not during a
-        call or a reply, nor for QUIET_BEFORE_FRESH after one ended or a notification came (a
-        call rings with one), not while it loads, and not within FRESH_AGAIN of its last load,
+        call (ringing or connected, and rtc.GRACE after) or a reply, nor while its page is lent
+        (loan.py), nor for QUIET_BEFORE_FRESH after a call ended or a notification came (a call
+        rings with one), not while a voice message is recorded, not while it loads, not within
+        FRESH_GAP of the last fresh page for memory, and not within FRESH_AGAIN of its last load,
         unless the reason (`kind`) is a call's leftovers: those are asked for once per call and
         gone with the fresh page, so they can't make a loop, and the guard counts on them going
         (memguard.py: the call's room above a page's limit)."""
@@ -2303,8 +2404,14 @@ class Natter(Adw.Application):
             return "call ended", "a call ended a moment ago"
         if account.replying:
             return "reply", "a reply is being sent"
+        if account.id in getattr(self.window, "loans", {}):
+            return "lent", "its page is lent to a reply window"
+        if account.recording:
+            return "recording", "a voice message is being recorded"
         if account.crashing or account.reloading or not account.ready:
             return "loading", "its page isn't up"
+        if self._fresh_at is not None and now - self._fresh_at < FRESH_GAP:
+            return "gap", "another page was made fresh a moment ago"
         if account.notified_at is not None and now - account.notified_at < QUIET_BEFORE_FRESH:
             return "notified", "a notification came a moment ago"
         if kind != "call" and now - account.loaded_at < FRESH_AGAIN:
@@ -2312,6 +2419,8 @@ class Natter(Adw.Application):
         return None
 
     def _check_memory(self) -> bool:
+        if not self.calling:  # the pages aren't read during a call (held_by_page: the guard's last look, or /proc)
+            self._measure_idle(time.monotonic())
         self._fresh_pages_for_memory()
         return GLib.SOURCE_CONTINUE
 

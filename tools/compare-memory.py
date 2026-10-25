@@ -3,8 +3,10 @@
 
 Each app is found by its systemd scopes: ZapZap's Flatpak runs its web engine in extra
 scopes, which count too, and Whatsie runs as a Snap or a Flatpak. Memory is PSS from
-/proc/<pid>/smaps_rollup plus what is swapped out; CPU is user and system time over the
-measuring window.
+/proc/<pid>/smaps_rollup plus what is swapped out; beside it, what the kernel charges the scopes
+that no process's PSS or swap shows: shmem (the GPU's buffers, on Intel) and the zswap pool
+(memory.stat), and the GPU buffers each process owns by its DRM fdinfo (drm-total-system…),
+where that can be read. CPU is user and system time over the measuring window.
 
   python3 tools/compare-memory.py              30 s, every app that's running
   python3 tools/compare-memory.py --seconds 60
@@ -15,7 +17,12 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from natter.memguard import gem_held  # noqa: E402
 
 SLICE = f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice"
 APPS = {
@@ -52,6 +59,18 @@ def memory(pid: int) -> dict[str, int]:
     return found
 
 
+def charged(dirs: list[str]) -> dict[str, int]:
+    """What the kernel charges the scopes beside their processes' private memory, in MB:
+    shmem and the zswap pool, from each scope's memory.stat."""
+    found = {"shmem": 0, "zswap": 0}
+    for d in dirs:
+        for line in read(f"{d}/memory.stat").splitlines():
+            name, _, value = line.partition(" ")
+            if name in found and value.strip().isdigit():
+                found[name] += int(value) // (1024 * 1024)
+    return found
+
+
 def cpu_ticks(pid: int) -> int:
     fields = read(f"/proc/{pid}/stat").rsplit(")", 1)[-1].split()
     return int(fields[11]) + int(fields[12]) if len(fields) > 12 else 0
@@ -79,8 +98,12 @@ def main() -> None:
         swap = sum(m.get("Swap", 0) for m in per.values())
         cpu = sum(cpu_ticks(p) - before[app].get(p, cpu_ticks(p)) for p in processes) / HZ / seconds * 100
         biggest = sorted(((m.get("Pss", 0), name(p)) for p, m in per.items()), reverse=True)[:3]
+        beside = charged(dirs)
+        gem = sum(gem_held(p) for p in processes) // (1024 * 1024)
         print(f"{app}: {len(processes)} processes in {len(dirs)} scope(s)")
         print(f"  in memory (PSS) {pss} MB + swapped out {swap} MB = {pss + swap} MB")
+        print(f"  besides: shmem {beside['shmem']} MB and zswap pool {beside['zswap']} MB charged to the scope(s); "
+              f"GPU buffers {gem} MB by fdinfo")
         print(f"  CPU {cpu:.1f}% of one core over {seconds} s")
         print("  biggest: " + ", ".join(f"{n} {m} MB" for m, n in biggest if m))
 

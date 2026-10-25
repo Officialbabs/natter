@@ -346,6 +346,7 @@ class WiringTest(unittest.TestCase):
         self.assertLess(made, guard)
         self.assertIn("calling=lambda: self.calling", startup)
         self.assertIn("ceiling=page_ceiling(total)", startup)
+        self.assertIn("charge=unit_charge", startup)  # the unit's shmem and zswap, for the step line only
         self.assertLess(guard, startup.index("self.memory_guard.start()"))
 
     def test_the_guard_stops_on_quitting(self):

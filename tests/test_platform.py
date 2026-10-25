@@ -166,15 +166,90 @@ class ReclaimTest(Temp):
             (folder / "memory.reclaim").write_text("")
             (folder / "memory.current").write_text("0\n")  # under the floor: a run ends at once
         reclaimer = Reclaimer()  # made while Natter is still in the terminal's unit
-        with mock.patch.object(system, "cheap_swap", return_value=True):
+        with mock.patch.object(system, "cheap_swap", return_value=True), \
+                mock.patch.object(system, "swap_share", return_value=0.1):
             with mock.patch.object(system, "own_cgroup", return_value=terminal):
+                self.assertFalse(reclaimer.possible)
                 self.assertFalse(reclaimer.available)
+                self.assertEqual(reclaimer.why_not(), "Giving memory back isn't possible here")
                 self.assertFalse(reclaimer.start())
             with mock.patch.object(system, "own_cgroup", return_value=unit):  # the move to its scope finished
+                self.assertTrue(reclaimer.possible)
                 self.assertTrue(reclaimer.available)
+                self.assertEqual(reclaimer.why_not(), "")
                 self.assertTrue(reclaimer.start())
                 reclaimer._thread.join(5)
         self.assertEqual(reclaimer.cgroup, unit)
+
+
+class ReclaimerHonestyTest(Temp):
+    """The Reclaimer's floor is on the unit's private memory (memory.stat anon), not
+    memory.current (file cache and the GPU's shmem too); and where swap is full already it
+    says so instead of promising a run that does nothing (24 Oct 2026: the unit's swap sat
+    at its cap all morning, and the switch stayed on)."""
+
+    def unit(self, anon_mb=700, file_mb=1300, swapped_mb=0):
+        unit = self.dir / scope_name(1)
+        unit.mkdir()
+        (unit / "memory.reclaim").write_text("")
+        (unit / "memory.current").write_text(f"{(anon_mb + file_mb) << 20}\n")
+        (unit / "memory.stat").write_text(f"anon {anon_mb << 20}\nfile {file_mb << 20}\nshmem {400 << 20}\n")
+        (unit / "memory.swap.current").write_text(f"{swapped_mb << 20}\n")
+        return unit
+
+    def test_the_floor_is_on_private_memory(self):
+        unit = self.unit()  # 2000 MB in all, 700 MB of it private: under the 800 MB floor
+        reclaimer = Reclaimer()
+        reclaimer.cgroup = unit
+        steps = []
+        reclaimer._step = lambda: steps.append(1) or True
+        self.assertEqual(reclaimer.usage(), 700 << 20)
+        with mock.patch.object(system, "swap_full", return_value=False), \
+                mock.patch.object(system, "memory_stalls", return_value=0.0):
+            reclaimer._run()
+        self.assertEqual(steps, [])
+        (unit / "memory.stat").write_text(f"anon {900 << 20}\nfile {100 << 20}\n")  # 1000 MB in all, 900 private
+        reclaimer._step = lambda: steps.append(1) or (unit / "memory.stat").write_text(f"anon {700 << 20}\n") or True
+        reclaimer._stop.wait = lambda _seconds: False
+        with mock.patch.object(system, "swap_full", return_value=False), \
+                mock.patch.object(system, "memory_stalls", return_value=0.0):
+            reclaimer._run()
+        self.assertEqual(steps, [1])
+        self.assertEqual(Reclaimer().usage(), 0)  # no unit yet
+
+    def test_not_available_while_swap_is_full(self):
+        unit = self.unit(swapped_mb=system.SWAP_BUDGET_MB + 1)
+        reclaimer = Reclaimer()
+        with mock.patch.object(system, "cheap_swap", return_value=True), \
+                mock.patch.object(system, "own_cgroup", return_value=unit), \
+                mock.patch.object(system, "swap_share", return_value=0.1):
+            self.assertTrue(reclaimer.possible)
+            self.assertFalse(reclaimer.available)
+            self.assertEqual(reclaimer.why_not(), "Swap is full already, so there's nowhere for it to go")
+            self.assertFalse(reclaimer.start())
+            self.assertIsNone(reclaimer._thread)
+            (unit / "memory.swap.current").write_text("0\n")
+            self.assertTrue(reclaimer.available)
+            self.assertEqual(reclaimer.why_not(), "")
+        with mock.patch.object(system, "cheap_swap", return_value=True), \
+                mock.patch.object(system, "own_cgroup", return_value=unit), \
+                mock.patch.object(system, "swap_share", return_value=0.7):  # the computer's swap past 60%
+            self.assertFalse(reclaimer.available)
+            self.assertFalse(reclaimer.start())
+
+    def test_the_unit_charge_and_the_footprint(self):
+        from natter.system import footprint, unit_charge
+
+        unit = self.unit(anon_mb=1500, file_mb=300, swapped_mb=800)
+        (unit / "memory.stat").write_text(f"anon {1500 << 20}\nfile {300 << 20}\nshmem {400 << 20}\n"
+                                          f"zswap {150 << 20}\nzswapped {700 << 20}\n")
+        self.assertEqual(unit_charge(unit), {"shmem": 400 << 20, "zswap": 150 << 20})
+        self.assertEqual(footprint(unit), (1500 + 800 + 400) << 20)  # the zswap pool is swapped already
+        (unit / "memory.stat").write_text(f"anon {1500 << 20}\n")
+        self.assertEqual(unit_charge(unit), {"shmem": 0, "zswap": 0})
+        self.assertEqual(footprint(unit), (1500 + 800) << 20)
+        self.assertEqual(unit_charge(self.dir / "none"), {"shmem": 0, "zswap": 0})
+        self.assertEqual(footprint(None) if system.own_cgroup() is None else 0, 0)
 
 
 class SandboxTest(Temp):

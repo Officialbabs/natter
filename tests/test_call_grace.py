@@ -88,7 +88,7 @@ class App:
 
     def __init__(self):
         self.window, self.settings, self.memory_guard = Window(), {"light_background": True}, None
-        self.reclaimer = types.SimpleNamespace(available=True, stops=0)
+        self.reclaimer = types.SimpleNamespace(possible=True, available=True, stops=0)
         self.reclaimer.stop = lambda: setattr(self.reclaimer, "stops", self.reclaimer.stops + 1)
         self.call_sound, self.written = Log(), []
         self.voice_pause = types.SimpleNamespace(call_started=lambda: None, call_over=lambda: None)
