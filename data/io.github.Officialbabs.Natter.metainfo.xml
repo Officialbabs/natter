@@ -81,6 +81,17 @@
   </content_rating>
 
   <releases>
+    <release version="0.1.6" date="2026-10-26">
+      <description>
+        <p>A start-up that answers at once.</p>
+        <ul>
+          <li>A starting copy answers launches at once: its set-up runs in the background, and launches that arrive meanwhile are kept and run in order</li>
+          <li>A copy started only to answer desktop search leaves 10 seconds after starting if no search comes</li>
+          <li>A clear message, instead of a crash, when there's no display to open a window on</li>
+          <li>The Flatpak build has been tried: it builds, and everything calls, the camera and videos need is inside</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.5" date="2026-10-26">
       <description>
         <p>One copy at a time, and no silent hangs at launch.</p>

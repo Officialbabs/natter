@@ -960,7 +960,7 @@ class AppTest(unittest.TestCase):
 
     def test_made_with_the_setting_and_both_kinds_of_call(self):
         import inspect
-        source = inspect.getsource(Natter.do_startup)
+        source = inspect.getsource(Natter._start_services)  # a step of start-up's
         self.assertIn('enabled=lambda: bool(self.settings["pause_other_audio"])', source)
         self.assertIn("calling=lambda: self.calling or bool(self.calls and self.calls.in_call)", source)
 

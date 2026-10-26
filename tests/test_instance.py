@@ -27,10 +27,10 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib
 
 from natter import instance
-from natter.app import Natter, main as app_main, stop_name_watch
+from natter.app import FIRST_SEARCH_WAIT, SEARCH_LINGER, Natter, main as app_main, stop_name_watch
 from natter.instance import (BUSY, LOST, MAYBE, NOT_ANSWERING, OK, STILL_RUNNING, UNKNOWN, Holder, InstanceLock,
                              NameWatchdog, OwnerAsker, Taken, end_stale, end_webkit, holds_lock, lock_path,
-                             name_owner, primary_line, probe, start_ticks, take, verdict)
+                             name_owner, primary_line, probe, start_ticks, take, take_later, verdict)
 
 OWN, OTHER = ":1.10", ":1.99"
 
@@ -238,6 +238,100 @@ class LockTest(Temp):
         self.assertIn("no instance lock", lines[0])
 
 
+class Timers:
+    """GLib.timeout_add for take_later, run by hand: each one moves `clock` on by its delay."""
+
+    def __init__(self, clock):
+        self.clock, self.queue = clock, []
+
+    def __call__(self, ms, run):
+        self.queue.append((ms, run))
+        return len(self.queue)
+
+    def run(self, limit=1000):
+        fired = 0
+        while self.queue and fired < limit:
+            ms, step = self.queue.pop(0)
+            self.clock.now += ms / 1000
+            step()
+            fired += 1
+        return fired
+
+
+class TakeLaterTest(Temp):
+    """The lock's wait in start-up: timers on the main loop, which answers launches meanwhile."""
+
+    def take(self, **more):
+        clock, answers = Clock(), []
+        timers = Timers(clock)
+        first = take_later(self.lock(), answers.append, wait=20, poll=0.25, clock=clock, log=lambda _: None,
+                           timeout_add=timers, **more)
+        return first, answers, timers, clock
+
+    def test_free_is_taken_at_once(self):
+        first, answers, timers, _ = self.take()
+        self.assertEqual(first, Taken(True, "taken"))
+        self.assertEqual((answers, timers.queue), ([], []))
+
+    def test_held_then_freed_is_taken_over_one_timer_at_a_time(self):
+        let_go = self.hold(4242)
+        first, answers, timers, _ = self.take()
+        self.assertIsNone(first)
+        self.assertEqual(len(timers.queue), 1)  # one try per timer: the main loop runs in between
+        self.assertEqual(timers.run(limit=3), 3)
+        self.assertEqual(answers, [])
+        let_go()
+        timers.run()
+        self.assertEqual(answers, [Taken(True, "taken over", 4242)])
+        self.assertEqual(timers.queue, [])
+
+    def test_held_throughout_gives_up_once(self):
+        self.hold(4242)
+        first, answers, timers, clock = self.take()
+        self.assertIsNone(first)
+        fired = timers.run()
+        self.assertEqual(answers, [Taken(False, "gave up", 4242)])
+        self.assertGreaterEqual(clock.now, 20)
+        self.assertLess(clock.now, 21)
+        self.assertEqual(fired, 80)  # every 0.25 s
+        self.assertEqual(timers.queue, [])
+
+    def test_a_holder_ended_after_the_wait(self):
+        let_go = self.hold(4242)
+        first, answers, timers, clock = self.take(end_holder=lambda: let_go() or True)
+        timers.run()
+        self.assertEqual(answers, [Taken(True, "ended", 4242)])
+        self.assertLess(clock.now, 21)
+
+    def test_a_step_that_fails_gives_up(self):
+        self.hold(4242)
+        lock = self.lock()
+        clock, answers = Clock(), []
+        timers = Timers(clock)
+        self.assertIsNone(take_later(lock, answers.append, clock=clock, log=lambda _: None, timeout_add=timers))
+        lock.try_take = lambda: 1 / 0
+        with contextlib.redirect_stderr(io.StringIO()):
+            timers.run()
+        self.assertEqual(answers, [Taken(False, "gave up")])
+
+    def test_done_is_called_once_even_if_it_raises(self):
+        let_go = self.hold(4242)
+        calls = []
+
+        def done(taken):
+            calls.append(taken)
+            raise RuntimeError("in done")
+
+        clock = Clock()
+        timers = Timers(clock)
+        self.assertIsNone(take_later(self.lock(), done, clock=clock, log=lambda _: None, timeout_add=timers))
+        let_go()
+        with self.assertRaises(RuntimeError) as raised:
+            timers.run()
+        self.assertIsNone(raised.exception.__context__)  # not inside the lock's StopIteration
+        self.assertEqual(calls, [Taken(True, "taken over", 4242)])
+
+
 HOLDER = """
 import os, subprocess, sys, time
 sys.path.insert(0, {root!r})
@@ -399,71 +493,278 @@ class EndWebKitTest(Temp):
         self.assertTrue(alive(child.pid))
 
 
+STARTUP_METHODS = ("do_startup", "_take_instance", "_instance_taken", "_start_steps", "_now_ready", "_when_ready",
+                   "_gated", "_drop_pending", "_release_start", "do_activate", "do_command_line", "_answer",
+                   "quit_natter", "_start_scope")
+
+
 def startup_app(**more):
-    """What _take_instance uses of the app."""
+    """A Natter as far as start-up goes: its own start-up code, stand-ins for the rest, and its
+    steps saying when they ran. A step named in `waits` waits until the test calls app.go[name]()."""
     events = []
+    waits = more.pop("waits", ())
     more.setdefault("get_dbus_connection", lambda: None)
     more.setdefault("get_flags", lambda: Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
-    app = SimpleNamespace(quit=lambda: events.append("quit"), settings={"accounts": []}, events=events, **more)
-    app._take_instance = types.MethodType(Natter._take_instance, app)
+    app = SimpleNamespace(events=events, go={}, settings={"accounts": [{}], "privacy_blur": False, "microphone": True,
+                                                          "camera": True},
+                          quit=lambda: events.append("quit"), hold=lambda: events.append("hold"),
+                          release=lambda: events.append("release"), add_action=lambda action: None,
+                          set_accels_for_action=lambda *_: None,
+                          set_inactivity_timeout=lambda seconds: events.append(("linger", seconds)),
+                          # As Natter.__init__ sets them.
+                          _started=False, _ready=False, _pending=[], _start_hold=False, _gave_up=False,
+                          _quitting=False, late_status=0, scope=None, window=None, **more)
+    for name in STARTUP_METHODS:
+        setattr(app, name, types.MethodType(getattr(Natter, name), app))
     app._start_name_watch = lambda: events.append("watch")
+    app._debug_actions = lambda: None
+    app.present_window = lambda token="": events.append("window") or True
+    for name in ("_on_terminate", "show_preferences", "show_shortcuts", "show_about", "call_in_browser",
+                 "answer_call", "decline_call", "show_call_window", "lock_now", "choose_do_not_disturb",
+                 "resume_notifications"):  # what do_startup's actions name
+        setattr(app, name, lambda *_: None)
+
+    def step(name):
+        def run(then):
+            events.append(name)
+            if name in waits:
+                app.go[name] = then
+            else:
+                then()
+        return run
+
+    for method, name in (("_start_look", "look"), ("_start_scope", "scope"), ("_start_calls", "calls"),
+                         ("_make_web_context", "web"), ("_start_guard", "guard"), ("_start_services", "services")):
+        setattr(app, method, step(name))
     return app
 
 
-class Far(Exception):
-    """Start-up got as far as the test needs."""
+STEPS = ["look", "scope", "calls", "web", "guard", "services"]
 
 
-class StartupTest(unittest.TestCase):
+def spin():
+    """The main loop, until it has nothing ready to run."""
+    context = GLib.MainContext.default()
+    for _ in range(1000):
+        if not context.iteration(False):
+            return
+
+
+class CommandLine:
+    """A launch's command line, as far as start-up answers it."""
+
+    def __init__(self, name, status=0, remote=True):
+        self.name, self.status, self.remote = name, status, remote
+        self.answers = []
+
+    def get_is_remote(self):
+        return self.remote
+
+    def set_exit_status(self, status):
+        self.answers.append(("status", status))
+
+    def done(self):
+        self.answers.append("done")
+
+
+class Starting(unittest.TestCase):
     def startup(self, app, taken, take=None):
         out, err = io.StringIO(), io.StringIO()
-        take = take or (lambda lock, **_: taken)
-
-        def scope(**_):
-            app.events.append("scope")
-            return "scope"
-
-        def far():
-            raise Far
-
+        take = take or (lambda lock, done, **_: taken)
         with mock.patch("natter.app.take_instance", take), \
                 mock.patch("natter.app.lock_path", return_value=Path("/nonexistent/natter-a.b.lock")), \
                 mock.patch.object(Adw.Application, "do_startup", lambda self: app.events.append("gtk")), \
+                mock.patch.object(GLib, "unix_signal_add", lambda *_: app.events.append("sigterm")), \
                 mock.patch("natter.app.instance_notice", lambda bus, body: app.events.append(("notice", body))), \
-                mock.patch("natter.app.move_to_own_scope", scope), mock.patch("natter.app.memory_events", far), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            try:
-                Natter.do_startup(app)
-            except Far:
-                pass
+            Natter.do_startup(app)
         return out.getvalue(), err.getvalue()
 
-    def test_held_gives_up_without_starting_pages(self):
-        app = startup_app()
-        out, err = self.startup(app, Taken(False, "gave up", 4242))
-        self.assertTrue(app._gave_up)
-        self.assertEqual(app.events, ["gtk", ("notice", STILL_RUNNING), "quit"])  # no scope, no pages
-        self.assertIn(STILL_RUNNING, err)
-        self.assertNotIn("primary instance", out)
-        # The launch that started it, and anything activating it meanwhile, finds nothing to open.
-        app.present_window = lambda *_: app.events.append("window")
-        self.assertEqual(Natter.do_command_line(app, None), 1)
-        Natter.do_activate(app)
-        self.assertNotIn("window", app.events)
+    def command_lines(self, app):
+        app._command_line = lambda line: app.events.append(("command line", line.name)) or line.status
 
-    def test_a_search_start_gives_up_without_a_notification(self):
-        app = startup_app(get_flags=lambda: Gio.ApplicationFlags.IS_SERVICE | Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
-        _out, err = self.startup(app, Taken(False, "gave up", 4242))
+
+class StartupTest(Starting):
+    """do_startup does only what can't wait; the slow steps follow on the main loop, which
+    answers launches meanwhile; what asks for the window waits for them."""
+
+    def test_do_startup_leaves_the_slow_steps_to_the_main_loop(self):
+        app = startup_app()
+        out, _ = self.startup(app, Taken(True, "taken over", 4242))
+        # Back to the main loop with no step run, and held so it doesn't end meanwhile.
+        self.assertEqual(app.events, ["gtk", "sigterm", "hold", "watch"])
+        self.assertIn(f"natter: primary instance: app id {instance.APP_ID}, pid {os.getpid()}, "
+                      "lock taken over from pid 4242, on the session bus", out)
+        spin()
+        self.assertEqual(app.events, ["gtk", "sigterm", "hold", "watch", *STEPS, "release"])
+        self.assertTrue(app._ready)
+
+    def test_a_failure_after_the_lock_still_starts(self):
+        app = startup_app()
+
+        def broken():
+            raise RuntimeError("no watchdog")
+
+        app._start_name_watch = broken
+        _out, err = self.startup(app, Taken(True, "taken"))
+        spin()
+        self.assertIn("no watchdog", err)
+        self.assertEqual(app.events, ["gtk", "sigterm", "hold", *STEPS, "release"])
+        self.assertTrue(app._ready)
+
+    def test_debug_actions_wait_for_ready(self):
+        app = startup_app(waits=("scope",))
+        actions = {}
+        app.add_action = lambda action: actions.update({action.get_name(): action})
+        app.window = SimpleNamespace(save_snapshot=None, account=None)
+        app._snapshot = lambda path, save: app.events.append(("snapshot", path))
+        self.startup(app, Taken(True, "taken"))
+        spin()
+        with mock.patch("natter.app.debug_token", return_value="t"), contextlib.redirect_stdout(io.StringIO()):
+            Natter._debug_actions(app)
+        actions["debug-snapshot"].activate(GLib.Variant("s", "t:a.png"))
+        self.assertNotIn(("snapshot", "a.png"), app.events)
+        app.go["scope"]()
+        spin()
+        self.assertEqual(app.events[-2:], [("snapshot", "a.png"), "release"])
+
+    def test_what_waited_runs_once_ready_in_order_and_once(self):
+        app = startup_app(waits=("scope",))
+        self.command_lines(app)
+        self.startup(app, Taken(True, "taken"))
+        spin()
+        first, second = CommandLine("first"), CommandLine("second", status=1)
+        handler = app._gated(lambda *args: app.events.append(("action", args)))
+        self.assertEqual(Natter.do_command_line(app, first), 0)
+        Natter.do_activate(app)
+        handler("show-account", "work")
+        app._when_ready(lambda: app.events.append("search result"))
+        self.assertEqual(Natter.do_command_line(app, second), 0)
+        spin()
+        self.assertEqual(app.events[-2:], ["look", "scope"])  # nothing ran meanwhile
+        self.assertEqual(first.answers, [])  # its launch waits for the answer
+        app.go["scope"]()
+        spin()
+        ran = [event for event in app.events if event not in ("gtk", "sigterm", "hold", "watch", *STEPS)]
+        self.assertEqual(ran, [("command line", "first"), "window", ("action", ("show-account", "work")),
+                               "search result", ("command line", "second"), "release"])
+        self.assertEqual(first.answers, [("status", 0), "done"])
+        self.assertEqual(second.answers, [("status", 1), "done"])
+        self.assertEqual(app._pending, [])
+        # Once ready, straight through, and nothing that waited runs again.
+        self.assertEqual(Natter.do_command_line(app, CommandLine("third", status=3)), 3)
+        Natter.do_activate(app)
+        spin()
+        self.assertEqual(app.events[-2:], [("command line", "third"), "window"])
+        self.assertEqual(app.events.count(("command line", "first")), 1)
+        self.assertEqual(app.events.count("window"), 2)
+        self.assertEqual(app.events.count("release"), 1)
+
+    def test_what_a_waiting_one_asks_for_runs_after_the_rest(self):
+        app = startup_app(waits=("web",))
+        self.startup(app, Taken(True, "taken"))
+        spin()
+        app._when_ready(lambda: app._when_ready(lambda: app.events.append("asked by the first")))
+        app._when_ready(lambda: app.events.append("second"))
+        app.go["web"]()
+        spin()
+        self.assertEqual(app.events[-3:], ["second", "asked by the first", "release"])
+
+    def test_a_first_command_line_that_fails_late_says_so(self):
+        app = startup_app()
+        self.command_lines(app)
+        self.startup(app, Taken(True, "taken"))
+        line = CommandLine("first", status=1, remote=False)  # this process's own: run() returned 0 already
+        self.assertEqual(Natter.do_command_line(app, line), 0)
+        spin()
+        self.assertEqual(app.late_status, 1)
+
+    def test_the_scope_is_there_before_webkit_starts(self):
+        app = startup_app()
+        moves, limits = [], []
+        app._start_scope = types.MethodType(Natter._start_scope, app)
+        app._unit_events = lambda: {"oom_kill": 2}
+        with mock.patch("natter.app.move_to_own_scope_async",
+                        lambda done, accounts, bus: moves.append((done, accounts))), \
+                mock.patch("natter.app.limit_own_scope_async",
+                           lambda done, accounts, bus: limits.append(accounts) or done(False)), \
+                mock.patch("natter.app.memory_events", lambda: {"oom_kill": 2}):
+            self.startup(app, Taken(True, "taken"))
+            spin()
+            self.assertEqual(len(moves), 1)
+            self.assertNotIn("web", app.events)  # systemd hasn't answered: no WebKit process yet
+            done, accounts = moves[0]
+            self.assertEqual(accounts, 1)
+            done(None)  # a launcher's scope: its backstop next, then on
+            spin()
+        self.assertEqual(limits, [1])
+        self.assertEqual((app.scope, app._oom_kills), (None, 2))
+        self.assertEqual(app.events[-5:], ["calls", "web", "guard", "services", "release"])
+
+    def test_a_step_that_fails_does_not_stop_start_up(self):
+        app = startup_app()
+
+        def fails(then):
+            app.events.append("calls")
+            raise RuntimeError
+
+        app._start_calls = fails
+        app._start_scope = types.MethodType(Natter._start_scope, app)
+        app._unit_events = lambda: {}
+        with mock.patch("natter.app.move_to_own_scope_async", lambda done, accounts, bus: done("scope")), \
+                mock.patch("natter.app.memory_events", side_effect=OSError), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.startup(app, Taken(True, "taken"))
+            spin()
+        self.assertEqual(app.events[-5:], ["calls", "web", "guard", "services", "release"])
+        self.assertEqual(app.scope, "scope")
+        self.assertEqual(err.getvalue().count("Traceback"), 2)
+
+    def test_no_page_starts_until_the_lock_is_taken(self):
+        app = startup_app()
+        waiting = []
+        self.startup(app, None, take=lambda lock, done, **_: waiting.append(done))
+        spin()
+        self.assertEqual(app.events, ["gtk", "sigterm", "hold"])  # only the lock's wait
+        with contextlib.redirect_stdout(io.StringIO()):
+            waiting[0](Taken(True, "taken over", 4242))
+        spin()
+        self.assertEqual(app.events, ["gtk", "sigterm", "hold", "watch", *STEPS, "release"])
+
+    def test_given_up_drops_what_waited_and_quits(self):
+        app = startup_app()
+        self.command_lines(app)
+        waiting = []
+        self.startup(app, None, take=lambda lock, done, **_: waiting.append(done))
+        line = CommandLine("first")
+        handler = app._gated(lambda *_: app.events.append("action"))
+        Natter.do_command_line(app, line)
+        Natter.do_activate(app)
+        handler()
+        with mock.patch("natter.app.instance_notice", lambda bus, body: app.events.append(("notice", body))), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            waiting[0](Taken(False, "gave up", 4242))  # after the wait, from the main loop
+        spin()
         self.assertTrue(app._gave_up)
-        self.assertEqual(app.events, ["gtk", "quit"])
-        self.assertIn(STILL_RUNNING, err)
+        self.assertIn(STILL_RUNNING, err.getvalue())
+        self.assertEqual(app.events, ["gtk", "sigterm", "hold", ("notice", STILL_RUNNING), "release", "quit"])
+        self.assertEqual(line.answers, [("status", 1), "done"])  # its launch is told, not left waiting
+        self.assertEqual(app._pending, [])
+        # Anything arriving after finds nothing to open.
+        self.assertEqual(Natter.do_command_line(app, CommandLine("later")), 1)
+        Natter.do_activate(app)
+        handler()
+        spin()
+        self.assertNotIn("window", app.events)
+        self.assertNotIn("action", app.events)
+        self.assertNotIn(("command line", "first"), app.events)
 
     def test_a_stale_holder_may_be_ended_and_the_bus_is_noted(self):
         bus = SimpleNamespace(get_unique_name=lambda: OWN)
         app = startup_app(get_dbus_connection=lambda: bus)
         seen = {}
 
-        def take(lock, end_holder=None):
+        def take(lock, done, end_holder=None):
             seen.update(lock=lock, end_holder=end_holder)
             lock.note = lambda *args: seen.update(noted=args)
             return Taken(True, "taken")
@@ -474,14 +775,74 @@ class StartupTest(unittest.TestCase):
             self.assertTrue(seen["end_holder"]())
         self.assertEqual(seen["ended"], (seen["lock"], bus))
         self.assertEqual(seen["noted"], ("bus-a", OWN))
+        spin()
 
-    def test_taken_says_so_and_watches_the_name(self):
+    def test_quit_while_starting_stops_the_steps(self):
+        app = startup_app(waits=("scope",))
+        self.command_lines(app)
+        self.startup(app, Taken(True, "taken"))
+        spin()
+        line = CommandLine("first")
+        Natter.do_command_line(app, line)
+        with mock.patch("natter.app.stop_name_watch", lambda app: app.events.append("unwatched")):
+            Natter.quit_natter(app)  # SIGTERM, say
+        app.go["scope"]()
+        spin()
+        self.assertEqual(app.events[-4:], ["scope", "unwatched", "release", "quit"])
+        self.assertEqual(line.answers, [("status", 1), "done"])
+        self.assertFalse(app._ready)
+
+
+class ServiceStartTest(Starting):
+    """Started over D-Bus for a search (--gapplication-service): as before."""
+
+    def flags(self):
+        return Gio.ApplicationFlags.IS_SERVICE | Gio.ApplicationFlags.HANDLES_COMMAND_LINE
+
+    def test_lingers_for_searches_and_starts_the_same(self):
+        app = startup_app(get_flags=self.flags)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.startup(app, Taken(True, "taken"))
+        spin()
+        self.assertEqual(app.events, ["gtk", "sigterm", ("linger", FIRST_SEARCH_WAIT), "hold", "watch", *STEPS, "release"])
+
+    def test_gives_up_without_a_notification(self):
+        app = startup_app(get_flags=self.flags)
+        _out, err = self.startup(app, Taken(False, "gave up", 4242))
+        self.assertTrue(app._gave_up)
+        self.assertEqual(app.events, ["gtk", "sigterm", ("linger", FIRST_SEARCH_WAIT), "hold", "release", "quit"])
+        self.assertIn(STILL_RUNNING, err)
+
+    def test_the_first_search_lingers_longer(self):
+        # Waiting 10 s for the first search, counted from ready; 30 s after each search.
+        app = startup_app(get_flags=self.flags)
+        app.settings["accounts"] = []
+        Natter._search_chats(app)
+        self.assertEqual(app.events, [("linger", SEARCH_LINGER), "hold", "release"])
+
+    def test_not_a_service_keeps_no_linger(self):
         app = startup_app()
-        out, _ = self.startup(app, Taken(True, "taken over", 4242))
-        self.assertFalse(app._gave_up)
-        self.assertEqual(app.events[:2], ["watch", "scope"])
-        self.assertIn(f"natter: primary instance: app id {instance.APP_ID}, pid {os.getpid()}, "
-                      "lock taken over from pid 4242, on the session bus", out)
+        app.settings["accounts"] = []
+        Natter._search_chats(app)
+        self.assertEqual(app.events, ["hold", "release"])
+
+    def test_a_result_opened_while_starting_waits(self):
+        app = startup_app()
+        made = {}
+        app.open_chat = lambda account_id, name: app.events.append(("open", account_id, name))
+        app.go_to_chat = lambda query="": app.events.append(("search", query))
+        app._search_chats = lambda: []
+        with mock.patch("natter.app.SearchProvider", lambda bus, chats, open_chat, launch, allowed:
+                        made.update(open=open_chat, launch=launch)), \
+                mock.patch.object(Adw.Application, "do_dbus_register", lambda *_: True):
+            Natter.do_dbus_register(app, None, "/a/b")
+        made["open"]("work", "Mum")
+        made["launch"]("mu")
+        self.assertEqual(app._pending and len(app._pending), 2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.startup(app, Taken(True, "taken"))
+        spin()
+        self.assertEqual(app.events[-3:], [("open", "work", "Mum"), ("search", "mu"), "release"])
 
 
 class VerdictTest(unittest.TestCase):
@@ -792,6 +1153,7 @@ def launcher(probed, ran):
 
     with mock.patch.object(gstfix, "apply", lambda: None), mock.patch.object(gstfix, "start_own", lambda: None), \
             mock.patch("natter.__main__.check", return_value=0), mock.patch.object(system, "hide_system_bus"), \
+            mock.patch("natter.__main__.no_display", return_value=False), \
             mock.patch.object(Gio, "bus_get_sync", lambda *_: object()), \
             mock.patch.object(instance, "probe", lambda: probed or ran.append("probe") or (None, True)), \
             mock.patch("natter.app.main", lambda argv, owner=None: ran.append(("run", argv[1:], owner)) or 0):
@@ -828,7 +1190,7 @@ class LaunchTest(unittest.TestCase):
 
 class FakeApp:
     def __init__(self, statuses, made):
-        self.statuses, self.restart_args = statuses, None
+        self.statuses, self.restart_args, self.late_status = statuses, None, 0
         made.append(self)
 
     def run(self, argv):

@@ -341,9 +341,10 @@ class WiringTest(unittest.TestCase):
         return inspect.getsource(function)
 
     def test_the_guard_starts_once_the_web_context_is_made(self):
-        startup = self.source(Natter.do_startup)
-        made, guard = startup.index("self._make_web_context()"), startup.index("MemoryGuard(page_limit(total)")
-        self.assertLess(made, guard)
+        steps = self.source(Natter._start_steps)  # start-up's steps, in order
+        self.assertLess(steps.index("self._make_web_context"), steps.index("self._start_guard"))
+        startup = self.source(Natter._start_guard)
+        guard = startup.index("MemoryGuard(page_limit(total)")
         self.assertIn("calling=lambda: self.calling", startup)
         self.assertIn("ceiling=page_ceiling(total)", startup)
         self.assertIn("charge=unit_charge", startup)  # the unit's shmem and zswap, for the step line only
@@ -353,9 +354,9 @@ class WiringTest(unittest.TestCase):
         self.assertIn("self.memory_guard.stop()", self.source(Natter.quit_natter))
 
     def test_the_units_limits_follow_the_accounts(self):
-        startup = self.source(Natter.do_startup)
-        self.assertIn("move_to_own_scope(accounts=accounts)", startup)
-        self.assertIn("limit_own_scope(accounts)", startup)
+        startup = self.source(Natter._start_scope)  # without blocking the main loop
+        self.assertIn("move_to_own_scope_async(moved, accounts=accounts, bus=bus)", startup)
+        self.assertIn("limit_own_scope_async(limited, accounts, bus)", startup)
         for change in (Natter.add_account, Natter.remove_account):
             self.assertIn("limit_own_scope(len(self.accounts))", self.source(change))
 
@@ -393,7 +394,7 @@ class AttachLogTest(unittest.TestCase):
 
     def test_every_way_in_says_how(self):
         self.assertIn('self.send_files(paths, "paste")', inspect.getsource(Natter.paste))
-        self.assertIn('self.go_to_chat(files, how="share")', inspect.getsource(Natter.do_command_line))
+        self.assertIn('self.go_to_chat(files, how="share")', inspect.getsource(Natter._command_line))
         self.assertIn("account.attach(paths, done, how)", inspect.getsource(Natter.send_files))
         self.assertIn("self.go_to_chat(paths, how=how)", inspect.getsource(Natter.send_files))
         from natter.window import Window

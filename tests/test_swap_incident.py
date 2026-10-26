@@ -94,6 +94,29 @@ class FakeSystemd:
     def __init__(self, policy="stop", knows_oom_policy=True):
         self.policy, self.knows_oom_policy = policy, knows_oom_policy
         self.calls = []
+        self.systemd_there = True
+        self.waiting = []  # asynchronous calls not answered yet (call)
+
+    def call(self, *args):
+        *args, callback = args
+        self.waiting.append((args, callback))
+
+    def call_finish(self, result):
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def answer(self):
+        """The main loop, as far as systemd's answers go: each answered in turn."""
+        from gi.repository import GLib
+
+        while self.waiting:
+            args, callback = self.waiting.pop(0)
+            try:
+                result = self.call_sync(*args)
+            except GLib.Error as error:
+                result = error
+            callback(self, result)
 
     def call_sync(self, _name, _path, _interface, method, params, _reply, _flags, _timeout, _cancellable):
         from gi.repository import GLib
@@ -108,16 +131,16 @@ class FakeSystemd:
             return GLib.Variant("(o)", ("/org/freedesktop/systemd1/unit/natter",))
         if method == "Get":
             return GLib.Variant("(v)", (GLib.Variant("s", self.policy),))
+        if method == "NameHasOwner":
+            return GLib.Variant("(b)", (self.systemd_there,))
         return None
 
     def sent(self, method):
         return [args for name, args in self.calls if name == method]
 
 
-class ScopeLimitsTest(unittest.TestCase):
-    """The unit's backstop: MemoryMax and MemorySwapMax from the computer's memory, never
-    MemoryHigh (it only swapped the runaway and stalled the window), and OOMPolicy=continue where
-    Natter makes the scope, so the kernel ending a page doesn't stop Natter."""
+class ScopeCase(unittest.TestCase):
+    """systemd's user manager, Natter's unit and what system.py remembers of it, as stand-ins."""
 
     def setUp(self):
         from natter import APP_ID, system
@@ -148,6 +171,12 @@ class ScopeLimitsTest(unittest.TestCase):
     def limits(self, memory_max, swap_max):
         (self.cgroup / "memory.max").write_text(f"{memory_max}\n")
         (self.cgroup / "memory.swap.max").write_text(f"{swap_max}\n")
+
+
+class ScopeLimitsTest(ScopeCase):
+    """The unit's backstop: MemoryMax and MemorySwapMax from the computer's memory, never
+    MemoryHigh (it only swapped the runaway and stalled the window), and OOMPolicy=continue where
+    Natter makes the scope, so the kernel ending a page doesn't stop Natter."""
 
     def test_own_scope_is_made_with_the_limits_and_continue(self):
         with mock.patch.object(self.system, "in_own_scope", side_effect=[False, True]):
@@ -246,6 +275,102 @@ class ScopeLimitsTest(unittest.TestCase):
         with mock.patch.object(self.system, "own_cgroup", return_value=self.cgroup.parent / "vte-spawn-1.scope"):
             self.assertFalse(self.system.limit_own_scope())
             self.assertFalse(self.system.pages_end_alone())
+        self.assertEqual(self.bus.calls, [])
+
+
+class ScopeAsyncTest(ScopeCase):
+    """The same scope and limits at start-up, with systemd's answers coming back through the main
+    loop (move_to_own_scope_async, limit_own_scope_async): launches are answered meanwhile."""
+
+    def move(self, moved=(False, True), **more):
+        found = []
+        with mock.patch.object(self.system, "in_own_scope", side_effect=list(moved)):
+            self.system.move_to_own_scope_async(found.append, bus=self.bus, **more)
+            self.assertEqual(found, [])  # nothing until systemd answers
+            self.bus.answer()
+        return found
+
+    def test_made_the_same(self):
+        found = self.move()
+        name = self.system.scope_name(os.getpid())
+        self.assertEqual(found, [name])
+        (unit, mode, properties, _aux), = self.bus.sent("StartTransientUnit")
+        properties = dict(properties)
+        self.assertEqual((unit, mode), (name, "fail"))
+        self.assertEqual((properties["MemoryMax"], properties["MemorySwapMax"]), (6 * GiB, 4 * GiB))
+        self.assertEqual(properties["OOMPolicy"], "continue")
+        self.assertEqual(self.system._made_scope, name)
+        self.assertEqual(self.system.unit_oom_policy(name, self.bus), "continue")
+
+    def test_without_oom_policy_made_without_limits(self):
+        self.bus.knows_oom_policy = False
+        self.assertEqual(self.move(), [self.system.scope_name(os.getpid())])
+        first, second = self.bus.sent("StartTransientUnit")
+        self.assertIn("OOMPolicy", dict(first[2]))
+        for limit in ("OOMPolicy", "MemoryMax", "MemorySwapMax"):
+            self.assertNotIn(limit, dict(second[2]))
+        self.assertTrue(self.system._made_without_policy)
+        self.assertEqual(self.out.getvalue().count("sets no memory limit"), 1)
+
+    def test_none_without_systemd_or_in_a_unit_of_its_own(self):
+        self.bus.systemd_there = False
+        self.assertEqual(self.move(moved=(False,)), [None])
+        self.assertEqual(self.bus.sent("StartTransientUnit"), [])
+        found = []
+        with mock.patch.object(self.system, "in_own_scope", return_value=True):
+            self.system.move_to_own_scope_async(found.append, bus=self.bus)
+        self.assertEqual((found, self.bus.waiting), ([None], []))
+        with mock.patch.object(self.system, "in_sandbox", return_value=True):
+            self.system.move_to_own_scope_async(found.append, bus=self.bus)
+        self.assertEqual(found, [None, None])
+
+    def test_waits_for_the_move_on_a_timer(self):
+        # systemd moves the process once its job runs: the main loop goes on until it has.
+        from gi.repository import GLib
+
+        found = []
+        # Not yet at the start, nor once systemd answers, nor at the first timer; then moved.
+        with mock.patch.object(self.system, "in_own_scope", side_effect=[False, False, False, True]):
+            self.system.move_to_own_scope_async(found.append, bus=self.bus, timeout=5, poll=5)
+            self.bus.answer()
+            self.assertEqual(found, [])
+            context = GLib.MainContext.default()
+            for _ in range(100):
+                if found:
+                    break
+                context.iteration(True)
+        self.assertEqual(found, [self.system.scope_name(os.getpid())])
+
+    def test_a_step_that_fails_ends_it(self):
+        with mock.patch.object(self.system, "_scope_made", side_effect=RuntimeError), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.move(), [None])
+
+    def limit(self, **more):
+        found = []
+        self.system.limit_own_scope_async(found.append, bus=self.bus, **more)
+        self.bus.answer()
+        return found
+
+    def test_a_launchers_unit_that_stops_all_of_natter_gets_no_limit_async(self):
+        self.assertEqual(self.limit(), [False])
+        self.assertEqual(self.bus.sent("SetUnitProperties"), [])
+        self.assertIn(f"{self.cgroup.name} has OOMPolicy=stop", self.out.getvalue())
+        self.assertFalse(self.system.pages_end_alone())
+        self.assertEqual(len(self.bus.sent("GetUnit")), 1)  # asked once: pages_end_alone has it
+
+    def test_a_launcher_with_continue_gets_the_limits_async(self):
+        self.bus.policy = "continue"
+        self.assertEqual(self.limit(), [True])
+        (unit, runtime, properties), = self.bus.sent("SetUnitProperties")
+        self.assertEqual((unit, runtime, properties), (self.cgroup.name, True, [("MemoryMax", 6 * GiB),
+                                                                                 ("MemorySwapMax", 4 * GiB)]))
+        self.assertTrue(self.system.pages_end_alone())
+        self.assertEqual(len(self.bus.sent("GetUnit")), 1)
+
+    def test_nothing_in_a_unit_not_its_own_async(self):
+        with mock.patch.object(self.system, "own_cgroup", return_value=self.cgroup.parent / "vte-spawn-1.scope"):
+            self.assertEqual(self.limit(), [False])
         self.assertEqual(self.bus.calls, [])
 
 

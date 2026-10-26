@@ -93,10 +93,10 @@ On Fedora Atomic, `rpm-ostree install` can layer Fedora's packages instead (they
 a restart); the Flatpak is the other way there, and on Bazzite and SteamOS.
 
 Then download the latest release and install it. Its tag is the one marked *Latest* on the
-[Releases page](https://github.com/Officialbabs/natter/releases); put it in place of `v0.1.5` below:
+[Releases page](https://github.com/Officialbabs/natter/releases); put it in place of `v0.1.6` below:
 
 ```sh
-tag=v0.1.5   # the latest release's tag
+tag=v0.1.6   # the latest release's tag
 mkdir -p ~/.local/lib/natter/source && cd ~/.local/lib/natter/source
 curl -fsSL "https://github.com/Officialbabs/natter/archive/refs/tags/$tag.tar.gz" | tar -xz --strip-components=1
 ./install.sh   # adds Natter Den to your apps and `natter` to ~/.local/bin
@@ -105,10 +105,10 @@ curl -fsSL "https://github.com/Officialbabs/natter/archive/refs/tags/$tag.tar.gz
 ## Flatpak
 
 The Flatpak builds on GNOME's runtime (`org.gnome.Platform//50`), which brings GTK, libadwaita,
-WebKitGTK and GStreamer, so it doesn't depend on the system's versions. It hasn't been built and
-tried yet. Building it needs `flatpak` and `flatpak-builder` (on Ubuntu and Debian:
-`sudo apt install flatpak flatpak-builder`) and the Flathub remote. From Natter Den's source folder,
-for you alone (`get.sh --flatpak` does the same, building in `~/.cache/natter-den-flatpak`):
+WebKitGTK and GStreamer, so it doesn't depend on the system's versions. Building it needs `flatpak`
+and `flatpak-builder` (on Ubuntu and Debian: `sudo apt install flatpak flatpak-builder`) and the
+Flathub remote. From Natter Den's source folder, for you alone (`get.sh --flatpak` does the same,
+building in `~/.cache/natter-den-flatpak`):
 
 ```sh
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
@@ -117,10 +117,26 @@ flatpak-builder --user --install --force-clean build-flatpak packaging/io.github
 flatpak run io.github.Officialbabs.Natter
 ```
 
+Without `sudo`, Flathub's own flatpak-builder does the same: `flatpak install --user flathub
+org.flatpak.Builder`, then `flatpak run org.flatpak.Builder` in place of `flatpak-builder`. If it
+stops at "Failure spawning rofiles-fuse", add `--disable-rofiles-fuse`. GNOME's runtime and SDK,
+with that builder, take about 4 GB.
+
+How far it's been tried, with GNOME 50 in October 2026: the manifest builds, Flathub's linter finds
+nothing but the missing screenshots (see [Flathub checklist](#flathub-checklist)), and Natter Den's
+own dependency check finds everything inside, calls' pieces included: WebKitGTK 2.54, GStreamer 1.26
+with its WebRTC, libnice and PipeWire plugins, and the H.264 and AAC decoders from the codecs
+extension. In `flatpak build`'s sandbox it starts, shows its window, loads a page and quits cleanly.
+Not tried yet: the installed Flatpak with WhatsApp, notifications, the tray, calls and the camera,
+and WebKit's own sandbox for its pages. `flatpak build` can't start that sandbox (`flatpak-spawn
+--sandbox` needs an app started with `flatpak run`), so there WebKit runs its pages without one.
+
 In the Flatpak, notifications go through the notification portal, start at login through the
 Background portal, and there's no dock badge or recent chats in the dock menu (the tray shows the
-count). The manifest adds no modules for GStreamer's WebRTC plugins, so whether calls work in the
-Flatpak depends on what the runtime has. The camera fix isn't used there.
+count). Its accounts and settings are in `~/.var/app/io.github.Officialbabs.Natter`, apart from
+those of the Natter Den `install.sh` installs, so each account is linked again there. The camera
+fix isn't used there (the build makes it, but `natter/gstfix.py` leaves a Flatpak's GStreamer
+alone); GNOME 50's GStreamer, 1.26, doesn't need it.
 
 ## Distribution packages
 

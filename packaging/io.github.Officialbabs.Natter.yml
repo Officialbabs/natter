@@ -2,11 +2,17 @@
 #
 #   flatpak-builder --user --install --force-clean build-flatpak packaging/io.github.Officialbabs.Natter.yml
 #
+# Without flatpak-builder on the system, Flathub's (flatpak install --user flathub org.flatpak.Builder)
+# does the same as `flatpak run org.flatpak.Builder …`. Where it stops at "Failure spawning
+# rofiles-fuse", add --disable-rofiles-fuse.
+#
 # GNOME's runtime already has everything Natter uses (Python, PyGObject, GTK 4, libadwaita,
-# WebKitGTK 6.0, libsoup 3, GStreamer, and the H.264/AAC codecs through the freedesktop
-# codecs-extra extension), so Natter itself is only Python files: meson.build copies them to
-# /app/share/natter, byte-compiles them, and installs the launcher, desktop file, icons,
-# metainfo, D-Bus service and search provider.
+# WebKitGTK 6.0, libsoup 3, GStreamer with the WebRTC, libnice and PipeWire plugins calls and the
+# camera need, and the H.264/AAC codecs through the freedesktop codecs-extra extension), so the
+# manifest builds only Natter: meson.build copies its Python files to /app/share/natter,
+# byte-compiles them, and installs the launcher, desktop file, icons, metainfo, D-Bus service and
+# search provider. It builds the camera fix too, as the SDK has a compiler and GStreamer's
+# headers, but Natter doesn't use it in a Flatpak (natter/gstfix.py).
 id: io.github.Officialbabs.Natter
 runtime: org.gnome.Platform
 runtime-version: '50'

@@ -10,9 +10,9 @@ So, as well as the name:
 
 - the instance lock (InstanceLock, take): a primary holds an flock on a file of its own, which
   the kernel lets go of when the process ends, however it ends. A primary that finds it held
-  waits a while for the other to end. If the other has provably lost its bus connection (it's
-  frozen, as on 25 Oct) it's ended (end_stale); otherwise the new one quits without starting
-  WhatsApp;
+  waits a while for the other to end, from its main loop (take_later), which answers launches
+  meanwhile. If the other has provably lost its bus connection (it's frozen, as on 25 Oct) it's
+  ended (end_stale); otherwise the new one quits without starting WhatsApp;
 - the name watchdog (NameWatchdog): a thread, so a stalled main loop doesn't stall it, that asks
   the bus who owns the name. Once the name is surely lost it asks the main loop to quit, and ends
   the process itself if that hasn't happened GRACE seconds later;
@@ -196,16 +196,11 @@ def pid_words(pid: Optional[int]) -> str:
     return f"pid {pid}" if pid else "pid unknown"
 
 
-def take(lock: InstanceLock, wait: float = LOCK_WAIT, poll: float = LOCK_POLL,
-         sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
-         log: Callable[[str], None] = say, end_holder: Optional[Callable[[], bool]] = None,
-         kill_wait: float = KILL_WAIT) -> Taken:
-    """Take the instance lock, waiting up to `wait` seconds for another Natter Den holding it
-    to end. Only a primary calls this, so another holder is one without its bus name: quitting,
-    or lost. Still held after the wait, `end_holder` (end_stale) may end it, when it can prove
-    the holder's bus connection has gone, and the lock is taken once it's free. A lock that
-    can't be had at all (no folder for it) doesn't stop Natter: the bus name still keeps a
-    second one out, as it did before the lock."""
+def taking(lock: InstanceLock, wait: float = LOCK_WAIT, poll: float = LOCK_POLL,
+           clock: Callable[[], float] = time.monotonic, log: Callable[[str], None] = say,
+           end_holder: Optional[Callable[[], bool]] = None, kill_wait: float = KILL_WAIT):
+    """take's steps, as a generator: it yields how long to wait before its next try, and
+    returns the Taken. The first try is made on the first next()."""
     try:
         if lock.try_take():
             return Taken(True, "taken")
@@ -216,7 +211,7 @@ def take(lock: InstanceLock, wait: float = LOCK_WAIT, poll: float = LOCK_POLL,
     log(f"natter: another {NAME} ({pid_words(holder)}) still runs without its bus name; waiting for it to end")
     deadline = clock() + wait
     while clock() < deadline:
-        sleep(poll)
+        yield poll
         try:
             if lock.try_take():
                 log(f"natter: the other {NAME} ({pid_words(holder)}) has ended; taking over")
@@ -232,7 +227,7 @@ def take(lock: InstanceLock, wait: float = LOCK_WAIT, poll: float = LOCK_POLL,
     if ended:
         deadline = clock() + kill_wait
         while clock() < deadline:
-            sleep(poll)
+            yield poll
             try:
                 if lock.try_take():
                     log(f"natter: the other {NAME} ({pid_words(holder)}) has been ended; taking over")
@@ -242,6 +237,56 @@ def take(lock: InstanceLock, wait: float = LOCK_WAIT, poll: float = LOCK_POLL,
     log(f"natter: another {NAME} ({pid_words(holder)}) still holds {lock.path} after {wait:g} s; "
         "quitting without starting WhatsApp")
     return Taken(False, "gave up", holder)
+
+
+def take(lock: InstanceLock, wait: float = LOCK_WAIT, poll: float = LOCK_POLL,
+         sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+         log: Callable[[str], None] = say, end_holder: Optional[Callable[[], bool]] = None,
+         kill_wait: float = KILL_WAIT) -> Taken:
+    """Take the instance lock, waiting up to `wait` seconds for another Natter Den holding it
+    to end. Only a primary calls this, so another holder is one without its bus name: quitting,
+    or lost. Still held after the wait, `end_holder` (end_stale) may end it, when it can prove
+    the holder's bus connection has gone, and the lock is taken once it's free. A lock that
+    can't be had at all (no folder for it) doesn't stop Natter: the bus name still keeps a
+    second one out, as it did before the lock. It blocks while it waits: start-up uses take_later."""
+    steps = taking(lock, wait, poll, clock, log, end_holder, kill_wait)
+    try:
+        while True:
+            sleep(next(steps))
+    except StopIteration as stop:
+        return stop.value
+
+
+def take_later(lock: InstanceLock, done: Callable[[Taken], None], wait: float = LOCK_WAIT,
+               poll: float = LOCK_POLL, clock: Callable[[], float] = time.monotonic,
+               log: Callable[[str], None] = say, end_holder: Optional[Callable[[], bool]] = None,
+               kill_wait: float = KILL_WAIT,
+               timeout_add: Callable[[int, Callable[[], bool]], int] = GLib.timeout_add) -> Optional[Taken]:
+    """take, without blocking the main loop. The first try is made now: when that settles it,
+    the Taken is returned, and `done` isn't called. Otherwise None, and the wait goes on in
+    timers on the main loop, which runs meanwhile, until done(Taken) is called, once."""
+    steps = taking(lock, wait, poll, clock, log, end_holder, kill_wait)
+    try:
+        first = next(steps)
+    except StopIteration as stop:
+        return stop.value
+
+    def step() -> bool:
+        try:
+            delay = next(steps)
+        except StopIteration as stop:
+            taken = stop.value
+        except Exception:  # a bug: given up, as a timer that raises is dropped and done would never come
+            traceback.print_exc()
+            taken = Taken(False, "gave up")
+        else:
+            timeout_add(max(1, round(delay * 1000)), step)
+            return GLib.SOURCE_REMOVE
+        done(taken)  # out of the except clauses, so a raise in done isn't taken for the lock's
+        return GLib.SOURCE_REMOVE
+
+    timeout_add(max(1, round(first * 1000)), step)
+    return None
 
 
 def primary_line(taken: Taken, app_id: str = APP_ID, pid: Optional[int] = None) -> str:

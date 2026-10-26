@@ -467,7 +467,7 @@ class WindowThemeTest(unittest.TestCase):
 
     def test_startup_order(self):
         # Ada's style is known before the first style is set, and the theme follows that style.
-        startup = source(Natter.do_startup)
+        startup = source(Natter._start_look)  # a step of start-up's
         ada, appearance, theme = (startup.index("AdaStyle(on_change=self._apply_appearance)"),
                                   startup.index("self._apply_appearance()"), startup.index("self._start_theme()"))
         self.assertLess(ada, appearance)

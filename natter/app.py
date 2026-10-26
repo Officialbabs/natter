@@ -38,14 +38,15 @@ from .mediapause import Bus as PlayerBus, VoicePause
 from .memguard import (KILL_MEMORY, OOM_SCORE_ADJ, MiB, MemoryGuard, in_flatpak, kill as kill_web_process,
                        mem_total, page_ceiling, page_limit, page_limits, page_sizes, web_processes)
 from .instance import (STILL_RUNNING, InstanceLock, NameWatchdog, bus_id, end_stale, end_webkit, lock_path,
-                       notice as instance_notice, owner_now, primary_line, take as take_instance,
+                       notice as instance_notice, owner_now, primary_line, take_later as take_instance,
                        UNKNOWN as OWNER_UNKNOWN)
 from .notify import Notifier, ReplyTarget
 from .reply import LIMIT as REPLY_LIMIT, ReplyWindow, notice as reply_notice, units as reply_units
 from .search import SearchProvider
 from .settings import AUTOSTART, CACHE, CONFIG, DATA, Chat, ChatIndex, Settings, private_folder
 from .system import (AudioFollower, CallSound, LoopMeter, Reclaimer, footprint, give_system_bus, in_own_scope,
-                     in_sandbox, limit_own_scope, media_report, memory_events, memory_tight, move_to_own_scope,
+                     in_sandbox, limit_own_scope, limit_own_scope_async, media_report, memory_events,
+                     memory_tight, move_to_own_scope_async,
                      network_processes, open_uri, own_swap, pages_end_alone, request_background, unit_charge)
 from .tray import MenuItem, Tray, tray_host_available
 
@@ -133,6 +134,7 @@ HIDDEN_BEFORE_RECLAIM = 90  # seconds hidden before Natter gives memory back
 RECLAIM_AGAIN = 15 * 60  # and again this often while it stays hidden
 SETTLE_BEFORE_RECLAIM = 10 * 60  # seconds after a page's last load before its memory goes to swap
 SEARCH_LINGER = 30_000  # ms a Natter started only for desktop search stays after the last search
+FIRST_SEARCH_WAIT = 10_000  # ms it waits for the first search, as GLib would without start-up's hold
 MEDIA_CHECK_DELAY = 10  # seconds after WhatsApp is up, so the check doesn't slow its start
 SNAPSHOTS = CACHE / "snapshots"  # the only folder debug snapshots are saved to
 UNLOCK_QUEUE = 4  # requests that wait for the unlock at most (_held_while_locked), oldest dropped
@@ -170,13 +172,12 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>One copy at a time, and no silent hangs at launch.</p>"
+RELEASE_NOTES = ("<p>A start-up that answers at once.</p>"
                  "<ul>"
-                 "<li>Only one copy runs at a time: a lock the session bus can't take away, held for the app's life</li>"
-                 "<li>A copy that loses its place on the session bus ends itself, so the next launch starts cleanly</li>"
-                 "<li>A copy cut off from the bus while frozen is ended by the next launch</li>"
-                 "<li>A launch against a copy that is paused or busy says so, instead of hanging silently</li>"
-                 "<li>The log says which copy started, and why one ended</li>"
+                 "<li>A starting copy answers launches at once: its set-up runs in the background, and launches that arrive meanwhile are kept and run in order</li>"
+                 "<li>A copy started only to answer desktop search leaves 10 seconds after starting if no search comes</li>"
+                 "<li>A clear message, instead of a crash, when there's no display to open a window on</li>"
+                 "<li>The Flatpak build has been tried: it builds, and everything calls, the camera and videos need is inside</li>"
                  "</ul>")
 
 
@@ -606,6 +607,19 @@ def end_pages(accounts: Iterable, anchor, then: Optional[Callable[[], None]] = N
         GLib.timeout_add(QUIT_LOOK, look)
 
 
+_marks: list[float] = []  # start-up's first and latest marks (start_mark)
+
+
+def start_mark(step: str) -> None:
+    """With NATTER_DEBUG: a line saying how long start-up's step `step` took, and how far in it is."""
+    if not GLib.getenv("NATTER_DEBUG"):
+        return
+    now = time.monotonic()
+    first, last = (_marks[0], _marks[-1]) if _marks else (now, now)
+    _marks[:] = [first, now]
+    print(f"natter: start-up: {step} +{(now - last) * 1000:.0f} ms ({(now - first) * 1000:.0f} ms in)", flush=True)
+
+
 class Natter(Adw.Application):
     def __init__(self) -> None:
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
@@ -693,6 +707,20 @@ class Natter(Adw.Application):
         self._camera_waiting: list[Callable[[Optional[str]], None]] = []
         self._camera_gate_before: Optional[str] = None
         self._camera_gate_was: Optional[str] = None  # the desktop's answer as Natter last acted on it
+        # Start-up (do_startup, _start_steps). Launches wait on Natter's main loop from the moment
+        # it owns its bus name, so the slow steps run on it one by one, and what asks for the
+        # window meanwhile (an activation, a command line, a search result, an action) waits
+        # here, oldest first, as (run, drop): `drop` answers it should start-up be given up.
+        self._started = False  # the steps are done
+        self._ready = False  # and what waited has run
+        self._pending: list[tuple[Callable[[], None], Optional[Callable[[], None]]]] = []
+        self._start_hold = False
+        self._gave_up = False  # another Natter Den holds the instance lock (_instance_taken)
+        self._quitting = False
+        self._window_services = False
+        self.scope: Optional[str] = None
+        self.late_status = 0  # a first command line that ran once ready, and failed (main)
+        self.expect_primary = False  # no Natter Den was running at launch (main): GTK's style starts early
         self.add_main_option("background", ord("b"), GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
                              "Start in the background, without opening the window", None)
         self.add_main_option("chat", ord("c"), GLib.OptionFlags.NONE, GLib.OptionArg.STRING,
@@ -713,85 +741,36 @@ class Natter(Adw.Application):
         if options.contains("version"):
             print(f"{NAME} {VERSION}")
             return 0
+        if self.expect_primary:
+            # Before the bus name: libadwaita's start (its style sheets, the icon theme) takes
+            # half a second, and launches wait on the primary from the moment it owns the name.
+            # do_startup would do it anyway.
+            start_mark("launch")
+            Adw.init()
+            start_mark("libadwaita (Adw.init), before the bus name")
         return -1
 
     # ---- Start-up --------------------------------------------------------------------------
 
     def do_startup(self) -> None:
-        # Only the first instance gets here, once it owns the bus name. The instance lock first
-        # (instance.py): a Natter that lost its name may still be running.
-        if not self._take_instance():
-            return
-        # Group Natter's processes under a scope of its
-        # own before WebKit starts any (a desktop's launcher makes one; a terminal doesn't).
-        accounts = len(self.settings["accounts"])
-        self.scope = move_to_own_scope(accounts=accounts)
-        if self.scope is None:
-            limit_own_scope(accounts)  # a launcher's scope: the same backstop as Natter's own
-        # Counted from here: an oom_kill from before this start (in a launcher's scope) isn't a page's.
-        self._memory_events = memory_events()
-        self._oom_kills = self._unit_events().get("oom_kill", 0)
+        # Only the first instance gets here, once it owns the bus name. From then on launches
+        # wait on its main loop (GLib's DescribeAll, 25 s), so only what can't wait is done here:
+        # GTK's start, the actions the bus may ask for, and the instance lock's first try. The
+        # rest follows on the main loop, one step at a time (_start_steps); what asks for the
+        # window meanwhile waits for it (_when_ready).
+        start_mark("do_startup")
         Adw.Application.do_startup(self)
-        Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(str(ICONS))
-        Gtk.Window.set_default_icon_name(DEFAULT_APP_ID)  # a separate instance (NATTER_APP_ID) has no icon of its own
-        if on_ada():
-            # Ada's Light, Dark or Dune, which "Follow System" follows there, changing along with it.
-            self.ada_style = AdaStyle(on_change=self._apply_appearance)
-        self._apply_appearance()
-        self._start_theme()
-        # Decided now however Natter was started (D-Bus starts it as a service for a search, and
-        # for its menu entry on some desktops): WebKit's processes, started later, need it set.
-        if GLib.getenv("NATTER_CALLS") != "window":
-            from .__main__ import calls_missing
-
-            self.calls_lacking = calls_missing()
-        self.calls_in_page = GLib.getenv("NATTER_CALLS") != "window" and not self.calls_lacking and rtc.available()
-        self._make_web_context()
-        # WebKit's own limit (MEMORY_KILL) can't stop a page that grows while it's busy, or into
-        # swap: the guard looks at every page from a thread of Natter's own, window shown or not,
-        # and ends one past its limit (a crash its view puts down to memory: Account._on_crash).
-        # A call gets more room, as ending the page would end it.
-        # Its pages are the kernel's first choice only where that ends the page alone: in a unit
-        # whose OOMPolicy is "continue" (system.py). Elsewhere that would stop all of Natter.
-        total = mem_total()
-        self.memory_guard = MemoryGuard(page_limit(total), calling=lambda: self.calling, ceiling=page_ceiling(total),
-                                        oom_score_adj=OOM_SCORE_ADJ if pages_end_alone() else None,
-                                        charge=unit_charge)
-        self.memory_guard.start()
-        self._apply_spelling()
-
-        bus = self.get_dbus_connection()
-        self.notifier = Notifier(self, self._open_from_notification, self.on_reply)
-        self.badge = Badge(bus)
-        self.reclaimer = Reclaimer(on_done=self._reclaimed)
-        self.call_sound = CallSound()
-        self.loop_meter = LoopMeter()  # how late the main loop runs during a call (_measure_call)
-        # The page's sound follows the computer's output (Bluetooth headphones connected later).
-        self.audio_follower = AudioFollower(on_change=self._devices_changed)
-        # Other apps' players pause while a voice message is recorded, and play again after.
-        self.voice_pause = VoicePause(PlayerBus(self.get_dbus_connection),
-                                      enabled=lambda: bool(self.settings["pause_other_audio"]),
-                                      calling=lambda: self.calling or bool(self.calls and self.calls.in_call))
-        self._window_services = False
-        clipboard.tidy()
-        self.settings.connect(self._on_setting)
-        GLib.timeout_add_seconds(60, self._minute)
-        GLib.timeout_add_seconds(20, self._check_idle)
-        GLib.timeout_add_seconds(MEMORY_CHECK, self._check_memory)
-        self._network_processes: set[int] = set()
-        self._network_looks = 0
-        self._last_look = time.monotonic()
-        self._quitting = False
-        GLib.timeout_add_seconds(NETWORK_CHECK_EARLY, self._check_network_process)
+        start_mark("GTK (Adw.Application.do_startup)")
         # Asked to stop (the desktop closing apps to make room, logging out): quit properly, so
         # the tray icon goes and what Natter knows is saved, instead of just vanishing.
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, self._on_terminate)
-        Gio.NetworkMonitor.get_default().connect("network-changed", self._on_network)
         if self.get_flags() & Gio.ApplicationFlags.IS_SERVICE:
             # Started over D-Bus by a search: answer from the chat lists on disk, without
-            # WhatsApp, and leave once the searching stops (GLib waits 10 s for the first
-            # call). Opening a result builds the window.
-            self.set_inactivity_timeout(SEARCH_LINGER)
+            # WhatsApp, and leave once the searching stops. Start-up's hold keeps GLib from
+            # waiting its 10 s for the first call, so that wait counts from ready instead, and
+            # the first search turns it into SEARCH_LINGER (_search_chats). Opening a result
+            # builds the window.
+            self.set_inactivity_timeout(FIRST_SEARCH_WAIT)
 
         for name, run, accels in [
             ("preferences", self.show_preferences, ["<Control>comma"]),
@@ -814,72 +793,255 @@ class Natter(Adw.Application):
             ("quit", self.quit_natter, ["<Control>q"]),
         ]:
             action = Gio.SimpleAction.new(name, None)
-            action.connect("activate", lambda _a, _p, run=run: run())
+            action.connect("activate", self._gated(lambda _a, _p, run=run: run()))
             self.add_action(action)
             if accels:
                 self.set_accels_for_action(f"app.{name}", accels)
         blur = Gio.SimpleAction.new_stateful("privacy-blur", None, GLib.Variant("b", self.settings["privacy_blur"]))
-        blur.connect("change-state", lambda a, v: self.settings.__setitem__("privacy_blur", v.get_boolean()))
+        blur.connect("change-state", self._gated(lambda a, v: self.settings.__setitem__("privacy_blur",
+                                                                                 v.get_boolean())))
         self.add_action(blur)
         self.set_accels_for_action("app.privacy-blur", ["<Control><Shift>b"])
         # The microphone and camera switches, as check items (the menu, the palette), and
         # allow-media to turn one on: never off, so a toast's Turn On can't undo itself later.
         for kind in MEDIA_KINDS:
             switch = Gio.SimpleAction.new_stateful(kind, None, GLib.Variant("b", bool(self.settings[kind])))
-            switch.connect("change-state", lambda _a, v, kind=kind: self.settings.__setitem__(kind, v.get_boolean()))
+            switch.connect("change-state", self._gated(
+                lambda _a, v, kind=kind: self.settings.__setitem__(kind, v.get_boolean())))
             self.add_action(switch)
         allow = Gio.SimpleAction.new("allow-media", GLib.VariantType("s"))
-        allow.connect("activate", lambda _a, v: v.get_string() in MEDIA_KINDS
-                      and self.settings.__setitem__(v.get_string(), True))
+        allow.connect("activate", self._gated(lambda _a, v: v.get_string() in MEDIA_KINDS
+                                              and self.settings.__setitem__(v.get_string(), True)))
         self.add_action(allow)
         page = Gio.SimpleAction.new("preferences-page", GLib.VariantType("s"))
-        page.connect("activate", lambda _a, v: v.get_string() in PREFERENCES_PAGES
-                     and self.show_preferences(v.get_string()))
+        page.connect("activate", self._gated(lambda _a, v: v.get_string() in PREFERENCES_PAGES
+                                             and self.show_preferences(v.get_string())))
         self.add_action(page)
         account = Gio.SimpleAction.new("show-account", GLib.VariantType("s"))  # by its id
-        account.connect("activate", lambda _a, v: self.open_account(v.get_string()))
+        account.connect("activate", self._gated(lambda _a, v: self.open_account(v.get_string())))
         self.add_action(account)
         open_chat = Gio.SimpleAction.new("open-chat", GLib.VariantType("(ss)"))
-        open_chat.connect("activate", lambda _a, v: self.open_chat(v[0], v[1]))
+        open_chat.connect("activate", self._gated(lambda _a, v: self.open_chat(v[0], v[1])))
         self.add_action(open_chat)
         open_file = Gio.SimpleAction.new("open-file", GLib.VariantType("s"))
-        open_file.connect("activate", lambda _a, v: self._open_file(v.get_string()))
+        open_file.connect("activate", self._gated(lambda _a, v: self._open_file(v.get_string())))
         self.add_action(open_file)
         # A reply window that failed out of sight, by its own reference (its notice's Show Reply).
         show_reply = Gio.SimpleAction.new("show-reply", GLib.VariantType("s"))
-        show_reply.connect("activate", lambda _a, v: self.show_reply(v.get_string()))
+        show_reply.connect("activate", self._gated(lambda _a, v: self.show_reply(v.get_string())))
         self.add_action(show_reply)
         # Only once a restart would help (_on_anchor_gone): anything on the bus can call an action.
         restart = Gio.SimpleAction.new("restart", None)
-        restart.connect("activate", lambda *_: self.restart())
+        restart.connect("activate", self._gated(lambda *_: self.restart()))
         restart.set_enabled(False)
         self.add_action(restart)
         if GLib.getenv("NATTER_DEBUG"):
             self._debug_actions()
+        # Held until ready: a first launch's command line waits in the queue, not on a main loop
+        # that would end with nothing holding it.
+        self.hold()
+        self._start_hold = True
+        self._take_instance()
+        start_mark("do_startup done")
 
-    def _take_instance(self) -> bool:
-        """Take the instance lock (instance.take), and watch the bus name from then on. A holder
-        that has provably lost its bus connection is ended (instance.end_stale). False, after
-        starting GTK and asking to quit, when another Natter Den still holds the lock: nothing
-        else starts, WhatsApp's pages least of all."""
-        self._gave_up = False
+    def _take_instance(self) -> None:
+        """Take the instance lock (instance.take_later): its first try now, and if another
+        Natter Den holds it, its wait on the main loop, which answers launches meanwhile. A
+        holder that has provably lost its bus connection is ended (instance.end_stale)."""
         bus = self.get_dbus_connection()
         lock = self.instance_lock = InstanceLock(lock_path())  # held, by its open file, while Natter runs
-        taken = take_instance(lock, end_holder=lambda: end_stale(lock, bus))
+        taken = take_instance(lock, self._instance_taken, end_holder=lambda: end_stale(lock, bus))
+        if taken is not None:
+            self._instance_taken(taken)
+
+    def _instance_taken(self, taken) -> None:
+        """The lock's answer. Taken: the bus name is watched from then on, and start-up's steps
+        begin. Given up, because another Natter Den still holds it: nothing else starts,
+        WhatsApp's pages least of all, what waited for start-up is dropped, and Natter quits."""
+        bus = self.get_dbus_connection()
         if not taken.ok:
             self._gave_up = True
             print(f"natter: {STILL_RUNNING}", file=sys.stderr, flush=True)
-            Adw.Application.do_startup(self)  # GApplication insists on it
             # Not for a search's start: the person didn't open Natter Den, and may type on.
             if not self.get_flags() & Gio.ApplicationFlags.IS_SERVICE:
                 instance_notice(bus, STILL_RUNNING)
+            self._drop_pending()
             self.quit()
-            return False
-        if bus is not None:  # for a later Natter Den, should this one freeze without its name
-            lock.note(bus_id(bus) or "", bus.get_unique_name() or "")
-        print(primary_line(taken), flush=True)
-        self._start_name_watch()
-        return True
+            return
+        try:
+            if bus is not None:  # for a later Natter Den, should this one freeze without its name
+                self.instance_lock.note(bus_id(bus) or "", bus.get_unique_name() or "")
+            print(primary_line(taken), flush=True)
+            self._start_name_watch()
+        except Exception:  # none of it is worth stopping for: start-up would wait for good
+            traceback.print_exc()
+        start_mark("instance lock")
+        self._start_steps()
+
+    def _start_steps(self) -> None:
+        """Start-up's slow steps, in order, each from the main loop once the one before is done,
+        so launches, searches and the bus are answered in between. The scope comes before WebKit
+        starts any process, and the lock (_instance_taken) before both. Then ready (_now_ready)."""
+        steps = [self._start_look, self._start_scope, self._start_calls, self._make_web_context,
+                 self._start_guard, self._start_services]
+
+        def run(index: int) -> bool:
+            if self._quitting:  # quit while starting (quit_natter): no more steps
+                return GLib.SOURCE_REMOVE
+            if index == len(steps):
+                self._now_ready()
+                return GLib.SOURCE_REMOVE
+            done = []
+
+            def then() -> None:
+                if not done:
+                    done.append(True)
+                    start_mark(steps[index].__name__)
+                    GLib.idle_add(run, index + 1)
+
+            try:
+                steps[index](then)
+            except Exception:  # a step that fails mustn't leave Natter waiting for good
+                traceback.print_exc()
+                then()
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(run, 0)
+
+    def _start_look(self, then: Callable[[], None]) -> None:
+        Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(str(ICONS))
+        Gtk.Window.set_default_icon_name(DEFAULT_APP_ID)  # a separate instance (NATTER_APP_ID) has no icon of its own
+        if on_ada():
+            # Ada's Light, Dark or Dune, which "Follow System" follows there, changing along with it.
+            self.ada_style = AdaStyle(on_change=self._apply_appearance)
+        self._apply_appearance()
+        self._start_theme()
+        then()
+
+    def _start_scope(self, then: Callable[[], None]) -> None:
+        """Group Natter's processes under a scope of its own before WebKit starts any (a
+        desktop's launcher makes one; a terminal doesn't), with systemd's answers coming back
+        through the main loop (system.move_to_own_scope_async)."""
+        accounts = len(self.settings["accounts"])
+        bus = self.get_dbus_connection()
+
+        # Each answer goes on to the next step whatever happens here: one that raised would
+        # be dropped, and start-up would wait on it for good.
+        def limited(_set: bool = False) -> None:
+            try:
+                # Counted from here: an oom_kill from before this start (in a launcher's scope) isn't a page's.
+                self._memory_events = memory_events()
+                self._oom_kills = self._unit_events().get("oom_kill", 0)
+            except Exception:
+                traceback.print_exc()
+            then()
+
+        def moved(scope: Optional[str]) -> None:
+            self.scope = scope
+            try:
+                if scope is None:  # a launcher's scope: the same backstop as Natter's own
+                    limit_own_scope_async(limited, accounts, bus)
+                    return
+            except Exception:
+                traceback.print_exc()
+            limited()
+
+        move_to_own_scope_async(moved, accounts=accounts, bus=bus)
+
+    def _start_calls(self, then: Callable[[], None]) -> None:
+        # Decided now however Natter was started (D-Bus starts it as a service for a search, and
+        # for its menu entry on some desktops): WebKit's processes, started later, need it set.
+        if GLib.getenv("NATTER_CALLS") != "window":
+            from .__main__ import calls_missing
+
+            self.calls_lacking = calls_missing()
+        self.calls_in_page = GLib.getenv("NATTER_CALLS") != "window" and not self.calls_lacking and rtc.available()
+        then()
+
+    def _start_guard(self, then: Callable[[], None]) -> None:
+        # WebKit's own limit (MEMORY_KILL) can't stop a page that grows while it's busy, or into
+        # swap: the guard looks at every page from a thread of Natter's own, window shown or not,
+        # and ends one past its limit (a crash its view puts down to memory: Account._on_crash).
+        # A call gets more room, as ending the page would end it.
+        # Its pages are the kernel's first choice only where that ends the page alone: in a unit
+        # whose OOMPolicy is "continue" (system.py). Elsewhere that would stop all of Natter.
+        total = mem_total()
+        self.memory_guard = MemoryGuard(page_limit(total), calling=lambda: self.calling, ceiling=page_ceiling(total),
+                                        oom_score_adj=OOM_SCORE_ADJ if pages_end_alone() else None,
+                                        charge=unit_charge)
+        self.memory_guard.start()
+        self._apply_spelling()
+        then()
+
+    def _start_services(self, then: Callable[[], None]) -> None:
+        bus = self.get_dbus_connection()
+        self.notifier = Notifier(self, self._open_from_notification, self.on_reply)
+        self.badge = Badge(bus)
+        self.reclaimer = Reclaimer(on_done=self._reclaimed)
+        self.call_sound = CallSound()
+        self.loop_meter = LoopMeter()  # how late the main loop runs during a call (_measure_call)
+        # The page's sound follows the computer's output (Bluetooth headphones connected later).
+        self.audio_follower = AudioFollower(on_change=self._devices_changed)
+        # Other apps' players pause while a voice message is recorded, and play again after.
+        self.voice_pause = VoicePause(PlayerBus(self.get_dbus_connection),
+                                      enabled=lambda: bool(self.settings["pause_other_audio"]),
+                                      calling=lambda: self.calling or bool(self.calls and self.calls.in_call))
+        clipboard.tidy()
+        self.settings.connect(self._on_setting)
+        GLib.timeout_add_seconds(60, self._minute)
+        GLib.timeout_add_seconds(20, self._check_idle)
+        GLib.timeout_add_seconds(MEMORY_CHECK, self._check_memory)
+        self._network_processes: set[int] = set()
+        self._network_looks = 0
+        self._last_look = time.monotonic()
+        GLib.timeout_add_seconds(NETWORK_CHECK_EARLY, self._check_network_process)
+        Gio.NetworkMonitor.get_default().connect("network-changed", self._on_network)
+        then()
+
+    def _now_ready(self) -> None:
+        """The steps are done: what waited runs, oldest first, each once. What it queues in turn
+        runs after it; a quit on the way drops the rest."""
+        self._started = True
+        while self._pending and not self._quitting:
+            run, _drop = self._pending.pop(0)
+            try:
+                run()
+            except Exception:  # one that fails mustn't keep the rest from running
+                traceback.print_exc()
+        self._drop_pending()  # only after a quit
+        self._ready = True
+        self._release_start()
+        start_mark("ready")
+
+    def _when_ready(self, run: Callable[[], None], drop: Optional[Callable[[], None]] = None) -> None:
+        """Run `run` now if start-up is done, or once it is, after what came before it. Dropped
+        if start-up is given up (another Natter Den holds the lock): `drop` runs instead."""
+        if self._gave_up:
+            if drop is not None:
+                drop()
+        elif self._ready:
+            run()
+        else:
+            self._pending.append((run, drop))
+
+    def _gated(self, handler: Callable) -> Callable:
+        """An action's handler that waits for start-up (_when_ready)."""
+        return lambda *args: self._when_ready(lambda: handler(*args))
+
+    def _drop_pending(self) -> None:
+        pending, self._pending = self._pending, []
+        for _run, drop in pending:
+            if drop is not None:
+                try:
+                    drop()
+                except Exception:
+                    traceback.print_exc()
+        self._release_start()
+
+    def _release_start(self) -> None:
+        if self._start_hold:
+            self._start_hold = False
+            self.release()
 
     def _start_name_watch(self) -> None:
         """The bus-name watchdog (instance.NameWatchdog), on a thread of its own."""
@@ -928,7 +1090,7 @@ class Natter(Adw.Application):
                     run(argument)
 
             action = Gio.SimpleAction.new(name, GLib.VariantType("s"))
-            action.connect("activate", activate)
+            action.connect("activate", self._gated(activate))  # nothing is there to poke before ready
             self.add_action(action)
 
         # The window as it's drawn, as a PNG in SNAPSHOTS.
@@ -957,13 +1119,15 @@ class Natter(Adw.Application):
         # Here rather than at start-up: this runs before Natter takes its bus name, so a search
         # that started Natter over D-Bus doesn't arrive before there's anything to answer it.
         # Privacy blur keeps chat names out of the desktop's search too.
-        self.search = SearchProvider(connection, self._search_chats, self.open_chat,
-                                     lambda query: self.go_to_chat(query=query),
+        # Opening a result waits for start-up (_when_ready); the results themselves don't.
+        self.search = SearchProvider(connection, self._search_chats,
+                                     lambda account_id, name: self._when_ready(lambda: self.open_chat(account_id, name)),
+                                     lambda query: self._when_ready(lambda: self.go_to_chat(query=query)),
                                      lambda: self.settings["search_provider"] and not self.settings["privacy_blur"]
                                      and not self.locked and not (self.window is None and self.lock_enabled))
         return Adw.Application.do_dbus_register(self, connection, object_path)
 
-    def _make_web_context(self) -> None:
+    def _make_web_context(self, then: Optional[Callable[[], None]] = None) -> None:
         if self.calls_in_page:
             # WhatsApp's call engine runs threads that share memory (SharedArrayBuffer). WebKitGTK
             # marks WhatsApp's page cross-origin isolated, which is what makes sharing safe, but
@@ -1019,6 +1183,8 @@ class Natter(Adw.Application):
                                                   network_session=WebKit.NetworkSession.new_ephemeral())
             self._sandbox_anchor.connect("web-process-terminated", self._on_anchor_gone)
             self._sandbox_anchor.load_html("<!doctype html><title></title>", "about:blank")
+        if then is not None:  # a step of start-up's (_start_steps)
+            then()
 
     def _on_anchor_gone(self, _view, reason) -> None:
         """The anchor's web process ended. Another can't take its place: WebKit names every
@@ -1191,15 +1357,30 @@ class Natter(Adw.Application):
         return account
 
     def do_activate(self) -> None:
-        if getattr(self, "_gave_up", False):
-            return
-        self.present_window()
+        self._when_ready(self.present_window)  # nothing, should another Natter Den hold the lock
 
     # ---- Command line: first start and every later launch ---------------------------------
 
     def do_command_line(self, command_line: Gio.ApplicationCommandLine) -> int:
-        if getattr(self, "_gave_up", False):  # another Natter Den still runs (_take_instance)
+        if self._gave_up:  # another Natter Den still runs (_instance_taken)
             return 1
+        if self._ready:
+            return self._command_line(command_line)
+        # Start-up is under way: run once it's done, in turn. The launch it came from waits for
+        # the answer (done), as it would have waited for start-up; one given up is answered 1.
+        self._pending.append((lambda: self._answer(command_line, self._command_line(command_line)),
+                              lambda: self._answer(command_line, 1)))
+        return 0
+
+    def _answer(self, command_line: Gio.ApplicationCommandLine, status: int) -> None:
+        """A command line that waited for start-up is answered: `status` is what its launch exits with."""
+        command_line.set_exit_status(status)
+        if not command_line.get_is_remote() and status:
+            self.late_status = status  # this process's own first command line: run() returned already
+        if hasattr(command_line, "done"):  # GLib 2.80: the answer goes now, not when it's let go
+            command_line.done()
+
+    def _command_line(self, command_line: Gio.ApplicationCommandLine) -> int:
         options = command_line.get_options_dict().end().unpack()
         first = self.window is None
         url, warning = dev_url(options.get("url"), command_line.get_is_remote())
@@ -1509,6 +1690,8 @@ class Natter(Adw.Application):
         """Every account's chats for desktop search. A Natter started just for a search reads
         them from disk; WhatsApp only starts when a result is opened."""
         if self.window is None:
+            if self.get_flags() & Gio.ApplicationFlags.IS_SERVICE:
+                self.set_inactivity_timeout(SEARCH_LINGER)
             self.hold()
             self.release()  # restarts the countdown to leaving
             indexes = [(info["id"], info.get("name") or "WhatsApp",
@@ -3064,6 +3247,16 @@ class Natter(Adw.Application):
             return
         self._quitting = True  # WebKit's processes end now: not a lost network process
         stop_name_watch(self)  # the name this quit gives up isn't lost
+        if not getattr(self, "_started", True):
+            # Still starting (SIGTERM, a lost name): no more steps, nothing of WhatsApp's to save
+            # yet, what waited is dropped, and do_shutdown ends any WebKit process started so far.
+            try:
+                if getattr(self, "memory_guard", None) is not None:
+                    self.memory_guard.stop()
+                self._drop_pending()
+            finally:
+                self.quit()
+            return
         try:
             if self.window:
                 self.window.give_back_pages()  # each page in its own place as it ends
@@ -3146,7 +3339,8 @@ def main(argv: list[str], owner: Optional[str] = None, now: Callable[[], object]
     Natter Den leaving after its last search, between the launch's look and its command line),
     it runs once more, as the one Natter Den or handing over to the next."""
     app = Natter()
-    status = app.run(argv)
+    app.expect_primary = owner is None
+    status = app.run(argv) or app.late_status
     # Not after a first run that became the one Natter Den itself (it holds the lock still).
     if status != 0 and owner is not None and app.restart_args is None \
             and getattr(app, "instance_lock", None) is None:
@@ -3156,7 +3350,8 @@ def main(argv: list[str], owner: Optional[str] = None, now: Callable[[], object]
                   file=sys.stderr, flush=True)
             app = Natter()
             app.set_default()  # in place of the first, which GLib made the process's default
-            status = app.run(argv)
+            app.expect_primary = found is None
+            status = app.run(argv) or app.late_status
     if app.restart_args is not None:
         start_again(app.restart_args)
     return status

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 
 from . import APP_ID, DEFAULT_APP_ID, NAME
@@ -228,6 +229,15 @@ def check() -> int:
     return 1 if trouble else 0
 
 
+def no_display(environ=None) -> bool:
+    """Whether there's no display for GTK to open: without one GTK's start-up fails and the app
+    crashes later, instead of saying why. GDK_BACKEND=broadway (development) has a display of its own."""
+    environ = os.environ if environ is None else environ
+    if environ.get("GDK_BACKEND", "").startswith("broadway"):
+        return False
+    return not (environ.get("WAYLAND_DISPLAY") or environ.get("DISPLAY"))
+
+
 def main() -> int:
     try:
         from gi.repository import GLib
@@ -261,6 +271,10 @@ def main() -> int:
             print(f"{NAME} can't start: there's no D-Bus session bus ({error.message}).\n"
                   "It runs inside a desktop session, which is where notifications, the tray and links reach it.",
                   file=sys.stderr)
+            return 1
+        if no_display():
+            print(f"{NAME} can't start: there's no display to open its window on (neither WAYLAND_DISPLAY "
+                  "nor DISPLAY is set).\nIt runs inside a desktop session.", file=sys.stderr)
             return 1
     owner = None
     # D-Bus starts the service only while no Natter Den owns the name: nothing to look at then.

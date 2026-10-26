@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import threading
 import time
+import traceback
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
@@ -280,6 +281,33 @@ def pages_end_alone() -> bool:
     return unit_oom_policy(cgroup.name, bus) == "continue"
 
 
+def _scope_plan(cgroup: Path, accounts: int, policy: Optional[str]) -> Optional[tuple[int, int]]:
+    """The MemoryMax and MemorySwapMax limit_own_scope sets on `cgroup`, whose OOMPolicy is
+    `policy`, or None for none (said once)."""
+    global _launcher_limits, _told_oom_policy
+    launcher = cgroup.name != _made_scope
+    if policy != "continue":
+        if not _told_oom_policy:
+            _told_oom_policy = True
+            whose = "its launcher's, which only the launcher can change" if launcher else "systemd's default"
+            print(f"natter: memory: {cgroup.name} has OOMPolicy={policy or 'unknown'} ({whose}): the kernel ending "
+                  f"one page there would stop all of {NAME}, so {NAME} sets no memory limit on it; the guard "
+                  "ends a page that grows without end, alone", flush=True)
+        return None
+    memory_max, swap_max = scope_limits(mem_total(), accounts, swap_total())
+    if launcher:
+        if _launcher_limits is None:  # read before Natter set anything of its own
+            _launcher_limits = (_cgroup_limit(cgroup, "memory.max"), _cgroup_limit(cgroup, "memory.swap.max"))
+        memory_max = min(memory_max, _launcher_limits[0] or memory_max)
+        swap_max = min(swap_max, swap_max if _launcher_limits[1] is None else _launcher_limits[1])
+    return memory_max, swap_max
+
+
+def _limit_args(cgroup: Path, limits: tuple[int, int]) -> GLib.Variant:
+    return GLib.Variant("(sba(sv))", (cgroup.name, True, [("MemoryMax", GLib.Variant("t", limits[0])),
+                                                          ("MemorySwapMax", GLib.Variant("t", limits[1]))]))
+
+
 def limit_own_scope(accounts: int = 1) -> bool:
     """Set the backstop's MemoryMax and MemorySwapMax, for `accounts` pages, on the unit Natter
     runs in, if its OOMPolicy is "continue": the one move_to_own_scope made, or a launcher's that
@@ -289,7 +317,6 @@ def limit_own_scope(accounts: int = 1) -> bool:
     seen so far: KDE's, GNOME's, Ada's; it can't be changed once the unit runs) gets no limit:
     the kernel ending one page there would stop all of Natter, the very thing the backstop is
     meant to spare. There the guard alone ends a page that grows without end. Said once."""
-    global _launcher_limits, _told_oom_policy
     cgroup = own_cgroup()
     if in_sandbox() or not in_own_scope(cgroup):
         return False
@@ -298,32 +325,47 @@ def limit_own_scope(accounts: int = 1) -> bool:
     except GLib.Error as error:
         print(f"natter: memory: couldn't limit {cgroup.name}: {error.message}", flush=True)
         return False
-    launcher = cgroup.name != _made_scope
-    policy = unit_oom_policy(cgroup.name, bus)
-    if policy != "continue":
-        if not _told_oom_policy:
-            _told_oom_policy = True
-            whose = "its launcher's, which only the launcher can change" if launcher else "systemd's default"
-            print(f"natter: memory: {cgroup.name} has OOMPolicy={policy or 'unknown'} ({whose}): the kernel ending "
-                  f"one page there would stop all of {NAME}, so {NAME} sets no memory limit on it; the guard "
-                  "ends a page that grows without end, alone", flush=True)
+    limits = _scope_plan(cgroup, accounts, unit_oom_policy(cgroup.name, bus))
+    if limits is None:
         return False
-    memory_max, swap_max = scope_limits(mem_total(), accounts, swap_total())
-    if launcher:
-        if _launcher_limits is None:  # read before Natter set anything of its own
-            _launcher_limits = (_cgroup_limit(cgroup, "memory.max"), _cgroup_limit(cgroup, "memory.swap.max"))
-        memory_max = min(memory_max, _launcher_limits[0] or memory_max)
-        swap_max = min(swap_max, swap_max if _launcher_limits[1] is None else _launcher_limits[1])
     try:
         bus.call_sync(SYSTEMD, "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
-                      "SetUnitProperties",
-                      GLib.Variant("(sba(sv))", (cgroup.name, True, [("MemoryMax", GLib.Variant("t", memory_max)),
-                                                                     ("MemorySwapMax", GLib.Variant("t", swap_max))])),
-                      None, Gio.DBusCallFlags.NONE, 3000, None)
+                      "SetUnitProperties", _limit_args(cgroup, limits), None, Gio.DBusCallFlags.NONE, 3000, None)
     except GLib.Error as error:
         print(f"natter: memory: couldn't limit {cgroup.name}: {error.message}", flush=True)
         return False
     return True
+
+
+def _scope_properties(pid: int, accounts: int) -> list:
+    memory_max, swap_max = scope_limits(mem_total(), accounts, swap_total())
+    return [
+        ("PIDs", GLib.Variant("au", [pid])),
+        ("Description", GLib.Variant("s", NAME)),
+        ("Slice", GLib.Variant("s", "app.slice")),
+        ("CollectMode", GLib.Variant("s", "inactive-or-failed")),
+        ("MemoryMax", GLib.Variant("t", memory_max)),
+        ("MemorySwapMax", GLib.Variant("t", swap_max)),
+        # The kernel ending a page past MemoryMax leaves Natter running: it starts a fresh page.
+        ("OOMPolicy", GLib.Variant("s", "continue")),
+    ]
+
+
+def _without_policy(name: str, properties: list, error: GLib.Error) -> list:
+    """What a systemd that refused OOMPolicy on scope `name` gets instead, said so."""
+    # A systemd that can't set OOMPolicy on a scope refuses the whole unit. The scope still
+    # groups Natter's processes, but with systemd's default policy, "stop": no limits.
+    print(f"natter: memory: systemd won't set OOMPolicy on {name} ({error.message}): the kernel ending "
+          f"one page there would stop all of {NAME}, so {NAME} sets no memory limit on it; the guard "
+          "ends a page that grows without end, alone", flush=True)
+    return [prop for prop in properties if prop[0] not in ("OOMPolicy", "MemoryMax", "MemorySwapMax")]
+
+
+def _scope_made(name: str, without_policy: bool) -> None:
+    global _made_scope, _made_without_policy, _told_oom_policy
+    _made_scope, _made_without_policy = name, without_policy
+    if without_policy:
+        _told_oom_policy = True
 
 
 def move_to_own_scope(timeout: float = 0.5, accounts: int = 1) -> Optional[str]:
@@ -335,8 +377,9 @@ def move_to_own_scope(timeout: float = 0.5, accounts: int = 1) -> Optional[str]:
     launcher made the scope), or there's no systemd user manager to ask. A systemd that won't
     set OOMPolicy on a scope gets one without it, and then without the limits too (see
     limit_own_scope: under "stop", the kernel ending a page stops all of Natter).
+
+    It blocks while systemd answers: start-up uses move_to_own_scope_async.
     """
-    global _made_scope, _made_without_policy, _told_oom_policy
     if in_sandbox() or in_own_scope():
         return None
     try:
@@ -347,17 +390,7 @@ def move_to_own_scope(timeout: float = 0.5, accounts: int = 1) -> Optional[str]:
         return None
     pid = os.getpid()
     name = scope_name(pid)
-    memory_max, swap_max = scope_limits(mem_total(), accounts, swap_total())
-    properties = [
-        ("PIDs", GLib.Variant("au", [pid])),
-        ("Description", GLib.Variant("s", NAME)),
-        ("Slice", GLib.Variant("s", "app.slice")),
-        ("CollectMode", GLib.Variant("s", "inactive-or-failed")),
-        ("MemoryMax", GLib.Variant("t", memory_max)),
-        ("MemorySwapMax", GLib.Variant("t", swap_max)),
-        # The kernel ending a page past MemoryMax leaves Natter running: it starts a fresh page.
-        ("OOMPolicy", GLib.Variant("s", "continue")),
-    ]
+    properties = _scope_properties(pid, accounts)
     without_policy = False
     try:
         try:
@@ -365,18 +398,12 @@ def move_to_own_scope(timeout: float = 0.5, accounts: int = 1) -> Optional[str]:
         except GLib.Error as error:
             if "OOMPolicy" not in error.message:
                 raise
-            # A systemd that can't set OOMPolicy on a scope refuses the whole unit. The scope
-            # still groups Natter's processes, but with systemd's default policy, "stop": no limits.
-            print(f"natter: memory: systemd won't set OOMPolicy on {name} ({error.message}): the kernel ending "
-                  f"one page there would stop all of {NAME}, so {NAME} sets no memory limit on it; the guard "
-                  "ends a page that grows without end, alone", flush=True)
-            _start_unit(bus, name, [prop for prop in properties
-                                    if prop[0] not in ("OOMPolicy", "MemoryMax", "MemorySwapMax")])
-            without_policy = _told_oom_policy = True
+            _start_unit(bus, name, _without_policy(name, properties, error))
+            without_policy = True
     except GLib.Error as error:
         print(f"natter: couldn't get a scope of its own: {error.message}")
         return None
-    _made_scope, _made_without_policy = name, without_policy
+    _scope_made(name, without_policy)
     # systemd moves the process once the job runs; wait so WebKit's processes follow it.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -391,6 +418,164 @@ def _start_unit(bus: Gio.DBusConnection, name: str, properties: list) -> None:
                   "StartTransientUnit",
                   GLib.Variant("(ssa(sv)a(sa(sv)))", (name, "fail", properties, [])),
                   GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, 3000, None)
+
+
+# ---- The same, without blocking the main loop (start-up) -------------------------------------
+
+def _once(done: Callable) -> Callable:
+    """`done`, callable once: later calls are dropped."""
+    called = []
+
+    def call(*args) -> None:
+        if not called:
+            called.append(True)
+            done(*args)
+
+    return call
+
+
+def _ask(bus: Gio.DBusConnection, name: str, path: str, interface: str, method: str,
+         args: Optional[GLib.Variant], reply: Optional[str], then: Callable, timeout: int = 3000) -> None:
+    """An asynchronous D-Bus call: then(value, None) with the reply's unpacked values, or
+    then(None, error), from the main loop."""
+    def answered(source, result) -> None:
+        try:
+            value = source.call_finish(result)
+        except GLib.Error as error:
+            then(None, error)
+            return
+        then(value.unpack() if value is not None else (), None)
+
+    bus.call(name, path, interface, method, args, GLib.VariantType(reply) if reply else None,
+             Gio.DBusCallFlags.NONE, timeout, None, answered)
+
+
+def _guarded(finish: Callable, fallback, step: Callable) -> Callable:
+    """`step`, with whatever it raises ending the whole move with `fallback`: a callback that
+    raises is dropped, and start-up would wait on it for good."""
+    def run(*args):
+        try:
+            return step(*args)  # a timer's answer, whether to go on
+        except Exception:
+            traceback.print_exc()
+            finish(fallback)
+            return False
+
+    return run
+
+
+def move_to_own_scope_async(done: Callable[[Optional[str]], None], accounts: int = 1, timeout: float = 0.5,
+                            bus: Optional[Gio.DBusConnection] = None, poll: int = 20) -> None:
+    """move_to_own_scope, with systemd's answers coming back through the main loop (Gio's
+    asynchronous calls) and the wait for the move on a timer: the main loop goes on meanwhile.
+    `done` gets what move_to_own_scope returns, once, perhaps before this returns."""
+    finish = _once(done)
+    if in_sandbox() or in_own_scope():
+        finish(None)
+        return
+    if bus is None:
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION)  # the app's own, made already
+        except GLib.Error:
+            finish(None)
+            return
+    pid = os.getpid()
+    name = scope_name(pid)
+    properties = _scope_properties(pid, accounts)
+    deadline = time.monotonic() + timeout
+
+    def moved() -> bool:
+        if in_own_scope() or time.monotonic() >= deadline:
+            finish(name)
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def start(chosen: list, without_policy: bool) -> None:
+        _ask(bus, SYSTEMD, "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "StartTransientUnit",
+             GLib.Variant("(ssa(sv)a(sa(sv)))", (name, "fail", chosen, [])), "(o)",
+             _guarded(finish, None, lambda _value, error: started(error, without_policy)))
+
+    def started(error: Optional[GLib.Error], without_policy: bool) -> None:
+        if error is not None:
+            if not without_policy and "OOMPolicy" in error.message:
+                start(_without_policy(name, properties, error), True)
+                return
+            print(f"natter: couldn't get a scope of its own: {error.message}")
+            finish(None)
+            return
+        _scope_made(name, without_policy)
+        # systemd moves the process once the job runs; wait so WebKit's processes follow it.
+        if moved():
+            GLib.timeout_add(poll, _guarded(finish, name, moved))
+
+    def has_owner(value, error) -> None:
+        if error is not None or not value[0]:
+            finish(None)
+            return
+        start(properties, False)
+
+    try:
+        _ask(bus, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner",
+             GLib.Variant("(s)", (SYSTEMD,)), "(b)", _guarded(finish, None, has_owner), timeout=1000)
+    except Exception:
+        traceback.print_exc()
+        finish(None)
+
+
+def limit_own_scope_async(done: Callable[[bool], None], accounts: int = 1,
+                          bus: Optional[Gio.DBusConnection] = None) -> None:
+    """limit_own_scope, with systemd's answers coming back through the main loop. `done` gets
+    what limit_own_scope returns, once, perhaps before this returns."""
+    finish = _once(done)
+    cgroup = own_cgroup()
+    if in_sandbox() or not in_own_scope(cgroup):
+        finish(False)
+        return
+    if bus is None:
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        except GLib.Error as error:
+            print(f"natter: memory: couldn't limit {cgroup.name}: {error.message}", flush=True)
+            finish(False)
+            return
+    unit = cgroup.name
+
+    def limited(_value, error) -> None:
+        if error is not None:
+            print(f"natter: memory: couldn't limit {unit}: {error.message}", flush=True)
+        finish(error is None)
+
+    def policy_known(policy: Optional[str]) -> None:
+        limits = _scope_plan(cgroup, accounts, policy)
+        if limits is None:
+            finish(False)
+            return
+        _ask(bus, SYSTEMD, "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "SetUnitProperties",
+             _limit_args(cgroup, limits), None, _guarded(finish, False, limited))
+
+    def got(value, error) -> None:
+        global _unit_policy
+        policy = value[0] if error is None and isinstance(value[0], str) else None
+        _unit_policy = (unit, policy)  # as unit_oom_policy keeps it: asked once
+        policy_known(policy)
+
+    def found(value, error) -> None:
+        if error is not None:
+            got(None, error)
+            return
+        interface = "org.freedesktop.systemd1." + ("Service" if unit.endswith(".service") else "Scope")
+        _ask(bus, SYSTEMD, value[0], "org.freedesktop.DBus.Properties", "Get",
+             GLib.Variant("(ss)", (interface, "OOMPolicy")), "(v)", _guarded(finish, False, got))
+
+    try:
+        if unit == _made_scope or (_unit_policy is not None and _unit_policy[0] == unit):
+            policy_known(unit_oom_policy(unit, bus))
+            return
+        _ask(bus, SYSTEMD, "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "GetUnit",
+             GLib.Variant("(s)", (unit,)), "(o)", _guarded(finish, False, found))
+    except Exception:
+        traceback.print_exc()
+        finish(False)
 
 
 # ---- Memory ---------------------------------------------------------------------------------

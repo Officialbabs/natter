@@ -332,8 +332,43 @@ and `app-flatpak-<app id>-<pid>.scope` (a Flatpak); on Ada it's
 `app-ada-io.github.Officialbabs.Natter-<pid>.scope`. When Natter Den finds itself in a unit that
 isn't named after it (started from a terminal or a script, say), it asks systemd for
 `app-io.github.Officialbabs.Natter-<pid>.scope` before WebKit starts any process, so every WebKit
-process, sandbox and proxy joins it. Without a systemd user manager, or inside a sandbox, it leaves
-things as they are.
+process, sandbox and proxy joins it. It doesn't wait on systemd meanwhile: the answers come back
+through the main loop (see [Start-up](#start-up)). Without a systemd user manager, or inside a
+sandbox, it leaves things as they are.
+
+### Start-up
+
+The first Natter Den owns its bus name before it starts, and from then on every launch waits on
+its main loop: GLib asks it for its actions first (`org.gtk.Actions.DescribeAll`) and gives up
+after 25 s. So start-up does only what can't wait before the main loop runs: GTK's start, the app's
+actions, and the instance lock's first try. When no Natter Den was running at launch, libadwaita
+starts before the name is taken, as it takes a quarter to half a second. The rest follows on the
+main loop one step at a time, with launches, searches and the bus answered in between:
+
+1. the instance lock, if another Natter Den holds it ([One at a time](#one-at-a-time));
+2. the look (icons, style, theme);
+3. the scope (above), with systemd's answers coming back through the main loop, then the calls
+   check;
+4. WebKit's context (and, for calls in the page, the blank page that keeps the camera portal's
+   identity valid);
+5. the memory guard, then notifications, the badge, sound and the timers.
+
+The order is kept: no step starts before the lock is taken, and every WebKit process starts in
+the scope. What arrives meanwhile (the window asked for, a launch's command line with `--chat`,
+links or files, a search result opened, a notification's button or any other action) waits, and
+runs once start-up is done, in the order it came, each once. A launch's command line is answered
+once it has run, so the launch exits with its real status. If start-up is given up (another
+Natter Den still holds the lock), what waited is dropped, and launches that waited are told it
+failed. Started by D-Bus for a search (`--gapplication-service`), it answers searches from the chat
+lists on disk at once and leaves 30 s after the last one, or 10 s after ready if none comes, much
+as before (10 s then counted from the start); opening a result waits like the rest. `--background` builds the window hidden, once ready. With `NATTER_DEBUG` set, each step logs
+`natter: start-up: <step> +N ms`.
+
+In 0.1.5 and before, all of it ran before the main loop, and launches waited the whole time: 0.4
+to 0.7 s on a warm start here, plus however long the lock was held (up to 20 s, and 10 s more to
+end a frozen holder), plus systemd's answers (up to 3.5 s on a busy login). Now the first answer
+comes 30 to 45 ms after the name is taken, the lock held or not, or 0.2 to 0.3 s when another
+Natter Den was running at launch, as libadwaita then starts after the name.
 
 ### One at a time
 
@@ -348,14 +383,17 @@ same WhatsApp login, for seven hours. So there's more than the name now (`natter
   `~/.cache/natter-instance/`). The kernel lets go of it when the process ends, however it ends,
   and WebKit's processes never hold it. The file says which process holds it and, once it has
   started, which bus it's on and its unique name there. If it's held, an older Natter Den is
-  still running without its name: the new one waits up to 20 s for it to end. If it's still there
+  still running without its name: the new one waits up to 20 s for it to end, trying every
+  quarter second from its main loop, which answers launches meanwhile (their requests wait their
+  turn: [Start-up](#start-up)). If it's still there
   and has provably lost its bus connection (the file names this same bus, and its unique name is
   no longer on it), it's frozen, as on 25 Oct: the new one ends it and its WebKit processes with
   `SIGKILL`, which reaches a frozen process, and takes over. The process is checked first (its
   start time, and `/proc/locks` showing it holds this lock). One that still has its connection
   (quitting, say) is left alone, and so is everything in the Flatpak, where each run has its own
   process namespace. Otherwise the new one says *Natter Den is already running but not answering*
-  and quits without opening WhatsApp (silently when D-Bus started it for a search).
+  and quits without opening WhatsApp (silently when D-Bus started it for a search); what launches
+  asked of it meanwhile is dropped, and they're told it failed.
 - **The name watchdog.** A thread of its own (a stalled main loop doesn't stall it) asks the bus
   every 3 s who owns the name. The name is lost once Natter Den's own bus connection has closed,
   another process owns the name, or no one has owned it at two looks in a row; a slow bus, a
