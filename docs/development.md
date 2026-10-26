@@ -49,8 +49,10 @@ NATTER_DEBUG=1 bin/natter --url "file://$PWD/tests/mock-whatsapp.html"
 ```
 
 An app id other than Natter Den's own (or its old `io.natter.Natter`) gets folders of its own too
-(`natter-dev` here). A separate instance still shares the desktop's notification server and its
-portal permission store with the Natter Den you use.
+(`natter-dev` here), and a bus name and instance lock of its own (`natter-<app id>.lock`, see
+[One at a time](how-it-works.md#one-at-a-time)), so it runs beside yours. A separate instance still
+shares the desktop's notification server and its portal permission store with the Natter Den you
+use.
 
 `NATTER_DEBUG=1` also turns on WebKit's inspector (right-click → Inspect Element), prints the
 page's console, and adds D-Bus actions for poking at a running Natter Den: `debug-snapshot` and

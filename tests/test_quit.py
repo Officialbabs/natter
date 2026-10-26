@@ -358,6 +358,15 @@ class QuitNatterTest(unittest.TestCase):
         Natter.quit_natter(quitting_app(events, guard=False))
         self.assertEqual(events[-1], "quit")
 
+    def test_the_name_watch_stops_before_anything(self):
+        # The name this quit gives up isn't a lost one (instance.NameWatchdog).
+        events = []
+        app = quitting_app(events, [account("page", events)])
+        app.name_watch = Log("name_watch", events)
+        with web_processes(Pages()):
+            Natter.quit_natter(app)
+        self.assertEqual(events[:2], ["name_watch.stop", "guard.stop"])
+
     def test_sigterm_quits_the_same_way(self):
         app = SimpleNamespace(quit_natter=mock.Mock())
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -390,6 +399,12 @@ class ShutdownTest(unittest.TestCase):
             del events[:]
             self.shutdown(app)
         self.assertEqual(events, [])
+
+    def test_the_name_watch_stops_too(self):
+        events = []
+        app = SimpleNamespace(accounts=[], name_watch=Log("name_watch", events))
+        self.shutdown(app)
+        self.assertEqual(events, ["name_watch.stop"])
 
     def test_chains_up_whatever_happens(self):
         app = SimpleNamespace(accounts=[account("page", [])])

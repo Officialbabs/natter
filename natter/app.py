@@ -37,6 +37,9 @@ from .launcher import Badge, chat_key, exec_quote, set_menu_chats
 from .mediapause import Bus as PlayerBus, VoicePause
 from .memguard import (KILL_MEMORY, OOM_SCORE_ADJ, MiB, MemoryGuard, in_flatpak, kill as kill_web_process,
                        mem_total, page_ceiling, page_limit, page_limits, page_sizes, web_processes)
+from .instance import (STILL_RUNNING, InstanceLock, NameWatchdog, bus_id, end_stale, end_webkit, lock_path,
+                       notice as instance_notice, owner_now, primary_line, take as take_instance,
+                       UNKNOWN as OWNER_UNKNOWN)
 from .notify import Notifier, ReplyTarget
 from .reply import LIMIT as REPLY_LIMIT, ReplyWindow, notice as reply_notice, units as reply_units
 from .search import SearchProvider
@@ -167,13 +170,13 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>Memory: what grows is given back, and WebKit stops working against an idle page.</p>"
+RELEASE_NOTES = ("<p>One copy at a time, and no silent hangs at launch.</p>"
                  "<ul>"
-                 "<li>A hidden page that has grown well past its own idle size gets a fresh page, with its chat opened again: memory that nothing freed before comes back</li>"
-                 "<li>WebKit no longer drops all its caches and code every 30 seconds at idle: its memory lines now sit above WhatsApp's idle size</li>"
-                 "<li>The swap the app may use follows its page limit, at most half the computer's swap</li>"
-                 "<li>Graphics memory now shows in the memory lines in the log</li>"
-                 "<li>Use Less Memory in the Background is greyed out, with the reason, when it can't run</li>"
+                 "<li>Only one copy runs at a time: a lock the session bus can't take away, held for the app's life</li>"
+                 "<li>A copy that loses its place on the session bus ends itself, so the next launch starts cleanly</li>"
+                 "<li>A copy cut off from the bus while frozen is ended by the next launch</li>"
+                 "<li>A launch against a copy that is paused or busy says so, instead of hanging silently</li>"
+                 "<li>The log says which copy started, and why one ended</li>"
                  "</ul>")
 
 
@@ -523,6 +526,14 @@ def process_ended(pid: int, proc: Path = Path("/proc")) -> bool:
     return state in ([], ["Z"], ["X"])
 
 
+def stop_name_watch(app) -> None:
+    """Stop the bus-name watchdog at the start of a quit, so the name it gives up isn't taken
+    for a lost one."""
+    watch = getattr(app, "name_watch", None)
+    if watch is not None:
+        watch.stop()
+
+
 def end_pages(accounts: Iterable, anchor, then: Optional[Callable[[], None]] = None, wait: float = QUIT_WAIT,
               find: Optional[Callable[[], set[int]]] = None, ended: Optional[Callable[[int], bool]] = None,
               kill: Optional[Callable[[int], bool]] = None, grace: float = QUIT_GRACE) -> None:
@@ -707,7 +718,11 @@ class Natter(Adw.Application):
     # ---- Start-up --------------------------------------------------------------------------
 
     def do_startup(self) -> None:
-        # Only the first instance gets here. Group Natter's processes under a scope of its
+        # Only the first instance gets here, once it owns the bus name. The instance lock first
+        # (instance.py): a Natter that lost its name may still be running.
+        if not self._take_instance():
+            return
+        # Group Natter's processes under a scope of its
         # own before WebKit starts any (a desktop's launcher makes one; a terminal doesn't).
         accounts = len(self.settings["accounts"])
         self.scope = move_to_own_scope(accounts=accounts)
@@ -841,6 +856,56 @@ class Natter(Adw.Application):
         self.add_action(restart)
         if GLib.getenv("NATTER_DEBUG"):
             self._debug_actions()
+
+    def _take_instance(self) -> bool:
+        """Take the instance lock (instance.take), and watch the bus name from then on. A holder
+        that has provably lost its bus connection is ended (instance.end_stale). False, after
+        starting GTK and asking to quit, when another Natter Den still holds the lock: nothing
+        else starts, WhatsApp's pages least of all."""
+        self._gave_up = False
+        bus = self.get_dbus_connection()
+        lock = self.instance_lock = InstanceLock(lock_path())  # held, by its open file, while Natter runs
+        taken = take_instance(lock, end_holder=lambda: end_stale(lock, bus))
+        if not taken.ok:
+            self._gave_up = True
+            print(f"natter: {STILL_RUNNING}", file=sys.stderr, flush=True)
+            Adw.Application.do_startup(self)  # GApplication insists on it
+            # Not for a search's start: the person didn't open Natter Den, and may type on.
+            if not self.get_flags() & Gio.ApplicationFlags.IS_SERVICE:
+                instance_notice(bus, STILL_RUNNING)
+            self.quit()
+            return False
+        if bus is not None:  # for a later Natter Den, should this one freeze without its name
+            lock.note(bus_id(bus) or "", bus.get_unique_name() or "")
+        print(primary_line(taken), flush=True)
+        self._start_name_watch()
+        return True
+
+    def _start_name_watch(self) -> None:
+        """The bus-name watchdog (instance.NameWatchdog), on a thread of its own."""
+        bus = self.get_dbus_connection()
+        if bus is None or not bus.get_unique_name():
+            return
+
+        def quit_now() -> bool:
+            self.quit_natter()
+            return GLib.SOURCE_REMOVE
+
+        def lost() -> None:  # on the watchdog's thread: the quit itself runs on the main loop
+            GLib.idle_add(quit_now, priority=GLib.PRIORITY_HIGH)
+
+        def end_pages_now() -> None:  # on the watchdog's thread, as quit_natter would have
+            if in_flatpak():
+                for pid in web_processes(flatpak=True):
+                    kill_web_process(pid)
+            # The network process too: the lock comes free as this process ends, and a new
+            # Natter Den mustn't start on WhatsApp's data while it's still writing.
+            end_webkit(os.getpid())
+
+        self.name_watch = NameWatchdog(bus.get_unique_name(), bus.is_closed, lost,
+                                       quitting=lambda: bool(getattr(self, "_quitting", False)),
+                                       before_exit=end_pages_now)
+        self.name_watch.start()
 
     def _debug_actions(self) -> None:
         """D-Bus actions for poking at a running Natter, with NATTER_DEBUG set. Natter's own instance
@@ -1126,11 +1191,15 @@ class Natter(Adw.Application):
         return account
 
     def do_activate(self) -> None:
+        if getattr(self, "_gave_up", False):
+            return
         self.present_window()
 
     # ---- Command line: first start and every later launch ---------------------------------
 
     def do_command_line(self, command_line: Gio.ApplicationCommandLine) -> int:
+        if getattr(self, "_gave_up", False):  # another Natter Den still runs (_take_instance)
+            return 1
         options = command_line.get_options_dict().end().unpack()
         first = self.window is None
         url, warning = dev_url(options.get("url"), command_line.get_is_remote())
@@ -2994,6 +3063,7 @@ class Natter(Adw.Application):
         if getattr(self, "_quitting", False):
             return
         self._quitting = True  # WebKit's processes end now: not a lost network process
+        stop_name_watch(self)  # the name this quit gives up isn't lost
         try:
             if self.window:
                 self.window.give_back_pages()  # each page in its own place as it ends
@@ -3056,6 +3126,7 @@ class Natter(Adw.Application):
         terminal, a window that couldn't be made): web processes still running end first, as
         quit_natter ends them, waiting QUIT_WAIT at most. After quit_natter there are none."""
         self._quitting = True
+        stop_name_watch(self)
         try:
             if not getattr(self, "_pages_ended", False):
                 self._pages_ended = True
@@ -3069,9 +3140,23 @@ class Natter(Adw.Application):
             Adw.Application.do_shutdown(self)
 
 
-def main(argv: list[str]) -> int:
+def main(argv: list[str], owner: Optional[str] = None, now: Callable[[], object] = owner_now) -> int:
+    """Run Natter. `owner` is the Natter Den already running that the launch found
+    (__main__.main), if any: when this launch fails and that one has gone meanwhile (a search's
+    Natter Den leaving after its last search, between the launch's look and its command line),
+    it runs once more, as the one Natter Den or handing over to the next."""
     app = Natter()
     status = app.run(argv)
+    # Not after a first run that became the one Natter Den itself (it holds the lock still).
+    if status != 0 and owner is not None and app.restart_args is None \
+            and getattr(app, "instance_lock", None) is None:
+        found = now()
+        if found is not OWNER_UNKNOWN and found != owner:
+            print(f"natter: the {NAME} this launch went to ended before it answered; trying once more",
+                  file=sys.stderr, flush=True)
+            app = Natter()
+            app.set_default()  # in place of the first, which GLib made the process's default
+            status = app.run(argv)
     if app.restart_args is not None:
         start_again(app.restart_args)
     return status

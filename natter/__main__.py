@@ -262,9 +262,19 @@ def main() -> int:
                   "It runs inside a desktop session, which is where notifications, the tray and links reach it.",
                   file=sys.stderr)
             return 1
+    owner = None
+    # D-Bus starts the service only while no Natter Den owns the name: nothing to look at then.
+    if not asking and "--gapplication-service" not in sys.argv[1:]:
+        from .instance import probe
+
+        # One already running gets this launch's command line, and GLib waits on its answer for
+        # good: a frozen one, or one whose main loop is stalled, is told apart first (instance.py).
+        owner, go_on = probe()
+        if not go_on:
+            return 1
     from .app import main as run
 
-    return run(sys.argv)
+    return run(sys.argv, owner)
 
 
 if __name__ == "__main__":

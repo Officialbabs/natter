@@ -81,6 +81,18 @@
   </content_rating>
 
   <releases>
+    <release version="0.1.5" date="2026-10-26">
+      <description>
+        <p>One copy at a time, and no silent hangs at launch.</p>
+        <ul>
+          <li>Only one copy runs at a time: a lock the session bus can't take away, held for the app's life</li>
+          <li>A copy that loses its place on the session bus ends itself, so the next launch starts cleanly</li>
+          <li>A copy cut off from the bus while frozen is ended by the next launch</li>
+          <li>A launch against a copy that is paused or busy says so, instead of hanging silently</li>
+          <li>The log says which copy started, and why one ended</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.4" date="2026-10-25">
       <description>
         <p>Memory: what grows is given back, and WebKit stops working against an idle page.</p>

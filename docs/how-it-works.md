@@ -334,3 +334,45 @@ isn't named after it (started from a terminal or a script, say), it asks systemd
 `app-io.github.Officialbabs.Natter-<pid>.scope` before WebKit starts any process, so every WebKit
 process, sandbox and proxy joins it. Without a systemd user manager, or inside a sandbox, it leaves
 things as they are.
+
+### One at a time
+
+GLib keeps one Natter Den per app id through its D-Bus name: a later launch hands its command line
+to the one running and ends. On 25 Oct 2026 that wasn't enough. The desktop froze a hidden Natter
+Den, its bus connection was dropped, and the next launch took the free name: two Natter Dens on the
+same WhatsApp login, for seven hours. So there's more than the name now (`natter/instance.py`):
+
+- **The instance lock.** The Natter Den that owns the name takes an `flock` on
+  `$XDG_RUNTIME_DIR/natter-<app id>.lock` before anything else starts (in the Flatpak,
+  `$XDG_RUNTIME_DIR/app/<app id>/`, which every run of the app shares; without `XDG_RUNTIME_DIR`,
+  `~/.cache/natter-instance/`). The kernel lets go of it when the process ends, however it ends,
+  and WebKit's processes never hold it. The file says which process holds it and, once it has
+  started, which bus it's on and its unique name there. If it's held, an older Natter Den is
+  still running without its name: the new one waits up to 20 s for it to end. If it's still there
+  and has provably lost its bus connection (the file names this same bus, and its unique name is
+  no longer on it), it's frozen, as on 25 Oct: the new one ends it and its WebKit processes with
+  `SIGKILL`, which reaches a frozen process, and takes over. The process is checked first (its
+  start time, and `/proc/locks` showing it holds this lock). One that still has its connection
+  (quitting, say) is left alone, and so is everything in the Flatpak, where each run has its own
+  process namespace. Otherwise the new one says *Natter Den is already running but not answering*
+  and quits without opening WhatsApp (silently when D-Bus started it for a search).
+- **The name watchdog.** A thread of its own (a stalled main loop doesn't stall it) asks the bus
+  every 3 s who owns the name. The name is lost once Natter Den's own bus connection has closed,
+  another process owns the name, or no one has owned it at two looks in a row; a slow bus, a
+  timeout or an error never counts. Then it logs `natter: lost the bus name …`, asks the main loop
+  to quit, and ends the process itself 10 s later if it's still there, ending WebKit's web and
+  network processes first, so none is still writing WhatsApp's data when the next one starts. A
+  frozen Natter Den's thread runs as soon as it's thawed, before the main loop has swapped back in.
+- **The launch's check.** A launch that finds a Natter Den running pings it first, with 3 s to
+  answer, then asks its main loop for its actions (`org.gtk.Actions.DescribeAll`, what GLib asks
+  first), with 5 s. GDBus answers pings from a thread of its own, so the ping tells a frozen
+  Natter Den apart and the second question one whose main loop is stalled (swapping back in after
+  a thaw). Either way the launch says *Natter Den is running but not answering* or *… running
+  but busy* and exits, instead of handing over a command line GLib would wait on for good. The
+  check takes 15 s at most, however slow the bus. If the one it found ends before answering (a
+  search's Natter Den leaving after its last search), the launch runs once more. The search
+  service itself (`--gapplication-service`) isn't checked: D-Bus only starts it while nothing owns
+  the name.
+
+Each start logs `natter: primary instance: app id …, pid …, lock taken` (or `lock taken over
+from pid …`, with `which was ended` when it was).
