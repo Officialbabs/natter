@@ -127,6 +127,7 @@
   const sources = new Set();  // started source nodes that haven't ended
   const streams = new Set();  // microphone streams (voice notes, calls) feeding a context
   const elements = new Set();  // <audio>/<video> played through a context
+  const routed = new WeakMap();  // each of those → the context it plays through
   let lastStart = 0;
   const IDLE_MS = 30000;  // long enough that a burst of message sounds doesn't cycle the pipeline
 
@@ -174,10 +175,134 @@
   // Contexts carrying a call's sound: WhatsApp's call worklets ("voip-…" processors) run in them.
   const callContexts = new WeakSet();
 
+  // Sound a page decodes itself plays through a worklet (not a call's) or a script processor,
+  // for as long as it's connected, with no start or end to watch. Such a node keeps its context
+  // up while it's connected (a script processor only with onaudioprocess set or an audioprocess
+  // listener), and connecting one, or giving a script processor its handler, wakes a context
+  // Natter suspended, as a start does. One fed only by microphone streams that have all ended (a
+  // recorder left connected) doesn't hold its context. Held weakly: one the page lets go is
+  // collected, and goes from here.
+  const processors = new Set();  // WeakRefs to those nodes
+  const outputs = new WeakMap();  // each → what it's connected to now
+  const scripts = new WeakSet();  // which of them are script processors
+  const listening = new WeakMap();  // a script processor → its audioprocess listeners
+  const fedBy = new WeakMap();  // each → the microphone streams connected into it
+  let onProcessorConnected = null;  // set by "Sound that can't be heard", for its log line
+
+  // Something starts to play through a processor: as a start does.
+  function processorBusy(node) {
+    lastStart = performance.now();
+    wake(node.context);
+  }
+
+  function trackProcessor(node, script) {
+    if (!node || typeof node.connect !== "function" || typeof node.disconnect !== "function") return;
+    outputs.set(node, new Set());
+    fedBy.set(node, new Set());
+    processors.add(new WeakRef(node));
+    const connect = node.connect;
+    const disconnect = node.disconnect;
+    node.connect = function (destination, ...rest) {
+      const result = connect.call(this, destination, ...rest);
+      const out = outputs.get(this);
+      if (out && destination) {
+        out.add(destination);
+        processorBusy(this);
+        if (onProcessorConnected) onProcessorConnected(this, scripts.has(this));
+      }
+      return result;
+    };
+    node.disconnect = function (...args) {
+      const result = disconnect.apply(this, args);
+      const out = outputs.get(this);
+      // disconnect() or disconnect(output) cuts every connection; disconnect(node, …) that one.
+      if (out) { if (args.length && typeof args[0] === "object" && args[0]) out.delete(args[0]); else out.clear(); }
+      return result;
+    };
+    if (script) {
+      scripts.add(node);
+      listening.set(node, new Map());
+      // onaudioprocess stays the engine's own (on the prototype); setting it here wakes too.
+      let handler;
+      for (let on = node; on && !handler; on = Object.getPrototypeOf(on)) {
+        handler = Object.getOwnPropertyDescriptor(on, "onaudioprocess");
+      }
+      let own = handler && "value" in handler ? handler.value : undefined;
+      try {
+        Object.defineProperty(node, "onaudioprocess", {
+          configurable: true, enumerable: true,
+          get() { return handler && handler.get ? handler.get.call(this) : own; },
+          set(value) {
+            if (handler && handler.set) handler.set.call(this, value); else own = value;
+            if (typeof value === "function") processorBusy(this);
+          },
+        });
+      } catch (_) { /* left as it was: only a set handler isn't seen waking */ }
+      const add = node.addEventListener;
+      const remove = node.removeEventListener;
+      if (typeof add === "function" && typeof remove === "function") {
+        // As the DOM counts them: a listener once for each capture flag; `once` ones stay counted.
+        const capture = (options) => Boolean(typeof options === "object" && options ? options.capture : options);
+        node.addEventListener = function (type, listener, options) {
+          const map = listening.get(this);
+          if (type === "audioprocess" && listener && map) {
+            if (!map.has(listener)) map.set(listener, new Set());
+            map.get(listener).add(capture(options));
+            processorBusy(this);
+          }
+          return add.apply(this, arguments);
+        };
+        node.removeEventListener = function (type, listener, options) {
+          const map = listening.get(this);
+          const flags = type === "audioprocess" && map && map.get(listener);
+          if (flags) {
+            flags.delete(capture(options));
+            if (!flags.size) map.delete(listener);
+          }
+          return remove.apply(this, arguments);
+        };
+      }
+    }
+  }
+
+  // A microphone source connected into a processor: a recorder's. Once all such streams have
+  // ended, the processor no longer holds its context.
+  function feedFrom(source, stream) {
+    if (!source || typeof source.connect !== "function" || !stream) return;
+    const connect = source.connect;
+    source.connect = function (destination, ...rest) {
+      const result = connect.call(this, destination, ...rest);
+      const feeds = destination && fedBy.get(destination);
+      if (feeds) feeds.add(stream);
+      return result;
+    };
+  }
+
+  const ended = (stream) => {
+    try { return !stream.getTracks().some((track) => track.readyState === "live"); } catch (_) { return false; }
+  };
+
+  // The contexts a connected processor holds up now.
+  function processing() {
+    const busy = new Set();
+    for (const ref of processors) {
+      const node = ref.deref();
+      if (!node || !node.context || node.context.state === "closed") { processors.delete(ref); continue; }
+      const out = outputs.get(node);
+      if (!out || !out.size) continue;
+      if (scripts.has(node) && typeof node.onaudioprocess !== "function" && !listening.get(node).size) continue;
+      const feeds = fedBy.get(node);
+      if (feeds && feeds.size && [...feeds].every(ended)) continue;  // a recorder, done
+      busy.add(node.context);
+    }
+    return busy;
+  }
+
   function rest() {
     if (performance.now() - lastStart < IDLE_MS || playingSources() || liveStreams() || mediaPlaying() || calling()) return;
+    const busy = processing();
     eachContext((context) => {
-      if (context.state === "running" && !callContexts.has(context)) {
+      if (context.state === "running" && !callContexts.has(context) && !busy.has(context)) {
         rested.add(context);
         context.suspend().catch(() => {});
       }
@@ -197,15 +322,38 @@
         streams.add(stream);
         lastStart = performance.now();
         wake(this);
-        return super.createMediaStreamSource(stream);
+        const source = super.createMediaStreamSource(stream);
+        feedFrom(source, stream);
+        return source;
       }
       createMediaElementSource(element) {
-        elements.add(element);
-        wake(this);
-        element.addEventListener("play", () => wake(this));
+        throughContext(this, element);
         return super.createMediaElementSource(element);
       }
     };
+    // An element played through a context: the context wakes now and at each play, and the
+    // element counts as playing (mediaPlaying) while it does, wherever it is.
+    function throughContext(context, element) {
+      if (!context || !element || typeof element.addEventListener !== "function") return;
+      elements.add(element);
+      routed.set(element, context);
+      wake(context);
+      element.addEventListener("play", () => wake(context));
+    }
+    // Sound a page decodes itself (a wasm decoder) plays through a script processor or a worklet,
+    // which have no start() to watch: making one wakes a context Natter suspended, as a start
+    // does, and so does connecting it (trackProcessor); while it's connected rest() leaves its
+    // context be (processing()).
+    const scriptProcessor = Context.prototype.createScriptProcessor;
+    if (typeof scriptProcessor === "function") {
+      Tracked.prototype.createScriptProcessor = function (...args) {
+        lastStart = performance.now();
+        wake(this);
+        const node = scriptProcessor.apply(this, args);
+        trackProcessor(node, true);
+        return node;
+      };
+    }
     window.AudioContext = Tracked;
     if (window.webkitAudioContext) window.webkitAudioContext = Tracked;
     const Worklet = window.AudioWorkletNode;
@@ -213,11 +361,25 @@
       window.AudioWorkletNode = class AudioWorkletNode extends Worklet {
         constructor(context, name, options) {
           super(context, name, options);
-          if (/voip/i.test(String(name))) {
-            callContexts.add(context);
-            wake(context);
+          if (/voip/i.test(String(name))) callContexts.add(context);  // a call's: never rested
+          else {
+            lastStart = performance.now();
+            trackProcessor(this, false);
           }
+          wake(context);
         }
+      };
+    }
+    // The constructor form of createMediaElementSource.
+    const ElementSource = window.MediaElementAudioSourceNode;
+    if (ElementSource) {
+      window.MediaElementAudioSourceNode = class MediaElementAudioSourceNode extends ElementSource {
+        constructor(context, options) {
+          throughContext(context, options && options.mediaElement);
+          super(context, options);
+        }
+        // What createMediaElementSource() makes is one too.
+        static [Symbol.hasInstance](node) { return node instanceof ElementSource; }
       };
     }
     const StreamSource = window.MediaStreamAudioSourceNode;
@@ -230,6 +392,7 @@
             wake(context);
           }
           super(context, options);
+          if (options && options.mediaStream) feedFrom(this, options.mediaStream);
         }
       };
     }
@@ -277,11 +440,12 @@
     const playing = playingSources();
     const live = liveStreams();
     const media = mediaPlaying();  // after it, elements holds only what it keeps
+    const held = processing().size;  // contexts a connected worklet or script processor keeps up
     return { contexts: states, sources: playing, streams: live, media, elements: elements.size,
              idle: Math.round(performance.now() - lastStart),
              rtc: window.__natterRtc ? window.__natterRtc.counts() : null,
              sizes: { contexts: states.length, rested: restedCount, calls: callCount, elements: elements.size,
-                      sources: playing, streams: live, notifications: shown.size } };
+                      sources: playing, streams: live, held, notifications: shown.size } };
   }
 
   // ---- Videos aren't pictures ---------------------------------------------------------------
@@ -731,6 +895,263 @@
     rewatch();
     queueScan();
     watchLook();
+  }
+
+  // ---- Sound that can't be heard, for the log ----------------------------------------------
+  // Voice messages may play through <audio> elements (WebKit's GStreamer player), perhaps through
+  // a Web Audio context as well (createMediaElementSource): then the element's own output is muted
+  // and the sound comes only through the context. A page may also decode sound itself, with
+  // decodeAudioData or WebCodecs' AudioDecoder, and play it through a context. Where it can't be
+  // heard, the log says how the page tried: at its first sound, how WebKit answers for the
+  // formats voice messages come in; once for each way sound played (from the element, or
+  // through a context, and the context's state); decodeAudioData resolved or rejected; an Opus
+  // AudioDecoder supported, configured or failing; a decoded sound started, and its context's
+  // state then; a page's own worklet or script processor connected, and its context's state
+  // then; and each failure: the element's error (MediaError's code), play() refused (the
+  // error's name, not its message) or the context it plays through not running a moment after
+  // it started. Each line once a page for what it says, so repeats don't use up the page's
+  // MEDIA_LINES. Kinds, codes, states and error names only, never a URL, a name or what plays.
+  {
+    const MEDIA_LINES = 12;
+    const MEDIA_TYPES_KEPT = 64;
+    // The media types a source is told as; any other is "audio-other" or "video-other" (a blob's
+    // type comes from the message, which its sender writes).
+    const MEDIA_TYPES = ["audio/ogg", "audio/opus", "audio/mpeg", "audio/mp3", "audio/mp4", "audio/aac",
+                         "audio/x-m4a", "audio/webm", "audio/wav", "audio/x-wav", "audio/amr", "audio/3gpp",
+                         "audio/flac", "video/mp4", "video/webm", "video/quicktime", "video/3gpp", "video/ogg"];
+    const SUPPORT = {  // what voice messages, and the sounds around them, come as
+      "ogg-opus": 'audio/ogg; codecs="opus"', "ogg": "audio/ogg", "webm-opus": 'audio/webm; codecs="opus"',
+      "mp4-opus": 'audio/mp4; codecs="opus"', "mp4-aac": 'audio/mp4; codecs="mp4a.40.2"', "mpeg": "audio/mpeg",
+    };
+    let mediaLines = 0;
+    const toldOnce = new Set();  // what each line said (its key): at most MEDIA_LINES of them
+    // `once`: the line's key; the same key is never sent twice. The first line of a page says
+    // how WebKit answers for voice messages' formats first.
+    const tellMedia = (message, once) => {
+      if (mediaLines >= MEDIA_LINES || toldOnce.has(once)) return;
+      if (once !== "support" && !toldOnce.has("support")) tellMedia(support(), "support");
+      if (mediaLines >= MEDIA_LINES) return;
+      toldOnce.add(once);
+      mediaLines++;
+      post({ type: "media", ...message });
+    };
+    // An error's name ("NotAllowedError"), never its message; "" for anything else.
+    const errorName = (error) => {
+      try {
+        const name = error && error.name;
+        return typeof name === "string" && /^[A-Za-z]{1,40}$/.test(name) ? name : "";
+      } catch (_) { return ""; }
+    };
+
+    // What each object URL is of: a Blob's type without its parameters, or a MediaSource.
+    const mediaTypes = new Map();
+    const createObjectURL = URL.createObjectURL;
+    URL.createObjectURL = function (object) {
+      const url = createObjectURL.call(this, object);
+      let type = "";
+      try {
+        if (object instanceof Blob) type = String(object.type).split(";")[0].trim().toLowerCase();
+        else if (window.MediaSource && object instanceof window.MediaSource) type = "mediasource";
+      } catch (_) { /* not one of those */ }
+      if (type !== "mediasource" && !MEDIA_TYPES.includes(type)) {
+        type = type.startsWith("audio/") ? "audio-other" : type.startsWith("video/") ? "video-other" : "";
+      }
+      if (type) {
+        mediaTypes.set(url, type);
+        if (mediaTypes.size > MEDIA_TYPES_KEPT) mediaTypes.delete(mediaTypes.keys().next().value);
+      }
+      return url;
+    };
+
+    function sourceOf(element) {
+      const url = String(element.currentSrc || element.src || "");
+      if (!url) return element.srcObject ? "stream" : "none";
+      if (mediaTypes.has(url)) return mediaTypes.get(url);
+      const scheme = url.slice(0, url.indexOf(":") + 1).toLowerCase();
+      return { "blob:": "blob", "https:": "https", "data:": "data", "file:": "file" }[scheme] || "other";
+    }
+
+    function about(element) {
+      const context = routed.get(element);
+      return {
+        kind: window.HTMLVideoElement && element instanceof window.HTMLVideoElement ? "video" : "audio",
+        route: context ? "webaudio" : "element",
+        source: sourceOf(element),
+        state: context ? String(context.state) : "",
+      };
+    }
+    // The key of a line about an element: what, its code or error name, its kind, route, state
+    // and source.
+    const keyOf = (what, detail, now) => `${what} ${detail} ${now.kind} ${now.route} ${now.state} ${now.source}`;
+
+    function support() {
+      const probe = document.createElement("audio");
+      const play = {};
+      const source = {};
+      for (const [key, type] of Object.entries(SUPPORT)) {
+        try { play[key] = String(probe.canPlayType(type)); } catch (_) { play[key] = ""; }
+        try { source[key] = Boolean(window.MediaSource && window.MediaSource.isTypeSupported(type)); } catch (_) { source[key] = false; }
+      }
+      return { what: "support", play, source };
+    }
+
+    const watchedMedia = new WeakSet();
+    function watchMedia(element) {
+      if (watchedMedia.has(element)) return;
+      watchedMedia.add(element);
+      element.addEventListener("error", () => {
+        const error = element.error;
+        const code = error && Number.isInteger(error.code) ? error.code : 0;
+        const now = about(element);
+        tellMedia({ what: "error", code, ...now }, keyOf("error", code, now));
+      });
+      element.addEventListener("playing", () => {
+        const now = about(element);
+        tellMedia({ what: "played", ...now }, keyOf("played", "", now));
+        setTimeout(() => {
+          const context = routed.get(element);
+          if (context && context.state !== "running" && !element.paused && !element.ended) {
+            const later = about(element);
+            tellMedia({ what: "silent", ...later }, keyOf("silent", "", later));
+          }
+        }, 1500);
+      });
+    }
+
+    const play = HTMLMediaElement.prototype.play;
+    HTMLMediaElement.prototype.play = function (...args) {
+      if (!toldOnce.has("support")) tellMedia(support(), "support");
+      watchMedia(this);
+      const result = play.apply(this, args);
+      if (result && typeof result.then === "function") {
+        result.then(null, (error) => {
+          const name = errorName(error);
+          const now = about(this);
+          // AbortError: a pause() or a new source came first, which is no failure.
+          if (name !== "AbortError") tellMedia({ what: "refused", name, ...now }, keyOf("refused", name, now));
+        });
+      }
+      return result;
+    };
+
+    // Sound the page decodes itself: decodeAudioData's answer, and a decoded sound started.
+    const decoded = new WeakSet();  // AudioBuffers decodeAudioData made
+    const tellDecode = (result, error) => {
+      const name = result === "rejected" ? errorName(error) : "";
+      tellMedia({ what: "decode", result, name }, `decode ${result} ${name}`);
+    };
+    const Base = window.BaseAudioContext || window.AudioContext || window.webkitAudioContext;
+    const decode = Base && Base.prototype && Base.prototype.decodeAudioData;
+    if (typeof decode === "function") {
+      Base.prototype.decodeAudioData = function (data, ok, fail, ...rest) {
+        const done = typeof ok === "function" ? function (buffer) {
+          if (buffer && typeof buffer === "object") decoded.add(buffer);
+          tellDecode("resolved");
+          return ok.apply(this, arguments);
+        } : ok;
+        const failed = typeof fail === "function" ? function (error) {
+          tellDecode("rejected", error);
+          return fail.apply(this, arguments);
+        } : fail;
+        let result;
+        try {
+          result = decode.call(this, data, done, failed, ...rest);
+        } catch (error) {
+          tellDecode("rejected", error);
+          throw error;
+        }
+        if (result && typeof result.then === "function") {
+          // Watched beside the page's own handlers: the page still gets the same promise.
+          result.then((buffer) => {
+            if (buffer && typeof buffer === "object") decoded.add(buffer);
+            tellDecode("resolved");
+          }, (error) => tellDecode("rejected", error));
+        }
+        return result;
+      };
+    }
+    for (const Node of [window.AudioScheduledSourceNode, window.AudioBufferSourceNode]) {
+      if (!Node || !Object.prototype.hasOwnProperty.call(Node.prototype, "start")) continue;
+      const start = Node.prototype.start;
+      Node.prototype.start = function (...args) {
+        let buffer = null;
+        try { buffer = this.buffer; } catch (_) { /* not a buffer source */ }
+        const context = this.context;
+        if (buffer && decoded.has(buffer) && context) {
+          // Its context's state a moment on: Natter's start() has woken it by then, if it can.
+          setTimeout(() => {
+            const state = String(context.state);
+            tellMedia({ what: "started", state }, `started ${state}`);
+          }, 1500);
+        }
+        return start.apply(this, args);
+      };
+    }
+
+    // A page's own player connected (a worklet, not a call's, or a script processor: sound
+    // decoded in wasm or a worker plays that way, with no other line): its context's state a
+    // moment on, once a page for each kind and state.
+    const toldProcessors = new WeakSet();
+    onProcessorConnected = (node, script) => {
+      const context = node.context;
+      if (!context || toldProcessors.has(node)) return;
+      toldProcessors.add(node);
+      setTimeout(() => {
+        const kind = script ? "script" : "worklet";
+        const state = String(context.state);
+        tellMedia({ what: "processor", kind, state }, `processor ${kind} ${state}`);
+      }, 1500);
+    };
+
+    // WebCodecs' AudioDecoder, for Opus only: supported, configured, or its error's name.
+    const Decoder = window.AudioDecoder;
+    if (typeof Decoder === "function") {
+      const opus = (config) => {
+        try { return Boolean(config) && String(config.codec).toLowerCase() === "opus"; } catch (_) { return false; }
+      };
+      const tellDecoder = (step, error) => {
+        const name = error === undefined ? "" : errorName(error);
+        tellMedia({ what: "decoder", step, name }, `decoder ${step} ${name}`);
+      };
+      const decoderOf = new WeakMap();  // each decoder → what its error callback knows it by
+      const opusDecoders = new WeakSet();  // those, for decoders configured for Opus now
+      class AudioDecoder extends Decoder {
+        constructor(init) {
+          let given = init;
+          const mine = {};  // stands for the decoder in its error callback, which comes first
+          if (init && typeof init === "object" && typeof init.error === "function") {
+            const error = init.error;
+            given = Object.create(init, { error: { enumerable: true, value(problem) {
+              if (opusDecoders.has(mine)) tellDecoder("error", problem);
+              return error.apply(this, arguments);
+            } } });
+          }
+          super(given);
+          decoderOf.set(this, mine);
+        }
+        configure(config) {
+          const isOpus = opus(config);
+          try {
+            super.configure(config);
+          } catch (problem) {
+            if (isOpus) tellDecoder("configure-failed", problem);
+            throw problem;
+          }
+          const mine = decoderOf.get(this);
+          if (mine) { if (isOpus) opusDecoders.add(mine); else opusDecoders.delete(mine); }
+          if (isOpus) tellDecoder("configured");
+        }
+        static isConfigSupported(config) {
+          const result = super.isConfigSupported(config);
+          if (opus(config) && result && typeof result.then === "function") {
+            result.then((answer) => tellDecoder(answer && answer.supported ? "supported" : "unsupported"),
+                        (problem) => tellDecoder("check-failed", problem));
+          }
+          return result;
+        }
+      }
+      Object.defineProperty(window, "AudioDecoder", { value: AudioDecoder, writable: true, configurable: true });
+    }
   }
 
   // ---- Opening a chat -----------------------------------------------------------------------

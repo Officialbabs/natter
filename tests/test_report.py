@@ -233,7 +233,107 @@ printf '00:02.0 VGA compatible controller: Intel Corporation Meteor Lake-P [Inte
     "gst-inspect-1.0": r"""#!/bin/sh
 case "$1" in
     --version) echo "gst-inspect-1.0 version 1.26.7"; echo "GStreamer 1.26.7" ;;
-    webrtcbin | opusdec | avdec_h264) exit 0 ;;
+    webrtcbin | avdec_h264) exit 0 ;;
+    opusdec | oggdemux | playbin | decodebin3 | tee | queue | audioconvert | audioresample | scaletempo) exit 0 ;;
+    pulsesink) printf 'Factory Details:\n  Rank                     primary + 10 (266)\n' ;;
+    pipewiresink) printf 'Factory Details:\n  Rank                     none (0)\n' ;;
+    autoaudiosink) printf 'Factory Details:\n  Rank                     none (0)\n' ;;
+    *) exit 1 ;;
+esac
+""",
+    # Makes the test voice message, and plays it: FAKE_NOTE=silent, and nothing reaches the sink.
+    "gst-launch-1.0": r"""#!/bin/sh
+echo "gst-launch-1.0 $*" >> "$FAKE_LOG"
+case " $* " in
+    *" opusenc "*) for arg; do case "$arg" in location=*) echo OggS > "${arg#location=}" ;; esac; done ;;
+    *" playbin "*)
+        if [ "${FAKE_NOTE-}" = silent ]; then
+            echo 'ERROR: from element /GstPlayBin:playbin0/GstURIDecodeBin:uridecodebin0: Your GStreamer installation is missing a plug-in.'
+            exit 1
+        fi
+        for n in 1 2 3; do echo '/GstPlayBin:playbin0/GstPlaySink:playsink/GstFakeSink:fakesink1: last-message = chain   ******* (fakesink1:sink)'; done ;;
+esac
+exit 0
+""",
+    "pipewire": "#!/bin/sh\nprintf 'pipewire\\nCompiled with libpipewire 1.6.10\\nLinked with libpipewire 1.6.10\\n'\n",
+    # A version with more after it: the version alone is kept.
+    "wireplumber": "#!/bin/sh\nprintf 'wireplumber\\nCompiled with libwireplumber 0.5.13\\nLinked with libwireplumber 0.5.13 (Secret Person build)\\n'\n",
+    # Two outputs (the default a Bluetooth one, its name holding the device's address), Natter's
+    # voice-message stream muted, its Web Audio stream, and another app's.
+    "pactl": r"""#!/bin/sh
+echo "pactl $*" >> "$FAKE_LOG"
+case "$*" in
+    get-default-sink) echo bluez_output.3C_22_FB_12_34_56.1 ;;
+    "list sinks") cat <<'EOS'
+Sink #56
+	State: SUSPENDED
+	Name: alsa_output.pci-0000_00_1f.3.analog-stereo
+	Description: Secret Person's speakers
+	Mute: no
+	Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+	Base Volume: 65536 / 100% / 0.00 dB
+Sink #58
+	State: RUNNING
+	Name: bluez_output.3C_22_FB_12_34_56.1
+	Description: Secret Person's headphones
+	Mute: no
+	Volume: front-left: 39321 /  60% / -13.31 dB,   front-right: 39321 /  60% / -13.31 dB
+Sink #60
+	State: IDLE
+	Name: alsa_output.usb-Plantronics_Blackwire_5220_Series_D1CEC32927974D5F9B1C0FB4C4B3E2C3-00.analog-stereo
+	Mute: no
+	Volume: mono: 65536 / 100% / 0.00 dB
+Sink #61
+	State: IDLE
+	Name: Secret_Persons_AirPods_Pro
+	Mute: no
+	Volume: mono: 65536 / 100% / 0.00 dB
+EOS
+    ;;
+    "list sink-inputs") cat <<'EOS'
+Sink Input #301
+	Driver: PipeWire
+	Sink: 58
+	Corked: no
+	Mute: yes
+	Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+	Properties:
+		media.role = "music"
+		application.name = "Natter Den"
+		application.process.binary = "WebKitWebProcess"
+		pipewire.access.portal.app_id = "io.github.Officialbabs.Natter"
+		media.name = "Secret Person voice"
+Sink Input #302
+	Sink: 58
+	Corked: no
+	Mute: no
+	Volume: mono: 65536 / 100% / 0.00 dB
+	Properties:
+		media.role = "webaudio"
+		application.name = "WebKit"
+		application.process.binary = "WebKitWebProcess"
+		pipewire.access.portal.app_id = "io.github.Officialbabs.Natter"
+Sink Input #304
+	Sink: 60
+	Corked: yes
+	Mute: no
+	Volume: mono: 65536 / 100% / 0.00 dB
+	Properties:
+		media.role = "music<3C:22:FB:12:34:56>"
+		application.name = "Natter Den (Plantronics_Blackwire/D1CEC329)"
+		application.process.binary = "WebKitWebProcess"
+		pipewire.access.portal.app_id = "io.github.Officialbabs.Natter"
+Sink Input #303
+	Sink: 58
+	Corked: no
+	Mute: yes
+	Volume: front-left: 65536 / 100% / 0.00 dB
+	Properties:
+		media.role = "music"
+		application.name = "signal-desktop"
+		application.process.binary = "WebKitWebProcess"
+EOS
+    ;;
     *) exit 1 ;;
 esac
 """,
@@ -734,6 +834,72 @@ class ReportTest(unittest.TestCase):
                 self.assertIn("~/.cache/natter: none", text)
                 self.assertFalse((run.home / ".cache/natter").exists())
 
+    def test_sound(self):
+        """What plays a voice message here: elements and sinks' ranks, a test message played into
+        nothing, the outputs by number and kind, Natter's streams alone, WirePlumber's memory."""
+        def remembered(home):
+            state = home / ".local/state/wireplumber"
+            state.mkdir(parents=True)
+            (state / "stream-properties").write_text(
+                "[stream-properties]\n"
+                'Output/Audio:media.role:Music={"mute":true, "volume":1.000000, "channelVolumes":[0.4, 0.4], '
+                '"channelMap":["FL", "FR"], "target":"bluez_output.3C_22_FB_12_34_56.1"}\n'
+                'Output/Audio:application.name:Natter\\sDen={"mute":false, "channelVolumes":[1.0, 1.0], '
+                '"channelMap":["FL", "FR"], "target":"alsa_output.usb-Plantronics_Blackwire_5220_Series_'
+                'D1CEC32927974D5F9B1C0FB4C4B3E2C3-00.analog-stereo"}\n'
+                'Output/Audio:media.role:Notification={"mute":false, "volume":0.5, "target":"Secret_Persons_AirPods_Pro", '
+                '"note":"Secret Person"}\n'
+                'Output/Audio:application.name:keepassxc={"mute":false, "volume":0.5}\n')
+
+        for awk in [None, *AWKS]:  # each awk the report may meet reads WirePlumber's JSON alike
+            with self.subTest(awk=awk):
+                run = self.run_report(before=remembered, awk=awk)
+                self.assertEqual(run.code, 0, run.err + run.out)
+                text = run.text
+                sound = text[text.index("--- Sound: voice messages"):text.index("===== 3. ")]
+                self.assertIn("pipewire: 1.6.10\nwireplumber: 0.5.13\n", sound)
+                self.assertIn("  oggdemux: yes\n", sound)
+                self.assertIn("  volume: missing\n", sound)
+                self.assertIn("  pulsesink: yes, rank primary + 10 (266)\n", sound)
+                self.assertIn("  pipewiresink: yes, rank none (0)\n", sound)
+                self.assertIn("A test voice message (Ogg Opus, 1 s, made here) through WebKit's chain into fakesink: plays (3 buffers)", sound)
+                self.assertIn("output #56 (alsa_output): state SUSPENDED, mute no, volume 100%\n", sound)
+                self.assertIn("output #58 (bluez_output), the default: state RUNNING, mute no, volume 60%\n", sound)
+                self.assertIn("output #60 (alsa_output): state IDLE, mute no, volume 100%\n", sound)
+                self.assertIn("output #61 (other): state IDLE, mute no, volume 100%\n", sound)  # a name with no kind
+                self.assertIn("  stream #301: output #58, corked no, mute yes, volume 100%, media.role music, "
+                              "application.name Natter Den\n", sound)
+                self.assertIn("  stream #302: output #58, corked no, mute no, volume 100%, media.role webaudio, "
+                              "application.name WebKit\n", sound)
+                self.assertIn("  stream #304: output #60, corked yes, mute no, volume 100%, media.role other, "
+                              "application.name other\n", sound)  # not a known role, nor Natter's or WebKit's own name
+                self.assertNotIn("#303", sound)  # another app's
+                self.assertIn("  Output/Audio, media.role Music: mute true, volume 1.000000, channel volumes 0.4 0.4, "
+                              "output bluez_output\n", sound)
+                self.assertIn("  Output/Audio, application.name Natter Den: mute false, channel volumes 1.0 1.0, "
+                              "output alsa_output\n", sound)
+                self.assertIn("  Output/Audio, media.role Notification: mute false, volume 0.5, output other\n", sound)
+                self.assertNotIn("keepassxc", sound)
+                # Never an output's name: no Bluetooth address, no headset model or serial, no JSON left over.
+                for name in ("3C_22_FB", "3C:22:FB", "3c:22:fb", "12_34_56", "12:34:56", "Plantronics_Blackwire_5220",
+                             "Blackwire_5220", "D1CEC32927974D5F", "AirPods", "bluez_output.", "alsa_output.", "analog-stereo",
+                             "channelMap", "target", '"', "Description"):
+                    self.assertNotIn(name, sound, name)
+                self.assertNotIn("3C_22_FB", text)
+                self.assertNotIn("Plantronics", text)
+                self.assertNotIn("Description", text)
+                self.assertPrivate(text, run.home)
+                played = [line for line in run.logged if line.startswith("gst-launch-1.0 ")]
+                self.assertTrue(all("fakesink" in line or "filesink" in line for line in played), played)
+                self.assertFalse([line for line in run.logged if line.startswith("pactl ")
+                                  and line.split()[1] not in ("get-default-sink", "list")])  # it only looks
+
+    def test_sound_when_a_voice_message_does_not_play(self):
+        run = self.run_report(env={"FAKE_NOTE": "silent"})
+        self.assertEqual(run.code, 0, run.err + run.out)
+        self.assertIn("into fakesink: does NOT play\nERROR: from element /GstPlayBin:playbin0/GstURIDecodeBin:"
+                      "uridecodebin0: Your GStreamer installation is missing a plug-in.", run.text)
+
     def test_aur_package_is_one_copy(self):
         """The package's command on PATH and the package itself are the same copy."""
         run = self.run_report(env={"FAKE_AUR": "1"})
@@ -891,6 +1057,9 @@ class ReportTest(unittest.TestCase):
         self.assertIn("natter: during the watch", seen)
         self.assertIn("ring gfx_0.0.0 timeout", seen)
         self.assertIn("Natter Den asked the desktop to show one", seen)
+        # Natter's sound streams, once (they don't change), not another app's
+        self.assertEqual(seen.count(" sound: stream #301: output #58, corked no, mute yes"), 1, seen)
+        self.assertNotIn("#303", seen)
         self.assertPrivate(seen, run.home)
         self.assertNotIn(HOST, seen)
         self.assertFalse(path.exists())

@@ -3,7 +3,8 @@ troubleshooting text.
 
 The bridge keeps sets of the page's AudioContexts (and of those it suspended, and those carrying
 a call), of the media elements played through them, of the sources still playing and of the
-microphone streams feeding them, and a map of the notifications it showed. Each is pruned as what
+microphone streams feeding them, and a map of the notifications it showed; and how many contexts
+a connected worklet or script processor keeps from being suspended ("held"). Each is pruned as what
 is in it ends, so each should stay small; one that doesn't is a leak. That shows here the way a
 selector WhatsApp dropped shows in the canary's line: a line once the chat list is up, then only
 when a size passes its limit or keeps growing check after check, never a line every check. Only
@@ -17,14 +18,14 @@ from typing import Callable, Optional
 from gi.repository import GLib
 
 # The sizes audio() reports, in the order they're written.
-KEYS = ("contexts", "rested", "calls", "elements", "sources", "streams", "notifications")
+KEYS = ("contexts", "rested", "calls", "elements", "sources", "streams", "held", "notifications")
 # Past these a size is told, and its limit doubles: a few lines however far it grows. The bridge
 # keeps its last 300 notifications (bridge.js), so past that means its cap stopped working.
-LIMITS = {"contexts": 8, "rested": 8, "calls": 4, "elements": 32, "sources": 32, "streams": 4,
+LIMITS = {"contexts": 8, "rested": 8, "calls": 4, "elements": 32, "sources": 32, "streams": 4, "held": 4,
           "notifications": 300}
 # Sizes told when they grow at every check for a while. Not the notifications: that map grows
 # with each message up to its cap by design, and only passing the cap is news.
-GROWING = ("contexts", "rested", "calls", "elements", "sources", "streams")
+GROWING = ("contexts", "rested", "calls", "elements", "sources", "streams", "held")
 FIRST = 10  # seconds after the chat list is up, as the canary's (bridge.js scan)
 CHECK = 600  # seconds between checks after that
 AFTER_CALL = 60  # seconds before a check that came during a call is tried again

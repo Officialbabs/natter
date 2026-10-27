@@ -816,7 +816,166 @@ section_system() {
     else
         printf 'gst-inspect-1.0 is not installed\n'
     fi
+
+    part "Sound: voice messages (WebKit's player) and calls (Web Audio)"
+    sound_report
 }
+
+# What plays a voice message here: PipeWire's and WirePlumber's versions, the GStreamer elements
+# WebKit's player goes through (with the sinks' ranks: autoaudiosink takes the highest), a test
+# voice message made and played here into a sink that keeps nothing (no sound comes out), the
+# outputs and Natter's sound streams as the sound server has them (mute, volume, corked), and
+# what WirePlumber remembers for Natter's, WebKit's and each role's streams. Outputs by number and
+# kind (alsa_output, bluez_output), never by name: a node's name can hold a Bluetooth address or a
+# headset's model and serial. Every value read is cut to the characters it's made of.
+sound_report() {
+    for sr_cmd in pipewire wireplumber; do
+        if have "$sr_cmd"; then
+            printf '%s: %s\n' "$sr_cmd" "$(t "$sr_cmd" --version 2>&1 \
+                | sed -n 's/^Linked with lib[a-z]* *\([0-9][0-9A-Za-z.+~-]*\).*/\1/p' | head -n 1 | cut -c 1-24)"
+        else
+            printf '%s: not found\n' "$sr_cmd"
+        fi
+    done
+    if have gst-inspect-1.0; then
+        printf 'GStreamer elements a voice message plays through:\n'
+        for sr_el in oggdemux opusdec opusparse playbin decodebin3 tee queue audioconvert audioresample volume \
+            scaletempo autoaudiosink pulsesink pipewiresink alsasink; do
+            if t gst-inspect-1.0 "$sr_el" > "$T/gst-el" 2>/dev/null; then
+                sr_rank=$(sed -n 's/^ *Rank *//p' "$T/gst-el" | head -n 1 | tr -cd 'a-z0-9 +()-' | cut -c 1-32)
+                printf '  %s: yes%s\n' "$sr_el" "${sr_rank:+, rank $sr_rank}"
+            else
+                printf '  %s: missing\n' "$sr_el"
+            fi
+        done
+    fi
+    if have gst-launch-1.0; then
+        sr_note="$T/note.ogg"
+        if t gst-launch-1.0 -q audiotestsrc num-buffers=50 ! opusenc ! oggmux ! filesink location="$sr_note" \
+                > /dev/null 2>&1 && [ -s "$sr_note" ]; then
+            t gst-launch-1.0 -v playbin uri="file://$sr_note" video-sink=fakesink \
+                audio-sink="tee ! queue ! audioconvert ! audioresample ! volume ! audioconvert ! audioresample ! fakesink silent=false" \
+                > "$T/note.out" 2>&1
+            sr_buffers=$(grep -c 'last-message = chain' "$T/note.out")
+            if [ "$sr_buffers" -gt 0 ]; then
+                printf 'A test voice message (Ogg Opus, 1 s, made here) through WebKit'"'"'s chain into fakesink: plays (%s buffers)\n' "$sr_buffers"
+            else
+                printf 'A test voice message (Ogg Opus, 1 s, made here) through WebKit'"'"'s chain into fakesink: does NOT play\n'
+                grep -E 'ERROR|WARNING|missing|Missing' "$T/note.out" | sed "s|$T/||g" | cut -c 1-300 | capped 10
+            fi
+        else
+            printf "Couldn't make a test voice message here (audiotestsrc, opusenc, oggmux)\n"
+        fi
+    else
+        printf 'gst-launch-1.0 is not installed: no test voice message played\n'
+    fi
+    if have pactl; then
+        sr_default=$(t pactl get-default-sink 2>/dev/null | head -n 1)
+        LC_ALL=C t pactl list sinks 2>/dev/null | awk -v def="$sr_default" "$SAFE$SINKS" | capped 12
+        printf "%s's sound streams now (one shows only while something plays: play a voice message during --watch):\n" "$NAME"
+        LC_ALL=C t pactl list sink-inputs 2>/dev/null | awk "$SAFE$STREAMS" > "$T/streams"
+        if [ -s "$T/streams" ]; then capped 12 < "$T/streams"; else printf '  none\n'; fi
+    else
+        printf 'pactl is not installed: outputs and streams not read\n'
+    fi
+    sr_state="${XDG_STATE_HOME:-$HOME/.local/state}/wireplumber/stream-properties"
+    if [ -r "$sr_state" ]; then
+        printf 'WirePlumber remembers (stream-properties, Natter'"'"'s, WebKit'"'"'s and roles'"'"' lines):\n'
+        grep -iE '^(Output|Input)/Audio:(media\.role:|application\.(name|id|process\.binary):[^=]*(natter|webkit))' "$sr_state" \
+            | awk "$SAFE$REMEMBERED" | capped 20
+    fi
+}
+
+# Shared by the awk programs below: values cut down to what can't name a device or a person.
+SAFE='
+# A node name (alsa_output.usb-Maker_Model_Serial-00.analog-stereo, bluez_output.3C_22_FB_12_34_56.1)
+# → its kind, the part before its first dot, if it is a known one; else "other".
+function kindof(name,    k) {
+    k = name; sub(/\..*/, "", k)
+    if (k ~ /^(alsa|bluez|auto|easyeffects|raop|tunnel|roc|jack|combine|echo-cancel|v4l2|virtual)(_(output|input|sink|source|null))?$/) return k
+    return "other"
+}
+# A media.role, if it is one of the known ones; else "other" ("?" for none).
+function role(s,    l) {
+    if (s == "" || s == "?") return "?"
+    l = tolower(s)
+    if (l ~ /^(music|movie|video|game|notification|phone|communication|animation|production|accessibility|a11y|test|event|alarm|navigation|emergency|webaudio|voice|speech|multimedia)$/) return s
+    return "other"
+}
+# An app'"'"'s name, if it is Natter'"'"'s or WebKit'"'"'s own; else "other" ("?" for none).
+function appname(s) {
+    if (s == "" || s == "?") return "?"
+    if (s ~ /^(Natter( Den)?|natter|io\.github\.Officialbabs\.Natter|WebKit|WebKitWebProcess|WebKitGTK)$/) return s
+    return "other"
+}
+# A number of the sound server'"'"'s: digits (and a % or a point) only.
+function number(s) { return s ~ /^[0-9]+(\.[0-9]+)?%?$/ ? s : "?" }
+function yesno(s) { return s == "yes" || s == "no" ? s : "?" }'
+
+# WirePlumber's stream-properties lines (a key, then JSON) → which streams (Output or Input, a
+# known role, or Natter's or WebKit's own app name), mute, volume, channel volumes and the KIND of output it
+# sends them to; the rest of the JSON, and the output's name, are left out.
+REMEMBERED='
+function field(json, key,    rest) {
+    if (!match(json, "\"" key "\" *: *")) return ""
+    rest = substr(json, RSTART + RLENGTH)
+    if (substr(rest, 1, 1) == "\"") { rest = substr(rest, 2); sub(/".*/, "", rest); return rest }
+    if (substr(rest, 1, 1) == "[") { rest = substr(rest, 2); sub(/\].*/, "", rest); return rest }
+    sub(/[,} ].*/, "", rest); return rest
+}
+{
+    eq = index($0, "="); if (!eq) next
+    key = substr($0, 1, eq - 1); json = substr($0, eq + 1)
+    way = key; sub(/:.*/, "", way); way = way == "Output/Audio" ? "Output/Audio" : "Input/Audio"
+    rest = substr(key, length(way) + 2); prop = rest; sub(/:.*/, "", prop)
+    who = substr(rest, length(prop) + 2); gsub(/\\s/, " ", who)
+    if (prop != "media.role" && prop != "application.name" && prop != "application.id" && prop != "application.process.binary") next
+    line = "  " way ", " prop " " (prop == "media.role" ? role(who) : appname(who)) ":"
+    mute = field(json, "mute"); if (mute != "") line = line " mute " (mute == "true" || mute == "false" ? mute : "?") ","
+    volume = field(json, "volume"); if (volume != "") line = line " volume " number(volume) ","
+    channels = field(json, "channelVolumes")
+    if (channels != "") {
+        n = split(channels, each, / *, */); out = ""
+        for (i = 1; i <= n && i <= 8; i++) out = out (i > 1 ? " " : "") number(each[i])
+        line = line " channel volumes " out ","
+    }
+    target = field(json, "target"); if (target != "") line = line " output " kindof(target) ","
+    sub(/[,:]$/, "", line)
+    print line
+}'
+
+# `pactl list sinks` (in C) → one line an output: its number, its kind (the name up to its first
+# dot), whether it's the default, its state, mute and first volume.
+SINKS='
+function flush() { if (n != "") printf "output #%s (%s)%s: state %s, mute %s, volume %s\n", n, kind, def != "" && name == def ? ", the default" : "", st, mute, vol; n = "" }
+/^Sink #/ { flush(); n = number(substr($2, 2)); kind = st = mute = vol = "?"; name = ""; next }
+/^[ \t]*Name: / { name = $2; kind = kindof(name); next }
+/^[ \t]*State: / { st = $2 ~ /^[A-Z]+$/ ? $2 : "?"; next }
+/^[ \t]*Mute: / { mute = yesno($2); next }
+/^[ \t]*Volume: / { for (i = 2; i <= NF; i++) if ($i ~ /%$/) { vol = number($i); break }; next }
+END { flush() }'
+
+# `pactl list sink-inputs` (in C) → one line for each of Natter's streams (its web process's,
+# or its own): its number, the output it's on, corked, mute, volume, media.role and application.name
+# (a known role and Natter's or WebKit's own name, else "other").
+# Other apps' streams are left out whole.
+STREAMS='
+function flush() {
+    if (n != "" && (tolower(app) ~ /natter/ || (bin == "WebKitWebProcess" && tolower(appid) ~ /natter/)))
+        printf "  stream #%s: output #%s, corked %s, mute %s, volume %s, media.role %s, application.name %s\n", n, sink, corked, mute, vol, role(rl), appname(app)
+    n = ""
+}
+function value(line) { sub(/^[^=]*= */, "", line); gsub(/"/, "", line); return line }
+/^Sink Input #/ { flush(); n = number(substr($3, 2)); sink = corked = mute = vol = rl = app = "?"; bin = appid = ""; next }
+/^[ \t]*Sink: / { sink = number($2); next }
+/^[ \t]*Corked: / { corked = yesno($2); next }
+/^[ \t]*Mute: / { mute = yesno($2); next }
+/^[ \t]*Volume: / { for (i = 2; i <= NF; i++) if ($i ~ /%$/) { vol = number($i); break }; next }
+/^[ \t]*media\.role = / { rl = value($0); next }
+/^[ \t]*application\.name = / { app = value($0); next }
+/^[ \t]*application\.process\.binary = / { bin = value($0); next }
+/^[ \t]*pipewire\.access\.portal\.app_id = / { appid = value($0); next }
+END { flush() }'
 
 # ---- 3. Natter's log -------------------------------------------------------------------------
 
@@ -1376,7 +1535,7 @@ watch_run() {
     say "  1. Leave this running (this terminal can go behind other windows)."
     say "  2. Minimise $NAME's window, or close it."
     say "  3. Wait for a message to come in (ask someone to send you one)."
-    say "  4. Try a call, and a video."
+    say "  4. Try a call, a video, and a voice message."
     say "  5. Note the times when something goes wrong: no notification, the page reloading, a crash."
     say "Press Ctrl+C to stop early: the report is still written."
     say "If the computer freezes: restart it and run this again (no --watch needed). What the watch"
@@ -1426,6 +1585,16 @@ watch_run() {
         wr_dt=$(awk -v a="$wr_now_up" -v b="$wr_up" 'BEGIN { print a - b }')
         awk -v ts="$(date +%Y-%m-%dT%H:%M:%S)" -v dt="$wr_dt" -v hz="$hz" -v first="$wr_first" -v name="$NAME" \
             "$SAMPLE" "$T/prev" "$T/procs.now" > "$T/sample" 2>/dev/null
+        # Natter's sound streams, when they change: a voice message played meanwhile shows its own.
+        if have pactl; then
+            wr_ts=$(date +%Y-%m-%dT%H:%M:%S)
+            LC_ALL=C t pactl list sink-inputs 2>/dev/null | awk "$SAFE$STREAMS" | sed 's/^ *//' | sort > "$T/streams.now"
+            if [ "$(cat "$T/streams.now")" != "$(cat "$T/streams.prev" 2>/dev/null)" ]; then
+                if [ -s "$T/streams.now" ]; then sed "s/^/$wr_ts sound: /" "$T/streams.now" >> "$T/sample"
+                elif [ -f "$T/streams.prev" ]; then printf '%s sound: no streams of %s now\n' "$wr_ts" "$NAME" >> "$T/sample"; fi
+                mv "$T/streams.now" "$T/streams.prev"
+            fi
+        fi
         cat "$T/sample" >> "$T/samples"
         awk '{ print $1, $3, $6 }' "$T/procs.now" > "$T/prev"
         wr_up=$wr_now_up
@@ -1499,6 +1668,9 @@ WHAT THIS FILE CONTAINS
   their memory, and their systemd unit's memory limits)
 - the system: distribution, kernel, desktop, CPU, memory, swap and zram, graphics, and the
   versions of the packages $NAME uses
+- sound: the GStreamer elements voice messages play through, a test voice message made and
+  played here into nothing (no sound comes out), the outputs by number and kind, $NAME's sound
+  streams (mute, volume, role), and what WirePlumber remembers for them
 - $NAME's own log lines, WebKit and GStreamer warnings and errors, and Python tracebacks,
   from the system log; the times it started and quit
 - crashes (signal and stack) of $NAME and WebKit; out-of-memory kills
@@ -1506,8 +1678,9 @@ WHAT THIS FILE CONTAINS
 - graphics: the GPUs and their drivers, which GPU $NAME's processes use, graphics settings in
   the environment, $NAME's blur and hardware acceleration switches, the last boots and whether
   each ended cleanly, and the kernel's GPU hangs and resets in this boot and the one before
-- with --watch: $NAME's memory and CPU every few seconds, the kernel's GPU errors, and the
-  times it asked the desktop for a notification; and a watch a freeze cut short, if one was
+- with --watch: $NAME's memory and CPU every few seconds, its sound streams when they change,
+  the kernel's GPU errors, and the times it asked the desktop for a notification; and a watch a
+  freeze cut short, if one was
 
 WHAT IT DOES NOT CONTAIN
 - no messages, chat names, contacts or phone numbers, and nothing from WhatsApp's storage:

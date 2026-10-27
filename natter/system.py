@@ -931,7 +931,18 @@ class AudioFollower:
     a stream opens), Natter tells PipeWire its page's streams follow the default (target.object
     -1). Not a move to a device: WirePlumber would remember that for every WebKit app's sound.
     Through pactl and pw-metadata; where they're missing, nothing changes.
+
+    A page stream the sound server opened muted, or at no volume, is never changed (that may be
+    the person's choice) but told in the log, once a stream. WirePlumber can give each new stream
+    the mute and volume it remembers for the stream's media.role, shared by every app's streams
+    of that role. WebKit's player opens <audio> with the role "music"; its Web Audio output
+    likely does too ("music" is the only role named in WebKitGTK 2.52), not confirmed. So a mute
+    remembered for "music" would silence voice messages in Natter if they play through <audio>,
+    and through Web Audio too if that stream has the same role. Why they go silent isn't known:
+    the line helps tell this apart from the other candidates (docs/how-it-works.md).
     """
+
+    TOLD_MOST = 20  # lines a session about streams opened silent
 
     def __init__(self, app_name: str = NAME, app_id: str = APP_ID,
                  on_change: Optional[Callable[[], None]] = None) -> None:
@@ -944,6 +955,7 @@ class AudioFollower:
         self._restarts = 0
         self._busy = threading.Lock()
         self._change_pending = 0
+        self._told: set = set()  # the streams told as silent (their indexes)
 
     def start(self) -> bool:
         if not self.pactl or not self.metadata or self._process is not None:
@@ -1018,11 +1030,13 @@ class AudioFollower:
             default = self._pactl("get-default-sink").strip()
             sinks = json.loads(self._pactl("-f", "json", "list", "sinks", "short") or "[]")
             streams = json.loads(self._pactl("-f", "json", "list", "sink-inputs") or "[]")
+            ours = page_streams(streams, self.app_name, self.app_id)
+            self._tell_silent(ours)
             target = next((sink["index"] for sink in sinks if sink.get("name") == default), None)
             if target is None:
                 return 0
             moved = 0
-            for stream in page_streams(streams, self.app_name, self.app_id):
+            for stream in ours:
                 node = (stream.get("properties") or {}).get("object.id")
                 if stream.get("sink") != target and node:
                     subprocess.run([self.metadata, "--", str(node), "target.object", "-1"],
@@ -1033,6 +1047,42 @@ class AudioFollower:
             return 0
         finally:
             self._busy.release()
+
+
+    def _tell_silent(self, streams: list) -> None:
+        for stream in streams:
+            index = stream.get("index")
+            why = silenced(stream)
+            if why and index not in self._told and len(self._told) < self.TOLD_MOST:
+                self._told.add(index)
+                print(silent_line(stream, why), flush=True)
+
+
+def silenced(stream: dict) -> str:
+    """How the sound server keeps a stream (from `pactl -f json list sink-inputs`) from being
+    heard: "muted", "at 0% volume", or "" when it doesn't."""
+    if stream.get("mute") is True:
+        return "muted"
+    volume = stream.get("volume")
+    if isinstance(volume, dict) and volume:
+        values = [channel.get("value") if isinstance(channel, dict) else None for channel in volume.values()]
+        if all(type(value) is int and value == 0 for value in values):
+            return "at 0% volume"
+    return ""
+
+
+def silent_line(stream: dict, why: str) -> str:
+    """The log's line for a page stream the sound server opened silent."""
+    role = re.sub(r"[^A-Za-z0-9._-]", "", str((stream.get("properties") or {}).get("media.role") or ""))[:24]
+    if not role:
+        return (f"natter: sound: a sound stream of the page, without a role, is {why} by the sound server: "
+                f"unmute or raise {NAME} in the desktop's sound settings")
+    carries = {"music": " (<audio>, perhaps Web Audio too: voice messages may play through either)",
+               "video": " (videos)", "movie": " (videos)",
+               "webaudio": " (Web Audio: calls, and sound the page decodes itself)"}.get(role.lower(), "")
+    return (f"natter: sound: a sound stream of the page with media.role {role}{carries} is {why} by the "
+            f"sound server, which can give every app's {role} streams what it remembers for that role: unmute "
+            f"or raise it in the desktop's sound settings while one plays")
 
 
 def page_streams(streams: list, app_name: str = NAME, app_id: str = APP_ID) -> list:
@@ -1139,6 +1189,10 @@ PLAYERS = (
     ("Ogg voice messages (oggdemux)", ("oggdemux",)),
     ("playback (playbin)", ("playbin",)),
     ("sound (autoaudiosink, pulsesink)", ("autoaudiosink", "pulsesink")),
+    # WebKit's player sends every <audio>'s sound through these on its way to the sink
+    # (AudioSourceProviderGStreamer's bin), and scaletempo plays voice messages faster.
+    ("the player's sound (audioconvert, audioresample, volume)", ("audioconvert", "audioresample", "volume")),
+    ("voice messages at 1.5x and 2x (scaletempo)", ("scaletempo",)),
 )
 _stub: Optional[bool] = None
 

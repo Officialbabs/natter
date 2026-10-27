@@ -22,7 +22,7 @@ gi.require_version("WebKit", "6.0")
 gi.require_version("JavaScriptCore", "6.0")
 from gi.repository import Gio, GLib, GObject, Gtk, JavaScriptCore, WebKit
 
-from . import NAME, WHATSAPP_URL, audiosizes, rtc, themes
+from . import NAME, WHATSAPP_URL, audiosizes, playback, rtc, themes
 from .links import chat_link, is_whatsapp, page_link, same_site, short_link, unread_in
 from .loan import out_of_sight
 from .media import KINDS as MEDIA_KINDS, refusal, refusals
@@ -323,7 +323,20 @@ def parse_message(message) -> Optional[dict]:
         look = {"tokens": message.get("tokens"), "dark": message.get("dark"),
                 "dark_class": message.get("darkClass"), "media": message.get("media")}
         return {"type": kind, **look} if all(isinstance(value, bool) for value in look.values()) else None
+    if kind == "media":
+        return playback.parse(message)  # sound in the page, for the log (bridge.js, playback.py)
     return None
+
+
+def media_gstreamer_version() -> str:
+    """GStreamer's version as WebKit's web process has it ("1.28.8"), "" when unknown."""
+    try:
+        from .gstfix import dotted, gstreamer_version
+
+        found = gstreamer_version()
+        return dotted(found) if found else ""
+    except Exception:
+        return ""
 
 
 def reply_length(text: str) -> int:
@@ -689,6 +702,7 @@ class Account(GObject.Object):
         self._codec_log = None if app.calls_in_page else rtc.CodecLog(later=GLib.timeout_add)
         # The sizes of the bridge's audio sets (bridge.js audio()), for the log and About.
         self.audio_sizes = audiosizes.Watch(self)
+        self._media_lines = (None, 0)  # the page (its loaded_at) and the playback lines it has had
         if app.calls_in_page:
             # The page's sound follows in_call too (app.py _apply_page_sound): a ringing call answered.
             self.rtc = rtc.Host(self._on_page_call, lambda on: self.app.page_connected(on))
@@ -1651,6 +1665,24 @@ class Account(GObject.Object):
         elif kind == "look":
             self.look = {key: message[key] for key in ("tokens", "dark", "dark_class", "media")}
             self.app.page_look_changed(self, fresh=True)
+        elif kind == "media":
+            self._media_line(message)
+
+    def _media_line(self, message: dict) -> None:
+        """The log's line for what the page said of its sound (playback.py), a few a page."""
+        page, count = self._media_lines
+        if page != self.loaded_at:
+            page, count = self.loaded_at, 0
+        if count >= playback.LINES_PER_PAGE:
+            return
+        self._media_lines = (page, count + 1)
+        versions = ""
+        if message["what"] == "support":
+            versions = f"WebKitGTK {WebKit.get_major_version()}.{WebKit.get_minor_version()}.{WebKit.get_micro_version()}"
+            gstreamer = media_gstreamer_version()
+            if gstreamer:
+                versions += f", GStreamer {gstreamer}"
+        print(f"natter: {self.name}: {playback.line(message, versions)}", flush=True)
 
     def set_recording(self, on: bool) -> None:
         """A voice message is being recorded, or no longer (the page said, its page went, or the

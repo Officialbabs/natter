@@ -284,7 +284,7 @@ class WatchTest(unittest.TestCase):
         self.assertEqual((body, args), (SCRIPT, None))
         self.page.answer(sizes(contexts=1, notifications=2))
         self.assertEqual(self.lines, ["natter: Personal: audio sets at ready: contexts 1, rested 0, calls 0, "
-                                      "elements 0, sources 0, streams 0, notifications 2"])
+                                      "elements 0, sources 0, streams 0, held 0, notifications 2"])
         for _ in range(20):
             self.assertEqual(self.fire(), CHECK)
             self.page.answer(sizes(contexts=1, notifications=2))
@@ -293,7 +293,7 @@ class WatchTest(unittest.TestCase):
         self.page.answer(sizes(contexts=1, sources=LIMITS["sources"] + 1))
         self.assertEqual(self.lines[1], f"natter: Personal: audio sets growing (sources past {LIMITS['sources']}): "
                                         f"contexts 1, rested 0, calls 0, elements 0, sources {LIMITS['sources'] + 1}, "
-                                        "streams 0, notifications 0")
+                                        "streams 0, held 0, notifications 0")
 
     def test_never_every_minute(self):
         self.assertGreaterEqual(CHECK, 300)
@@ -405,13 +405,14 @@ class AboutTest(unittest.TestCase):
 
     def test_debug_line(self):
         self.assertEqual(debug_line(sizes(contexts=1, notifications=4)),
-                         "Audio sets: contexts 1, rested 0, calls 0, elements 0, sources 0, streams 0, notifications 4")
+                         "Audio sets: contexts 1, rested 0, calls 0, elements 0, sources 0, streams 0, held 0, "
+                         "notifications 4")
         self.assertEqual(debug_line(sizes(), 1, 2)[:23], "Audio sets (account 2):")
         self.assertIn("not known", debug_line(None))
 
     def test_in_the_debug_info(self):
         info = debug_info("in the page", [], False, ["Camera: switch on"], [debug_line(sizes(streams=1))])
-        self.assertIn("\nAudio sets: contexts 0, rested 0, calls 0, elements 0, sources 0, streams 1, "
+        self.assertIn("\nAudio sets: contexts 0, rested 0, calls 0, elements 0, sources 0, streams 1, held 0, "
                       "notifications 0\n", info)
         self.assertNotIn("Audio sets", debug_info("in the page", [], False))
 

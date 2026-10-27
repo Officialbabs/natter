@@ -140,6 +140,54 @@ it then works there is untried.
 On Ada, adding `io.github.Officialbabs.Natter` to `AllowBackground` in
 `~/.config/os-ai/lifecycle.ini` keeps Natter Den receiving messages while its window is closed.
 
+### Voice messages that can't be heard
+
+Why voice messages go silent on some systems isn't known yet. WebKit's GStreamer player, which
+plays `<audio>` and `<video>` elements, opens its sound stream with the role `music`. Web Audio's
+stream likely has that role too (`music` is the only role named in WebKitGTK 2.52), but that isn't
+checked. WirePlumber can give each new stream the mute, volume and output it remembers for its
+role, shared by every app's streams of that role. So a mute remembered for `music` (a music player
+muted once in the volume applet) would silence voice messages in Natter Den if they play through
+`<audio>`, and through Web Audio as well if its stream has the same role. Whether WhatsApp plays
+them through `<audio>`, or decodes them itself and plays them through Web Audio, isn't confirmed. Other candidates: a regression in a WebKit release, something on WhatsApp's side (or
+a change rolled out to some accounts), or Natter's idle audio on a path not yet seen. Silent voice
+messages are reported in a Chromium-based client too.
+
+Natter Den leaves a stream the sound server opened muted or at 0% as it is (it may be your
+choice) and says so in the log, once a stream:
+`natter: sound: a sound stream of the page with media.role music (<audio>, perhaps Web Audio too:
+voice messages may play through either) is muted by the sound server, …`.
+
+The bridge's idle audio (see [Memory](memory.md#idle-audio)) wakes a context it suspended before
+anything plays through it: a sound started, an element played (also one made a source of the
+context by `createMediaElementSource` or `new MediaElementAudioSourceNode`), and any worklet or
+script processor made or connected, which is how a page decoding sound itself would play it.
+While such a worklet (not a call's) is connected, or a script processor with `onaudioprocess` set
+or an `audioprocess` listener, the context isn't suspended, so a long note isn't cut off; a
+context with neither still rests, and so does one whose processor is fed only by microphone
+streams that have ended (a recorder left connected). The log's and About's audio sets say how many
+contexts are held up this way (`held`).
+
+The log's lines are there to tell these candidates apart, a few a page, each once for what it
+says: at the page's first sound, WebKit's and GStreamer's versions and how WebKit answers
+`canPlayType` and `MediaSource.isTypeSupported` for the formats voice messages come in; each way
+sound played (from the element itself, or through a Web Audio context, with its state, and the
+kind of source); `decodeAudioData` resolved or rejected (the error's name); an Opus WebCodecs
+`AudioDecoder` supported or not, configured, or failing (the error's name); a decoded sound
+started, and its context's state a moment later; the page's own worklet or script processor
+connected, and its context's state a moment later; and each failure: the element's error
+(`MediaError`'s code), `play()` refused (the error's name), or the context an element plays
+through still not running 1.5 s after it started. A muted `music` stream beside `played` lines
+points at the sound server; `MediaError` or `decodeAudioData` failures at WebKit or GStreamer; a
+context left suspended at the idle audio. No sound lines at all while voice messages are tried
+rules out `<audio>` and decoding on the page's main thread only: sound decoded in a worker and
+played some other way leaves none. Only kinds, codes, states and error names, never an address or a name
+(`natter/playback.py`). `tools/report.sh` adds the GStreamer elements a voice message plays
+through and the sinks' ranks, a test voice message made and played into `fakesink`, the outputs by
+number and kind, Natter Den's sound streams (mute, volume, role), and what WirePlumber remembers
+for them (role or app, mute, volume and the kind of output); with `--watch`, the streams each time
+they change.
+
 ### Pausing other audio
 
 While you record a voice message, other apps' players pause, and play again after. The bridge says
