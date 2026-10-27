@@ -172,12 +172,12 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>A start-up that answers at once.</p>"
+RELEASE_NOTES = ("<p>Voice messages: every way sound plays is woken, and the log says how each one played.</p>"
                  "<ul>"
-                 "<li>A starting copy answers launches at once: its set-up runs in the background, and launches that arrive meanwhile are kept and run in order</li>"
-                 "<li>A copy started only to answer desktop search leaves 10 seconds after starting if no search comes</li>"
-                 "<li>A clear message, instead of a crash, when there's no display to open a window on</li>"
-                 "<li>The Flatpak build has been tried: it builds, and everything calls, the camera and videos need is inside</li>"
+                 "<li>Sound the page plays through a worklet or a script processor wakes the page's audio, and stays awake for as long as it plays</li>"
+                 "<li>The log says how each kind of voice message tried to play, and any error, with no names or words</li>"
+                 "<li>The log notes a sound stream the sound server opened muted or at no volume</li>"
+                 "<li>The problem report has a sound section: the sound server's versions, the voice message chain, and remembered mutes and volumes</li>"
                  "</ul>")
 
 
