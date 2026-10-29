@@ -7,7 +7,7 @@
 # ./install.sh is the other way in: it runs Natter from a checkout, for one user.
 
 project('natter',
-  version: '0.1.7',  # keep in step with VERSION in natter/__init__.py and the metainfo's release
+  version: '0.1.8',  # keep in step with VERSION in natter/__init__.py and the metainfo's release
   license: 'GPL-3.0-or-later',
   meson_version: '>= 0.62',
 )

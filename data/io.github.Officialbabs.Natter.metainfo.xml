@@ -81,6 +81,19 @@
   </content_rating>
 
   <releases>
+    <release version="0.1.8" date="2026-10-29">
+      <description>
+        <p>Downloads that save, and a notice before the page grows too big.</p>
+        <ul>
+          <li>A file WhatsApp opens to save, as its own download arrow does, is saved instead of dropped</li>
+          <li>Files keep their own names, spaces included</li>
+          <li>When the chosen download folder can't take a file it goes to Downloads; when neither can, the message names the folder and says why</li>
+          <li>With the window in use, a page that has grown past 2.25 GB gets a notice whose Reload starts it afresh and frees its memory</li>
+          <li>The memory guard counts the page's graphics memory, and no longer takes WebKit's blank spare page for an idle one</li>
+          <li>The log tells the page's workers still alive from all those it created</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.7" date="2026-10-27">
       <description>
         <p>Voice messages: every way sound plays is woken, and the log says how each one played.</p>

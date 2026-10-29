@@ -187,12 +187,14 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>Voice messages: every way sound plays is woken, and the log says how each one played.</p>"
+RELEASE_NOTES = ("<p>Downloads that save, and a notice before the page grows too big.</p>"
                  "<ul>"
-                 "<li>Sound the page plays through a worklet or a script processor wakes the page's audio, and stays awake for as long as it plays</li>"
-                 "<li>The log says how each kind of voice message tried to play, and any error, with no names or words</li>"
-                 "<li>The log notes a sound stream the sound server opened muted or at no volume</li>"
-                 "<li>The problem report has a sound section: the sound server's versions, the voice message chain, and remembered mutes and volumes</li>"
+                 "<li>A file WhatsApp opens to save, as its own download arrow does, is saved instead of dropped</li>"
+                 "<li>Files keep their own names, spaces included</li>"
+                 "<li>When the chosen download folder can't take a file it goes to Downloads; when neither can, the message names the folder and says why</li>"
+                 "<li>With the window in use, a page that has grown past 2.25 GB gets a notice whose Reload starts it afresh and frees its memory</li>"
+                 "<li>The memory guard counts the page's graphics memory, and no longer takes WebKit's blank spare page for an idle one</li>"
+                 "<li>The log tells the page's workers still alive from all those it created</li>"
                  "</ul>")
 
 
