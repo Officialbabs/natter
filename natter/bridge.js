@@ -1370,6 +1370,84 @@
     });
   }
 
+  // ---- Downloads ------------------------------------------------------------------------------
+  // WhatsApp saves a file by clicking a link to a blob: URL of it, or by opening that URL, and may
+  // revoke the URL straight after. A URL opened in a new window Natter saves itself
+  // (Account._on_policy), a moment later, and a revoked blob can't be fetched any more. So a blob:
+  // URL clicked or opened in the last minute is revoked a minute after that instead. Natter is told
+  // the file's name too (the link's download name, or the File's), which it saves it under.
+  {
+    const KEEP_MS = 60000;
+    const KEPT = 32;  // URLs WhatsApp never revokes don't pile up
+    const used = new Map();  // a blob: URL and when it was clicked or opened
+    const names = new Map();  // a blob: URL of a File and the File's name
+    const bound = (map) => { if (map.size > KEPT) map.delete(map.keys().next().value); };
+    const createObjectURL = URL.createObjectURL;
+    const revokeObjectURL = URL.revokeObjectURL;
+    URL.createObjectURL = function (object) {
+      const url = createObjectURL.call(this, object);
+      try {
+        if (typeof File === "function" && object instanceof File && object.name) {
+          names.set(url, String(object.name));
+          bound(names);
+        }
+      } catch (_) { /* not a File */ }
+      return url;
+    };
+    URL.revokeObjectURL = function (url) {
+      const key = String(url);
+      const at = used.get(key);
+      const wait = at === undefined ? 0 : at + KEEP_MS - Date.now();
+      if (wait > 0) {
+        setTimeout(() => URL.revokeObjectURL(key), wait);
+        return undefined;
+      }
+      used.delete(key);
+      names.delete(key);
+      return revokeObjectURL.call(this, url);
+    };
+
+    function saving(url, name) {
+      const key = String(url || "");
+      if (!key.startsWith("blob:")) return;
+      used.delete(key);
+      used.set(key, Date.now());
+      bound(used);
+      post({ type: "download", url: key, name: String(name || names.get(key) || "") });
+    }
+    const clicked = (link) => {
+      try { if (link && link.href) saving(link.href, link.getAttribute("download")); } catch (_) { /* not a link */ }
+    };
+    // a.click() and a click event sent to a link, in the page or not (FileSaver's way)...
+    const Link = window.HTMLAnchorElement;
+    if (Link && Link.prototype) {
+      const click = Link.prototype.click;
+      if (typeof click === "function") {
+        Link.prototype.click = function () { clicked(this); return click.apply(this, arguments); };
+      }
+      const dispatch = window.EventTarget && window.EventTarget.prototype.dispatchEvent;
+      if (typeof dispatch === "function") {
+        Link.prototype.dispatchEvent = function (event) {
+          if (event && event.type === "click") clicked(this);
+          return dispatch.apply(this, arguments);
+        };
+      }
+    }
+    // ...the user's own click on one (seen on its way down, before the link acts)...
+    window.addEventListener("click", (event) => {
+      const target = event.isTrusted && event.target;
+      if (target && typeof target.closest === "function") clicked(target.closest("a[href]"));
+    }, true);
+    // ...and window.open().
+    const open = window.open;
+    if (typeof open === "function") {
+      window.open = function (url) {
+        saving(url, "");
+        return open.apply(this, arguments);
+      };
+    }
+  }
+
   // ---- Replying from a notification ---------------------------------------------------------
   // A reply goes the way the person's own hands would take it, once: WhatsApp's own handler for
   // its notification opens that chat (unless it's open already), the words go into the chat's

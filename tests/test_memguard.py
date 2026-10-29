@@ -511,15 +511,125 @@ class GrowthTest(GuardBase):
         self.assertNotIn("besides", self.out.getvalue())
         self.assertIn("no reservation)\n", self.out.getvalue())
 
-    def test_gpu_buffers_and_the_charge_never_count_towards_ending_a_page(self):
-        self.proc.fdinfo(3002, {"5": "drm-client-id:\t30\ndrm-total-system0:\t2147483648\n"})  # 2 GiB, in bytes
+    def test_the_unit_charge_never_counts_towards_ending_a_page(self):
         guard = self.make(charge=lambda: {"shmem": 3 * GiB, "zswap": GiB})
         self.assertEqual(guard.limits(False), (3 * GiB, 3 * GiB + CALL_ROOM))
-        self.proc.set(3002, anon_mb=3 * 1024 - 1)  # just under its limit, with 2 GiB of GEM beside
+        self.proc.set(3002, anon_mb=3 * 1024 - 1)  # just under its limit, with the unit's shmem beside
         for now in (0, 2, 4):
             self.assertEqual(guard.check(now=now), [])
         self.assertEqual(self.killed, [])
-        self.assertEqual(memguard.gem_held(3002, self.proc.root), 2 * GiB)
+
+    def test_gpu_buffers_past_their_room_count_towards_ending_a_page(self):
+        # Against the limits only what's past GPU_ROOM counts (GPU_COUNTED): here 512 MB of 2 GiB.
+        self.assertEqual(memguard.GPU_ROOM, int(1.5 * GiB))
+        self.proc.fdinfo(3002, {"5": "drm-client-id:\t30\ndrm-total-system0:\t2147483648\n"})  # 2 GiB, in bytes
+        for now, size in enumerate((2200, 2400, 2600)):  # 100 MB/s; 3112 MB counted at the last look
+            self.proc.set(3002, anon_mb=size)
+            self.guard.check(now=now * 2)
+        self.assertEqual(self.killed, [3002])
+        self.assertEqual(self.reported, [(3002, 2600 * MiB + 2 * GiB)])
+        self.assertIn("natter: memory: page 3002 held 4648 MB (2600 MB its own, 2048 MB GPU buffers; 3112 MB "
+                      "counted), past its limit of 3072 MB, growing 100 MB/s; ended it", self.out.getvalue())
+
+    def test_an_idle_pages_gpu_buffers_dont_count_towards_its_limits(self):
+        # 28 Oct 2026: 1.4-1.6 GB of them beside the page's own 1.6-2.6 GB.
+        self.proc.fdinfo(3002, {"5": "drm-client-id:\t30\ndrm-total-system0:\t1600000000\n"})
+        for now, size in enumerate((2700, 2900, 3070)):  # 4.6 GB with them, growing fast, under 3 GiB alone
+            self.proc.set(3002, anon_mb=size)
+            self.assertEqual(self.guard.check(now=now * 2), [])
+
+    def test_gpu_buffers_count_towards_the_hard_limit_too(self):
+        self.proc.fdinfo(3002, {"5": "drm-client-id:\t30\ndrm-total-system0:\t2048 MiB\n"})
+        self.proc.set(3002, anon_mb=4000)  # holding still: 4512 MB counted, under 3 GiB + CALL_ROOM
+        self.assertEqual(self.guard.check(now=0), [])
+        self.proc.set(3002, anon_mb=4100)
+        self.assertEqual(self.guard.check(now=60), [3002])  # 4612 MB counted, past 4608 MB
+
+    def test_against_the_ceiling_gpu_buffers_count_in_full(self):
+        # The unit's MemoryMax counts them all (page_ceiling).
+        guard = self.make(ceiling=5 * GiB)
+        self.proc.fdinfo(3002, {"5": "drm-client-id:\t30\ndrm-total-system0:\t1536 MiB\n"})
+        self.proc.set(3002, anon_mb=3500)  # 5036 MB with them, 3500 MB counted against the limits
+        self.assertEqual(guard.check(now=0), [])
+        self.proc.set(3002, anon_mb=3600)
+        self.assertEqual(guard.check(now=100), [3002])  # 5136 MB, past 5120 MB
+        self.assertIn("natter: memory: page 3002 held 5136 MB (3600 MB its own, 1536 MB GPU buffers), past its "
+                      "limit of 5120 MB, growing 1 MB/s; ended it", self.out.getvalue())
+
+    def test_a_jump_in_gpu_buffers_is_no_runaway(self):
+        # A fullscreen video, a resize, or a full look finding a new DRM file.
+        self.proc.set(3002, anon_mb=3200)  # past its limit, holding still
+        for now, gpu in enumerate((0, 1024, 2048, 2900)):
+            self.proc.fdinfo(3002, {"5": f"drm-client-id:\t30\ndrm-total-system0:\t{gpu} MiB\n"})
+            self.assertEqual(self.guard.check(now=now * 2), [])
+
+    def test_a_healthy_page_on_an_8_gb_computer(self):
+        # Its limit is PAGE_FLOOR, 2.5 GiB: an idle page of 1.4 GB of its own and 1.6 GB of GPU
+        # buffers is under it, and survives a burst; past a call it survives the call's grace.
+        total = 8 * GiB
+        guard = self.make(ceiling=memguard.page_ceiling(total))
+        guard.limit = memguard.page_limit(total)
+        self.proc.fdinfo(3002, {"5": "drm-client-id:\t30\ndrm-total-system0:\t1600000000\n"})
+        for now, size in enumerate((1335, 1435, 1535, 1635)):  # 100 MB/s for three looks
+            self.proc.set(3002, anon_mb=size)
+            self.assertEqual(guard.check(now=now * 2), [])
+        self.call = True
+        self.proc.set(3002, anon_mb=2600)  # a call's engine on top, 1.2 GB more
+        self.assertEqual(guard.check(now=60), [])
+        self.call = False
+        for now in range(62, 62 + int(CALL_GRACE) + 64, 2):
+            self.assertEqual(guard.check(now=now), [])
+        self.assertEqual(self.killed, [])
+
+    def test_a_call_keeps_its_room_with_gpu_buffers_counted(self):
+        self.proc.fdinfo(3002, {"5": "drm-client-id:\t30\ndrm-total-system0:\t2560 MiB\n"})  # 1 GiB counted
+        self.call = True
+        for now, size in enumerate((3000, 3200, 3400)):  # 4.3 GiB counted, growing: under 3 + 1.5 GiB
+            self.proc.set(3002, anon_mb=size)
+            self.assertEqual(self.guard.check(now=now * 2), [])
+        self.call = False
+        self.guard.check(now=CALL_GRACE + 10)
+        self.proc.set(3002, anon_mb=3600)
+        self.assertEqual(self.guard.check(now=CALL_GRACE + 12), [3002])  # 4624 MB counted: past the room, after it
+
+    def test_without_drm_files_the_page_alone(self):
+        self.proc.fdinfo(3002, {"5": "pos:\t0\nflags:\t02\n"})
+        for now, size in enumerate((2800, 3000, 3070)):
+            self.proc.set(3002, anon_mb=size)
+            self.guard.check(now=now * 2)
+        self.assertEqual(self.killed, [])
+
+    def test_drm_files_are_looked_through_again_now_and_then(self):
+        # Only the DRM files found at the last full look are read between full looks; a file that
+        # goes brings the full look forward.
+        self.proc.fdinfo(3002, {"5": "drm-client-id:\t30\ndrm-total-system0:\t100 MiB\n", "6": "pos:\t0\n"})
+        page = self.guard._pages
+        self.guard.check(now=0)
+        self.assertEqual((page[3002].gpu, page[3002].gpu_fds), (100 * MiB, ["5"]))
+        self.proc.fdinfo(3002, {"7": "drm-client-id:\t31\ndrm-total-system0:\t50 MiB\n"})  # a new client
+        self.guard.check(now=2)
+        self.assertEqual(page[3002].gpu, 100 * MiB)  # not seen until the next full look
+        for look in range(memguard.GPU_RESCAN):
+            self.guard.check(now=4 + 2 * look)
+        self.assertEqual(page[3002].gpu, 150 * MiB)
+        (self.proc.root / "3002" / "fdinfo" / "5").unlink()  # its first file closed
+        self.guard.check(now=100)
+        self.assertEqual((page[3002].gpu, page[3002].gpu_fds), (50 * MiB, ["7"]))
+
+    def test_workers_alive_in_the_step_line(self):
+        (self.proc.root / "3002" / "smaps").write_text(SMAPS)
+        self.proc.threads(3002, {3002: ("WebKitWebProcess", 10), 3010: ("WebCore: Worker", 1),
+                                 3011: ("WebCore: Worker", 1), 3012: ("SkiaGPUWorker", 1)})
+        for tid, name in ((3002, "WebKitWebProces"), (3010, "WebCore: Worker"), (3011, "WebCore: Worker"),
+                          (3012, "SkiaGPUWorker")):
+            (self.proc.root / "3002" / "task" / str(tid) / "comm").write_text(name + "\n")
+        self.assertEqual(memguard.worker_threads(3002, self.proc.root), 2)
+        self.assertEqual(memguard.worker_threads(99999, self.proc.root), 0)
+        self.proc.set(3002, anon_mb=1600)
+        self.guard.check(now=0)
+        self.proc.set(3002, anon_mb=2100)
+        self.guard.check(now=2)
+        self.assertIn("(not a 1.5 MiB multiple, no reservation); 2 workers alive\n", self.out.getvalue())
 
     def test_an_idle_page_loading_is_not_news(self):
         self.proc.set(3002, anon_mb=30)

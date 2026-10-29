@@ -584,7 +584,8 @@
   // - a rewritten decoder fed faster than real time outside a call is being fed a file, and fails.
   // Failing is what WebKit does when a codec breaks: closed, then the error callback. What each
   // decoder and encoder does goes up to Natter as counts, no content, at most once a second each,
-  // for the log; so does how many workers the page starts, since none of this reaches into one.
+  // for the log; so does how many workers the page starts and has yet to end, since none of this
+  // reaches into one.
   const HELD_FRAMES = 64;  // a call's decoder has 1-3 out at once
   const PAGE_FRAMES = 2 * HELD_FRAMES;  // a group call's decoders, 1-3 each
   const HELD_MS = 10000;
@@ -640,7 +641,7 @@
   // What is known of each decoder and encoder (by the codec), and of the page as a whole.
   const codecs = new WeakMap();
   const made = { dec: 0, enc: 0 };
-  const page = { kind: "page", workers: 0, annexb: 0, dirty: false, sentAt: -Infinity, every: REPORT_MS };
+  const page = { kind: "page", workers: 0, alive: 0, annexb: 0, dirty: false, sentAt: -Infinity, every: REPORT_MS };
   let pageOpen = 0;  // decoded frames the page holds, from every decoder
   const waiting = new Set();  // decoders with chunks held back
 
@@ -677,7 +678,7 @@
   // Only these fields, which rtc.py checks again: codec names, sizes and counts.
   function countsOf(rec) {
     if (rec.kind === "page") {
-      return { op: "webcodecs", kind: "page", workers: rec.workers, annexb: rec.annexb, open: pageOpen };
+      return { op: "webcodecs", kind: "page", workers: rec.workers, alive: rec.alive, annexb: rec.annexb, open: pageOpen };
     }
     const message = { op: "webcodecs", kind: rec.kind, id: rec.id, codec: rec.codec, w: rec.w, h: rec.h,
                       out: rec.out, queue: queueOf(rec), drops: rec.drops };
@@ -1130,15 +1131,37 @@
   }
 
   // ---- Workers ----------------------------------------------------------------------------------
-  // Only how many the page starts: the codecs in a worker are WebKit's own, unbounded.
+  // Only counted: how many the page starts, and how many of those are alive. One is ended by
+  // terminate(), or once its Worker is collected (WebKit then ends its thread). One that closes
+  // itself from inside counts until then. Ending idle ones isn't Natter's to do: from here a
+  // worker waiting for its next voice message looks the same as one forgotten. The codecs in a
+  // worker are WebKit's own, unbounded.
 
   const NativeWorker = window.Worker;
   if (typeof NativeWorker === "function") {
+    const ended = new WeakSet();
+    const end = () => {
+      page.alive = Math.max(0, page.alive - 1);
+      changed(page, true);
+    };
+    const gone = typeof FinalizationRegistry === "function" ? new FinalizationRegistry(end) : null;
     class Worker extends NativeWorker {
       constructor(scriptURL) {  // one named argument: Worker.length is 1, as the browser's own
         super(...arguments);
         page.workers++;
+        page.alive++;
+        if (gone) gone.register(this, null, this);
         changed(page, true);
+      }
+
+      terminate() {
+        const result = typeof super.terminate === "function" ? super.terminate() : undefined;
+        if (!ended.has(this)) {
+          ended.add(this);
+          if (gone) gone.unregister(this);
+          end();
+        }
+        return result;
       }
     }
     install("Worker", Worker);

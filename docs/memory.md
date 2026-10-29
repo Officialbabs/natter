@@ -18,10 +18,11 @@ only just above that idle page: one that creeps past it, about 140 MB an hour, h
 dropped at every check again within half an hour or so, which is cheap. `NATTER_MEMORY_LIMIT=<MB>` overrides the limit
 (0 = WebKit's own) and `NATTER_MEMORY_THRESHOLDS=0.65,0.85` the two thresholds.
 
-None of WebKit's counting, nor the guard's below, sees the page's GPU buffers: on Intel the
-driver backs them with shared memory (542 MB of a page's, one morning), which shows only as the
-unit's `shmem`. Natter Den reports it (the log's step lines, `tools/compare-memory.py`) and never
-counts it towards ending a page.
+WebKit's counting doesn't see the page's GPU buffers: on Intel the driver backs them with shared
+memory (542 MB of a page's, one morning; 1.4-1.6 GB all afternoon on 28 October 2026), which
+shows only as the unit's `shmem`. The guard (below) counts them, read from the page's DRM files'
+`fdinfo`, as they are charged to Natter Den's unit and swapped like the rest; the log's step lines
+and `tools/compare-memory.py` report them.
 
 ## Idle audio
 
@@ -74,7 +75,12 @@ these reasons:
   page never quiet in its first hour keeps the 2 GB floor alone, so a page that has crept never
   sets its own ceiling. A fresh page or a crash brings a new process, measured afresh; another
   account's fresh page leaves this one's as it was. The log says
-  `natter: page: reloaded because it grew to N MB while hidden (idle N MB)`;
+  `natter: page: reloaded because it grew to N MB while hidden (idle N MB)`. What's under 300 MB
+  isn't a page (WebKit's blank spare process holds 20 MB, and was once taken for an idle page)
+  and isn't measured. What's over 2 GB at that first quiet look is a page that has grown already
+  (one measured 2,166 MB minutes after growing at 94 MB/s, which raised its ceiling to 3.2 GB):
+  it keeps the 2 GB floor, and the log says `a page holds N MB at its first quiet look, more than
+  an idle page`;
 - a call left 512 MB or more behind.
 
 And only once the window has been hidden ten minutes; not during a call (ringing or connected,
@@ -85,6 +91,15 @@ time, and never two within a minute. Natter Den looks every minute, and again wh
 paused it while hidden. Each fresh page is logged with the memory it saw, and the chat that was
 open opens again.
 
+While you're using the window, Natter Den never gives a page a fresh one by itself. A page past
+2.25 GB, or its growth ceiling (above) when that's more, gets a toast instead, once per web
+process: *WhatsApp's page has grown to N GB. Reload frees it.* Its *Reload* gives that page a
+fresh one. With several accounts Natter Den can't tell which page grew, so *Reload* goes to the
+one longest since its last load, and the toast says so. The menu's *Reload*
+doesn't free memory: WhatsApp loads again in the same web process (on 28 October 2026 a page held
+3,096 MB after two of them). Not during a call, a reply or a voice recording, while a page loads,
+or while the window is locked or behind others: it waits for the next minute's look.
+
 WebKit's own limit ends a page only at 2.5 times the limit, or higher: half a gigabyte above the
 most the guard lets a page hold during a call, as WebKit doesn't know about calls.
 
@@ -93,14 +108,18 @@ most the guard lets a page hold during a call, as WebKit doesn't know about call
 WebKit's limit only counts what's resident, and only looks when the page's own main thread lets
 it, so a page busy growing can get past it (on 20 October 2026 a video being attached took one to
 12 GB). Natter Den's guard (`natter/memguard.py`) looks at each page every 2 s from a thread of its
-own, with the window shown or hidden, swap included. A page's limit is a quarter of the computer's
-memory, between 2.5 and 6 GB and never more than half. A page past it that grows faster than
-64 MB/s, or 1.5 GB past it whatever it does (less on small computers), is ended and reloaded,
+own, with the window shown or hidden, swap included, and its GPU buffers where they can be read
+(the DRM files are looked through every 30 s, and only those read in between). A page's limit is
+a quarter of the computer's memory, between 2.5 and 6 GB and never more than half. It's sized for
+the page's own memory, and an idle page holds up to 1.5 GB of GPU buffers beside, so only those
+past 1.5 GB count towards it, and none towards how fast the page grows. A page past it that grows
+faster than 64 MB/s, or 1.5 GB past it whatever it does (less on small computers), is ended and reloaded,
 back on the chat that was open, with a toast if you're using the window. Ended again within ten
 minutes, it stays down until you press *Try Again*, and a notification says so if you're not
 looking at the window. During a call, and for a minute after it ends (30 s after its last channel
 closes), the page may hold 1.5 GB more before growth counts, and half a gigabyte more again
-whatever it does.
+whatever it does. The most a page may hold, call or not, is what Natter Den's unit leaves it
+(below), less half a gigabyte; there its GPU buffers count in full, as the unit is charged for them.
 
 The last backstop is the kernel's. In a unit whose `OOMPolicy` is `continue`, such as the scope
 Natter Den makes for itself, it sets `MemoryMax` (one page's limit, plus 1.5 GB for each account and
@@ -112,10 +131,30 @@ choice: the kernel ending a page there leaves Natter Den running. The units desk
 in have had `OOMPolicy=stop` wherever it was checked, and in those the kernel ending one page
 stops all of Natter Den: there Natter Den sets no limit, leaves its pages' standing with the
 kernel as it is, and the guard alone ends a page that grows without end (the log says so once).
-The log says what each page held, and the files handed to WhatsApp by number, size and type, not
-by name. At every half gigabyte a page passes above 1.5 GB, it says what the page's largest
-regions look like, and beside them what nothing above counts: the page's GPU buffers (by its DRM
-files' `fdinfo`) and the unit's shared memory and zswap pool.
+The log says what each page held (`held N MB (N MB its own, N MB GPU buffers)` when it ends one),
+and the files handed to WhatsApp by number, size and type, not by name. At every half gigabyte a
+page's own memory passes above 1.5 GB, it says what the page's largest regions look like, how
+many of WhatsApp's workers are alive (their threads), and beside them the page's GPU buffers and
+the unit's shared memory and zswap pool (the guard counts the first, as above, not the others).
+
+The 28 October 2026 freeze passed under all of this. The page grew from 1.6 to 2.56 GB in an hour,
+up to 94 MB/s, with 1.4-1.6 GB of GPU buffers beside; the computer swapped and Natter Den's window
+stalled for 30 s at 4.2 GB held by its unit. That page never passed its limit of 3.9 GB on its
+own, nor, as far as the log shows, at a runaway's pace even with all its GPU buffers counted
+(3.6 GB at 94 MB/s; 4.0 GB at 3 MB/s). The window was in use, so no fresh page could come; hidden, its idle
+size, measured after it grew, would have held it to 3.2 GB, and it had loaded under four hours
+before. The growth notice would have come at 2.25 GB, before the page reached 2.56 GB.
+
+## WhatsApp's workers
+
+`natter: webcodecs: workers=N alive (M created)` counts the Web Workers WhatsApp starts: M ever,
+N of them not ended (by `terminate()`, or collected). Each voice message played starts one, and
+each call about twenty, so M only goes up (40 in an afternoon on 28 October). In WebKitGTK 2.52 a
+worker with a message handler lives until it's terminated, even with nothing referring to it; an
+empty one holds about 1.3 MB of the page's memory, one with a 4 MB WebAssembly heap about 2.5 MB,
+so even 40 live ones are a small part of a page of gigabytes. Natter Den doesn't end them: from
+outside, a worker waiting for the next voice message looks the same as a forgotten one, and
+ending one WhatsApp still uses breaks it. A fresh page ends them all.
 
 ## Closing when asked
 

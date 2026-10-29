@@ -226,7 +226,7 @@ class CountsTest(HarnessCase):
         allowed = {"dec": common | {"id", "codec", "desc", "lat", "rewrite", "w", "h", "out", "open", "held", "queue",
                                     "drops", "err"},
                    "enc": common | {"id", "codec", "mode", "w", "h", "out", "queue", "drops", "err"},
-                   "page": common | {"workers", "annexb", "open"}}
+                   "page": common | {"workers", "alive", "annexb", "open"}}
         for kind, keys in found["keys"].items():
             self.assertLessEqual(set(keys), allowed[kind], kind)
         for message in found["sample"] + found["plain"]:
@@ -248,6 +248,15 @@ class CountsTest(HarnessCase):
         self.assertEqual(found["workers"], 3)
         self.assertEqual(found["thrown"], "TypeError")  # no arguments: the browser's own error
         self.assertTrue(found["isNative"])
+        self.assertEqual(found["terminateCalled"], 1)  # the browser's own terminate() still runs
+        self.assertTrue(found["terminateLooksNative"])
+
+    def test_workers_alive_and_created(self):
+        # 28 Oct 2026: "workers=N" only went up, to 40, as it counted every worker ever started.
+        found = self.scenario("workers")
+        self.assertEqual(found["alive"], 3)
+        self.assertEqual((found["afterTerminate"], found["terminatedCreated"]), (2, 3))  # terminated once, counted once
+        self.assertEqual((found["afterCollect"], found["collectedCreated"]), (1, 3))  # one collected, never terminated
 
 
 class WithoutTheStandInTest(HarnessCase):
@@ -331,6 +340,12 @@ class CodecLineTest(unittest.TestCase):
                          ("page", "workers=5 annexb-without-latency=1 open=0"))
         self.assertEqual(rtc.webcodecs_line({"op": "webcodecs", "kind": "page", "workers": 0, "annexb": 0,
                                              "open": 128}), ("page", "workers=0 annexb-without-latency=0 open=128"))
+        self.assertEqual(rtc.webcodecs_line({"op": "webcodecs", "kind": "page", "workers": 40, "alive": 6, "annexb": 0,
+                                             "open": 0}),
+                         ("page", "workers=6 alive (40 created) annexb-without-latency=0 open=0"))
+        for alive in (41, -1, "6", True, None):  # never more alive than started
+            self.assertIsNone(rtc.webcodecs_line({"op": "webcodecs", "kind": "page", "workers": 40, "alive": alive,
+                                                  "annexb": 0}), alive)
         fresh = {"op": "webcodecs", "kind": "dec", "id": 1, "codec": "", "w": 0, "h": 0}
         self.assertEqual(rtc.webcodecs_line(fresh)[1],
                          "dec#1 ? desc=no lat=no rewrite=off size=? out=0 open=0 held=0 queue=0 drops=0")
@@ -750,6 +765,10 @@ class FakeWorker {
   constructor(scriptURL) {
     if (!arguments.length) throw new TypeError("Not enough arguments");
     this.url = String(scriptURL);
+    this.terminated = 0;
+  }
+  terminate() {
+    this.terminated++;
   }
 }
 
@@ -1233,7 +1252,7 @@ const scenarios = {
   },
 
   async workers() {
-    for (const url of ["a.js", "b.js", "c.js"]) new Worker(url);
+    const kept = ["a.js", "b.js", "c.js"].map((url) => new Worker(url));
     let thrown = null;
     try {
       new Worker();
@@ -1241,8 +1260,31 @@ const scenarios = {
       thrown = e.name;
     }
     await advance(3000);
-    const pages = posted.filter((p) => p.message.op === "webcodecs" && p.message.kind === "page");
-    return { workers: pages[pages.length - 1].message.workers, thrown, isNative: new Worker("d.js") instanceof FakeWorker };
+    const last = () => {
+      const pages = posted.filter((p) => p.message.op === "webcodecs" && p.message.kind === "page");
+      return pages[pages.length - 1].message;
+    };
+    const started = last();
+    kept[0].terminate();
+    kept[0].terminate();  // once is enough
+    await advance(3000);
+    const terminated = last();
+    // One let go without terminate(): ended once collected. One that was terminated, collected
+    // too, isn't ended twice.
+    kept.splice(0, 2);
+    for (let i = 0; i < 4; i++) {
+      System.gc();
+      await realWait(30);
+      await advance(1);
+    }
+    await advance(3000);
+    const collected = last();
+    const extra = new Worker("d.js");
+    return { workers: started.workers, alive: started.alive, afterTerminate: terminated.alive,
+             terminatedCreated: terminated.workers,
+             afterCollect: collected.alive, collectedCreated: collected.workers, thrown,
+             isNative: extra instanceof FakeWorker, terminateCalled: (extra.terminate(), extra.terminated),
+             terminateLooksNative: String(Worker.prototype.terminate).includes("[native code]") };
   },
 
   async messages() {

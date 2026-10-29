@@ -352,6 +352,14 @@ esac
 }
 
 
+def so_far(path: Path) -> str:
+    """What a watch file holds so far; empty once it's gone."""
+    try:
+        return path.read_text()
+    except OSError:
+        return ""
+
+
 def stat_line(pid, comm, ppid, ticks, start=50000):
     """A /proc/<pid>/stat line: fields after the name are state, ppid, …, utime (12th), stime, …,
     starttime (20th)."""
@@ -1039,7 +1047,12 @@ class ReportTest(unittest.TestCase):
         kept = []
 
         def page_reloads(folder, _process):
-            time.sleep(1.5)  # the web process goes, as when the page reloads
+            # The web process goes, as when the page reloads: once the watch has seen it (a
+            # loaded computer may take more than a second to reach the first sample).
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and not any("sample: 3 processes" in so_far(path)
+                                                          for path in (folder / "home").glob("natter-watch-*.txt")):
+                time.sleep(0.05)
             shutil.rmtree(folder / "proc" / "4250")
             time.sleep(1)
             kept.extend((path, path.stat().st_mode, path.read_text()) for path in (folder / "home").glob("natter-watch-*.txt"))

@@ -63,6 +63,8 @@ The Flatpak is experimental: it hasn't been tested yet, calls in it included.
   only; the list is empty while a passcode is set or privacy blur is on).
 - Paste (Ctrl+V) or drop pictures and files on a chat, and WhatsApp's own preview opens with a
   caption box. With no chat open, Natter Den asks which chat.
+- Files you download from a chat go to the folder in Preferences → General → Downloads, under
+  their own names; if one can't be saved, the message says why.
 - `whatsapp://` links from other apps open in Natter Den (if another app already had them,
   `install.sh` leaves them there and prints the command that moves them), and so do `wa.me`,
   `api.whatsapp.com/send`, group invite and channel links clicked inside WhatsApp. Other links

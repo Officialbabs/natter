@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import collections
+import errno
 import json
+import mimetypes
 import os
 import re
 import secrets
@@ -180,6 +182,14 @@ ICON_LIMIT = 2_000_000  # bytes
 INVISIBLE = frozenset("\u200b\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2060\u2066\u2067\u2068\u2069\ufeff")
 
 OUTSIDE = ("http", "https", "mailto", "tel")  # links Natter hands to the browser (or mail, or phone) app
+# Files the page makes itself, which Natter saves when the page opens them (_on_policy). A frame
+# may still show a page of the page's own making. A blob: address carries the origin that made
+# it; a data: address carries none, so it's saved only on the user's own click, never from a frame.
+PAGE_FILES = ("blob:", "data:")
+FRAME_PAGES = ("text/html", "application/xhtml+xml", "image/svg+xml")
+# The names the bridge gives the files it's saving, by blob: URL: a few, for two minutes.
+DOWNLOAD_NAMES_KEPT = 16
+DOWNLOAD_NAME_TIME = 120
 
 # No user agent of Natter's own: WebKitGTK's site-specific quirks already present WhatsApp
 # Web with desktop Safari, and WebKit keeps that quirk current.
@@ -325,6 +335,12 @@ def parse_message(message) -> Optional[dict]:
         return {"type": kind, **look} if all(isinstance(value, bool) for value in look.values()) else None
     if kind == "media":
         return playback.parse(message)  # sound in the page, for the log (bridge.js, playback.py)
+    if kind == "download":
+        # A blob: URL the page clicked or opened, and the name of the file it is (bridge.js "Downloads").
+        url, name = message.get("url"), clean(message.get("name"), 1024)
+        if not (isinstance(url, str) and url.startswith("blob:") and len(url) <= 512) or name is None:
+            return None
+        return {"type": kind, "url": url, "name": name}
     return None
 
 
@@ -541,15 +557,59 @@ def file_name(suggested: str) -> str:
     return stem.encode()[: NAME_LIMIT - len(suffix.encode())].decode(errors="ignore") + suffix
 
 
-def _free_path(folder: Path, name: str) -> Path:
-    """`folder`/`name`, or "name (2)" and so on when that's taken."""
+def download_name(suggested: str, told: str = "", mime: str = "") -> str:
+    """What to save a download as: the page's own name for it (`told`, from the bridge), else WebKit's.
+    With neither (a blob: URL opened in a new window), "download" with its type's extension."""
+    name = file_name(told or suggested)
+    kind = (mime or "").split(";")[0].strip().lower()
+    if name == "download" and kind and kind != "application/octet-stream":
+        name += mimetypes.guess_extension(kind, strict=False) or ""
+    return name
+
+
+def room_problem(folder: Path, size: int) -> Optional[str]:
+    """Why `folder` can't take `size` more bytes, as the system says it, or None if it can."""
+    try:
+        if not folder.is_dir():
+            return os.strerror(errno.ENOENT)
+        if not os.access(folder, os.W_OK | os.X_OK):
+            return os.strerror(errno.EACCES)
+        stats = os.statvfs(folder)
+    except OSError as error:
+        return error.strerror or str(error)
+    if stats.f_flag & os.ST_RDONLY:
+        return os.strerror(errno.EROFS)
+    if stats.f_bavail * stats.f_frsize < max(size, 1):
+        return os.strerror(errno.ENOSPC)
+    return None
+
+
+def _new_file(folder: Path, name: str, size: int = 0) -> Path:
+    """An empty file for a download of `size` bytes: `folder`/`name`, or "name (2)" and so on when
+    that's taken. Made here, so a folder that can't take it fails now with the system's reason:
+    WebKit, failing to write a blob: download, only says "Load request cancelled"."""
     folder.mkdir(parents=True, exist_ok=True)
-    target = folder / name
-    stem, suffix, n = target.stem, target.suffix, 1
-    while target.exists():
-        n += 1
-        target = folder / f"{stem} ({n}){suffix}"
-    return target
+    problem = room_problem(folder, size)
+    if problem:
+        raise OSError(problem)
+    stem, suffix = os.path.splitext(name)
+    for n in range(1, 10_000):
+        target = folder / (name if n == 1 else f"{stem} ({n}){suffix}")
+        try:
+            os.close(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o644))
+            return target
+        except FileExistsError:
+            continue
+    raise OSError(os.strerror(errno.EEXIST))
+
+
+def _drop_if_empty(path: str) -> None:
+    """Remove the empty file _new_file made for a download that failed (nothing written in it)."""
+    try:
+        if path and os.path.getsize(path) == 0:
+            os.unlink(path)
+    except OSError:
+        pass
 
 
 def _downloads_folder() -> Path:
@@ -669,6 +729,8 @@ class Account(GObject.Object):
         self._in_page = 0
         self._held_actions: list[Callable[[], None]] = []
         self._fresh_held = False
+        # Names for files the page is saving, from the bridge: blob: URL -> (name, when).
+        self._download_names: dict[str, tuple[str, float]] = {}
 
         data, cache = DATA / "accounts" / self.id / "web", CACHE / "accounts" / self.id
         data.mkdir(parents=True, exist_ok=True)
@@ -759,7 +821,7 @@ class Account(GObject.Object):
                                 ("query-permission-state", self._on_permission_query),
                                 ("notify::camera-capture-state", self._on_capture_state),
                                 ("notify::microphone-capture-state", self._on_capture_state),
-                                ("create", lambda *_: None)):
+                                ("create", self._on_create)):
             self._connect(self.view, signal, handler)
         if app.settings["sw_cleared"]:
             self.view.load_uri(self.home)
@@ -1667,6 +1729,14 @@ class Account(GObject.Object):
             self.app.page_look_changed(self, fresh=True)
         elif kind == "media":
             self._media_line(message)
+        elif kind == "download":
+            names, now = self._download_names, time.monotonic()
+            names.pop(message["url"], None)
+            names[message["url"]] = (message["name"], now)
+            for url in [url for url, (_, when) in names.items() if now - when > DOWNLOAD_NAME_TIME]:
+                del names[url]
+            while len(names) > DOWNLOAD_NAMES_KEPT:
+                del names[next(iter(names))]
 
     def _media_line(self, message: dict) -> None:
         """The log's line for what the page said of its sound (playback.py), a few a page."""
@@ -1723,26 +1793,71 @@ class Account(GObject.Object):
             uri = action.get_request().get_uri() or ""
             new_window = kind == WebKit.PolicyDecisionType.NEW_WINDOW_ACTION
             clicked = action.get_navigation_type() == WebKit.NavigationType.LINK_CLICKED or action.is_user_gesture()
+            if new_window and uri.startswith(PAGE_FILES):
+                # A file the page made, opened in a new window (WhatsApp's download arrow): saved.
+                # Natter has no other windows, and the browser couldn't open it.
+                decision.ignore()
+                if uri.startswith("blob:") or action.is_user_gesture():
+                    self._save(uri)
+                return True
             if new_window or (clicked and not is_whatsapp(uri) and not uri.startswith(("blob:", "data:", "about:"))):
                 decision.ignore()
                 if not (chat_link(uri) and self.open_link(uri)):
                     self._open_outside(uri)
                 return True
-        elif kind == WebKit.PolicyDecisionType.RESPONSE and decision.is_main_frame_main_resource():
+        elif kind == WebKit.PolicyDecisionType.RESPONSE and not decision.is_main_frame_main_resource():
+            # A file the page made, loaded into a frame: saved, unless it's a page to show there.
+            response = decision.get_response()
+            uri = response.get_uri() or ""
+            if uri.startswith(PAGE_FILES) and (response.get_mime_type() or "").lower() not in FRAME_PAGES:
+                # Any frame could make a data: address, without a click: only blob: is saved.
+                if uri.startswith("blob:") and self._may_save(uri):
+                    decision.download()
+                else:
+                    decision.ignore()
+                return True
+        elif kind == WebKit.PolicyDecisionType.RESPONSE:
             uri = decision.get_response().get_uri() or ""
-            # A blob: address holds data the page made, and has the origin of the address inside it.
-            blob = uri.startswith("blob:")
-            if not (self._trusted(uri[len("blob:"):] if blob else uri) or uri.startswith("about:")):
+            made = uri.startswith(PAGE_FILES)
+            if not (self._may_save(uri) if made else self._trusted(uri) or uri.startswith("about:")):
                 # Natter's bridge, permissions and file hand-off are for WhatsApp Web only, so what
                 # comes from anywhere else (after a redirect, say) is neither shown nor saved. Nor is
                 # it opened in the browser: a navigation the user asked for went there already, when
                 # WebKit asked about it above (it asks again for each redirect, with the same click).
                 decision.ignore()
                 return True
-            if blob or not decision.is_mime_type_supported():
-                decision.download()  # saved, not shown in WhatsApp's place
+            if made or not decision.is_mime_type_supported():
+                self._download(decision, uri)  # saved, not shown in WhatsApp's place
                 return True
         return False
+
+    def _download(self, decision, uri: str) -> None:
+        """Save a response instead of showing it. WebKit 2.52 starts no download for a data:
+        address turned into one, so that one is saved afresh."""
+        if uri.startswith("data:"):
+            decision.ignore()
+            self._save(uri)
+        else:
+            decision.download()
+
+    def _may_save(self, uri: str) -> bool:
+        """Whether a blob: or data: address may be saved: WhatsApp's page made it, and is still there.
+        A blob: address has the origin of the page that made it inside it."""
+        if not self._trusted():
+            return False
+        return uri.startswith("data:") or (uri.startswith("blob:") and self._trusted(uri[len("blob:"):]))
+
+    def _save(self, uri: str) -> None:
+        """Save a file the page made and opened (_on_policy, _on_create); never shown, nor opened outside."""
+        if self._may_save(uri):
+            self.view.download_uri(uri)
+
+    def _on_create(self, _view, action: WebKit.NavigationAction) -> None:
+        """window.open(): Natter shows no other windows, but a file the page made, opened that way, is saved."""
+        uri = action.get_request().get_uri() or ""
+        if uri.startswith("blob:") or (uri.startswith("data:") and action.is_user_gesture()):
+            self._save(uri)
+        return None
 
     def _open_outside(self, uri: str) -> None:
         if urlparse(uri).scheme in OUTSIDE:
@@ -1921,28 +2036,71 @@ class Account(GObject.Object):
             self.run("navigator.mediaDevices && navigator.mediaDevices.dispatchEvent(new Event('devicechange'))")
 
     def _on_download(self, _session, download: WebKit.Download) -> None:
-        reported = []
+        # The empty file Natter made for it, the size it expects, and why it couldn't save it at all.
+        state = {"reported": False, "made": "", "size": 0, "path": "", "reason": ""}
 
         def destination(dl, suggested: str) -> bool:
-            name = file_name(suggested)
+            # Never left to WebKit: its own choice is a file named after the suggestion in the
+            # desktop's Downloads (or that folder itself, with no suggestion), and it writes there.
             try:
-                target = _free_path(self.app.settings.download_dir, name)
-            except (OSError, TypeError, ValueError) as error:
-                print(f"natter: can't save downloads in the chosen folder ({error}); using Downloads")
-                try:
-                    target = _free_path(_downloads_folder(), name)
-                except OSError:
-                    return False  # WebKit tries its default, and reports the failure
-            dl.set_destination(str(target))
+                pick(dl, suggested)
+            except Exception as error:  # noqa: BLE001 (a slip here mustn't hand the choice to WebKit)
+                print(f"natter: download: couldn't choose where to save it ({type(error).__name__})", flush=True)
+                state["reason"] = state["reason"] or f"{NAME} couldn't choose where to save it"
+                dl.cancel()
             return True
 
+        def pick(dl, suggested: str) -> None:
+            response = dl.get_response()
+            uri = dl.get_request().get_uri() or ""
+            told = self._download_names.pop(uri, ("", 0.0))[0]
+            if uri.startswith("data:") and uri.endswith(suggested):
+                suggested = ""  # WebKit's name for a data: address is the end of the data
+            name = download_name(suggested, told, response.get_mime_type() if response else "")
+            state["size"] = max(response.get_content_length(), 0) if response else 0
+            try:
+                chosen = Path(self.app.settings.download_dir)
+            except (TypeError, ValueError):
+                chosen = _downloads_folder()
+            problems = []
+            for folder in dict.fromkeys((chosen, _downloads_folder())):
+                try:
+                    target = _new_file(folder, name, state["size"])
+                except (OSError, ValueError) as error:
+                    problems.append(error.strerror or str(error))
+                    continue
+                if problems:
+                    print(f"natter: download: the chosen folder can't take it ({problems[0]}); saving in Downloads",
+                          flush=True)
+                state["made"] = str(target)
+                dl.set_allow_overwrite(True)  # over the empty file made for it
+                dl.set_destination(str(target))
+                return
+            print(f"natter: download: no folder can take it ({problems[0]})", flush=True)
+            state["path"], state["reason"] = str(chosen / name), problems[0]
+            dl.cancel()
+
         def failed(dl, error: GLib.Error) -> None:
-            reported.append(True)
-            if not error.matches(WebKit.download_error_quark(), WebKit.DownloadError.CANCELLED_BY_USER):
-                self.emit("download-done", dl.get_destination() or "", False, error.message)
+            state["reported"] = True
+            uri = dl.get_request().get_uri() or ""
+            # Failing before it had a file (a blob: URL revoked first), it's said by name if the page gave one.
+            path = dl.get_destination() or state["made"] or state["path"] or self._download_names.get(uri, ("",))[0]
+            _drop_if_empty(state["made"])
+            if error.matches(WebKit.download_error_quark(), WebKit.DownloadError.CANCELLED_BY_USER):
+                if state["reason"]:  # Natter's own cancel: the reason is Natter's
+                    self.emit("download-done", path, False, state["reason"])
+                return
+            reason = error.message
+            if os.path.isabs(path) and error.matches(WebKit.network_error_quark(), WebKit.NetworkError.CANCELLED):
+                # What WebKit says when it can't write a blob: download: the folder says why.
+                left = state["size"] - dl.get_received_data_length()
+                reason = room_problem(Path(path).parent, max(left, 1)) or reason
+            if not reason and error.domain == "WebKitBlobResource":
+                reason = "WhatsApp's page let go of the file before it was saved"  # a blob: URL revoked
+            self.emit("download-done", path, False, reason or "WebKit gave no reason")
 
         def finished(dl) -> None:
-            if not reported and dl.get_destination():  # "finished" follows "failed" too
+            if not state["reported"] and dl.get_destination():  # "finished" follows "failed" too
                 self.emit("download-done", dl.get_destination(), True, "")
 
         download.connect("decide-destination", destination)

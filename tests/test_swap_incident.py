@@ -14,8 +14,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from natter.app import (FRESH_AGAIN, GROWN_FLOOR, GROWN_FOR, GROWN_SHARE, HIDDEN_BEFORE_FRESH, HIDDEN_BEFORE_RECLAIM,
-                        IDLE_AFTER_LOAD, IDLE_WITHIN, MEMORY_LIMIT, QUIET_BEFORE_FRESH, SETTLE_BEFORE_RECLAIM)
+from natter.app import (FRESH_AGAIN, GROWN_FLOOR, GROWN_FOR, GROWN_NOTICE, GROWN_SHARE, HIDDEN_BEFORE_FRESH,
+                        HIDDEN_BEFORE_RECLAIM, IDLE_AFTER_LOAD, IDLE_LEAST, IDLE_MOST, IDLE_WITHIN, MEMORY_LIMIT,
+                        NOT_IDLE, QUIET_BEFORE_FRESH, SETTLE_BEFORE_RECLAIM)
 
 MEMINFO = "MemTotal: 15000000 kB\nMemAvailable: 9000000 kB\nSwapTotal: {total} kB\nSwapFree: {free} kB\n"
 GiB = 1024 ** 3
@@ -446,10 +447,26 @@ class Reclaimer:
 class Window:
     def __init__(self):
         self.visible = True
+        self.active = True  # in use: shown and focused
         self.loans = {}  # account id: its page's loan to a reply window (Window.lend_page)
+        self.toasts = []  # (title, button, action, timeout)
 
     def get_visible(self):
         return self.visible
+
+    def is_active(self):
+        return self.visible and self.active
+
+    def toast(self, title, button=None, action=None, target=None, timeout=4):
+        self.toasts.append((title, button, action, timeout))
+
+
+class Action:
+    def __init__(self):
+        self.enabled = False
+
+    def set_enabled(self, enabled):
+        self.enabled = enabled
 
 
 class World:
@@ -464,6 +481,7 @@ class World:
         self.module, self.clock = app_module, Clock()
         self.pages = {name: 1200 * MiB for name in accounts}
         self.pids = {name: 4000 + i for i, name in enumerate(accounts)}  # each page's web process
+        self.spare = None  # WebKit's blank spare process, when there is one: (pid, bytes)
         self.tight, self.swapped, self.held = False, 0, None
         self.out = io.StringIO()
 
@@ -480,6 +498,8 @@ class World:
             _reclaim = Natter._reclaim
             _reclaim_wait = Natter._reclaim_wait
             _check_memory = Natter._check_memory
+            _notice_growth = Natter._notice_growth
+            _fresh_page_asked = Natter._fresh_page_asked
 
         app = self.app = App()
         app.accounts = [Page(self, name, self.clock.now - loaded_hours_ago * 3600) for name in accounts]
@@ -489,6 +509,8 @@ class World:
         app._reclaim_timer, app._hidden_at, app._call_ended_at = 0, None, None
         app._call_held, app._after_call, app._memory_waiting = {}, {}, None
         app._seen, app._idle, app._grown_since, app._fresh_at = {}, {}, None, None
+        app._noticed, app.locked, self.action = set(), False, Action()
+        app.lookup_action = lambda name: self.action if name == "fresh-page" else None
         app.call_sound = types.SimpleNamespace(start=lambda: None, stop=lambda: None)
         app.voice_pause = types.SimpleNamespace(call_started=lambda: None, call_over=lambda: None)
         for name in ("_refresh_tray", "_write_menu_chats", "_check_media", "_apply_page_sound"):
@@ -498,7 +520,8 @@ class World:
         self.patches = [mock.patch.object(app_module.time, "monotonic", self.clock),
                         mock.patch.object(app_module, "GLib", self.timers),
                         mock.patch.object(app_module, "page_sizes",
-                                          lambda: {self.pids[name]: size for name, size in self.pages.items()}),
+                                          lambda: {self.pids[name]: size for name, size in self.pages.items()}
+                                          | (dict([self.spare]) if self.spare else {})),
                         mock.patch.object(app_module, "footprint", lambda: sum(self.pages.values()) + 300 * MiB),
                         mock.patch.object(app_module, "own_swap", lambda: self.swapped),
                         mock.patch.object(app_module, "memory_tight", lambda: self.tight),
@@ -547,8 +570,10 @@ class HiddenFreshPageTest(unittest.TestCase):
     def test_closing_the_window_reloads_nothing_however_big_natter_is(self):
         # The friend's and the Den's case: the whole unit past the old 1836 MB, 391 MB in swap,
         # at the moment the window hid. The page itself is an ordinary one.
+        # The page under the growth floor: past it, a page is grown (GrownPageTest), whatever
+        # its size at its first quiet look (IdleBoundsTest).
         with World() as world:
-            world.pages["Main"] = 2400 * MiB
+            world.pages["Main"] = 2000 * MiB
             world.swapped = 391 * MiB
             world.hide()
             self.assertEqual(world.fresh(), 0)
@@ -562,7 +587,7 @@ class HiddenFreshPageTest(unittest.TestCase):
         from natter.system import SWAP_BUDGET_MB
 
         with World() as world:
-            world.pages["Main"] = 2100 * MiB
+            world.pages["Main"] = 2000 * MiB  # under the growth floor (GrownPageTest)
             world.swapped = (SWAP_BUDGET_MB + 100) * MiB
             world.hide()
             world.run(4 * 60)
@@ -684,6 +709,8 @@ class HiddenFreshPageTest(unittest.TestCase):
     def test_swap_alone_is_no_shortage(self):
         # Natter's swap past its budget, or the computer's past 60% (swap_full): not a reason.
         with World() as world:
+            world.pages["Main"] = 1700 * MiB  # its idle size: a growth ceiling of 2550 MB (GrownPageTest)
+            world.run(IDLE_AFTER_LOAD // 60 + 1)
             world.hide()
             world.pages["Main"] = (MEMORY_LIMIT + 400) * MiB
             world.swapped = 3 * GiB
@@ -746,7 +773,7 @@ class HiddenFreshPageTest(unittest.TestCase):
             main = world.account()
             main.calling = True
             world.app._on_page_call(main, True)
-            world.pages["Main"] = 2300 * MiB
+            world.pages["Main"] = 2000 * MiB  # 800 MB more, under the growth floor (GrownPageTest)
             main.calling = False
             world.app._on_page_call(main, False)
             world.clock.minutes(1)
@@ -1016,6 +1043,8 @@ class GrownPageTest(unittest.TestCase):
             world.pages["Main"] = 3000 * MiB
             world.run(24 * 60)
             self.assertEqual(world.fresh(), 0)
+            self.assertEqual(len(world.app.window.toasts), 1)  # told once (GrowthNoticeTest), never reloaded
+
 
     def test_several_accounts_one_page_a_minute(self):
         with World(accounts=("Work", "Main")) as world:
@@ -1069,6 +1098,151 @@ class GrownPageTest(unittest.TestCase):
         # was open and opens it again once the new page is up.
         self.assertIn("account.fresh_page(f\"of its memory: {why}\")", inspect.getsource(Natter._fresh_pages_for_memory))
         self.assertIn("self._reopen_after_load()", inspect.getsource(Account.fresh_page))
+
+
+class IdleBoundsTest(unittest.TestCase):
+    """What can be an idle size (app.py _measure_idle, IDLE_LEAST and IDLE_MOST). On 28 Oct 2026
+    each run said "idle, a page holds 20 MB" (WebKit's blank spare process, beside the page) and
+    once "idle, a page holds 2166 MB" (a page that had grown at 94 MB/s minutes before), which
+    raised its ceiling to 3249 MB."""
+
+    def test_the_bounds(self):
+        self.assertEqual((IDLE_LEAST, IDLE_MOST), (300, GROWN_FLOOR))
+
+    def test_the_blank_spare_process_is_no_page(self):
+        with World(loaded_hours_ago=0) as world:
+            world.spare = (3999, 20 * MiB)
+            world.run(IDLE_AFTER_LOAD // 60 + 1)
+            self.assertEqual(world.idle(), 1200 * MiB)
+            self.assertNotIn(3999, world.app._idle)
+            self.assertNotIn("holds 20 MB", world.out.getvalue())
+            world.run(2 * 60)
+            self.assertNotIn(3999, world.app._idle)
+
+    def test_a_page_not_loaded_yet_is_measured_later(self):
+        with World(loaded_hours_ago=0) as world:
+            world.pages["Main"] = 150 * MiB
+            world.run(IDLE_AFTER_LOAD // 60 + 1)
+            self.assertIsNone(world.idle())
+            world.pages["Main"] = 1100 * MiB
+            world.run(1)
+            self.assertEqual(world.idle(), 1100 * MiB)
+
+    def test_a_page_grown_before_its_quiet_look_keeps_the_floor(self):
+        with World(loaded_hours_ago=0) as world:
+            world.pages["Main"] = 2166 * MiB
+            world.run(IDLE_AFTER_LOAD // 60 + 1)
+            self.assertEqual(world.idle(), NOT_IDLE)  # measured, and not idle
+            self.assertEqual(world.app._growth_ceiling(world.pids["Main"]), GROWN_FLOOR * MiB)
+            self.assertIn("natter: memory: a page holds 2166 MB at its first quiet look, more than an idle page; "
+                          "hidden, it may grow to 2048 MB", world.out.getvalue())
+            world.pages["Main"] = 1500 * MiB
+            world.run(30)
+            self.assertEqual(world.idle(), NOT_IDLE)  # once per process
+            # The reload's line says it was measured, not that it wasn't.
+            world.account().loaded_at -= FRESH_AGAIN  # past the gap between fresh pages
+            world.pages["Main"] = 2100 * MiB
+            world.hide()
+            world.run(GROWN_FOR // 60 + 2)
+            self.assertEqual(world.fresh(), 1)
+            self.assertIn("natter: page: reloaded because it grew to 2100 MB while hidden "
+                          f"(not idle at its first quiet look, floor {GROWN_FLOOR} MB)", world.out.getvalue())
+
+    def test_an_idle_page_with_swap_is_still_idle(self):
+        with World(loaded_hours_ago=0) as world:
+            world.pages["Main"] = 1644 * MiB  # 24 Oct 2026: 1137 MB resident, 507 MB swapped
+            world.run(IDLE_AFTER_LOAD // 60 + 1)
+            self.assertEqual(world.idle(), 1644 * MiB)
+
+
+class GrowthNoticeTest(unittest.TestCase):
+    """With the window in use a page that has grown big gets a toast once, whose Reload gives it a
+    fresh page (app.py _notice_growth, _fresh_page_asked); never a fresh page by itself. On 28 Oct
+    2026 a page at 2.56 GB, its GPU buffers beside, froze Natter's window in swap; another was
+    reloaded twice from the menu, in the same process, and held 3096 MB after."""
+
+    def test_told_once_past_the_notice_line(self):
+        with World() as world:
+            world.run(IDLE_AFTER_LOAD // 60 + 1)
+            world.pages["Main"] = GROWN_NOTICE * MiB  # at the line, not past it
+            world.run(5)
+            self.assertEqual(world.app.window.toasts, [])
+            world.pages["Main"] = 2600 * MiB
+            world.run(1)
+            self.assertEqual(world.app.window.toasts,
+                             [("WhatsApp's page has grown to 2.5 GB. Reload frees it.", "Reload", "app.fresh-page", 0)])
+            self.assertTrue(world.action.enabled)
+            self.assertIn("natter: memory: a page holds 2600 MB with the window in use; told, with Reload",
+                          world.out.getvalue())
+            world.pages["Main"] = 4000 * MiB
+            world.run(3 * 60)
+            self.assertEqual(len(world.app.window.toasts), 1)  # once per web process
+            self.assertEqual(world.fresh(), 0)  # never by itself
+
+    def test_reload_gives_a_fresh_page(self):
+        with World() as world:
+            world.pages["Main"] = 2600 * MiB
+            world.run(1)
+            world.app._fresh_page_asked()
+            self.assertEqual(world.fresh(), 1)
+            self.assertFalse(world.action.enabled)
+            world.pages["Main"] = 2700 * MiB  # its new process grows again: told again
+            world.run(1)
+            self.assertEqual(len(world.app.window.toasts), 2)
+
+    def test_a_bigger_growth_ceiling_raises_the_line(self):
+        with World(loaded_hours_ago=0) as world:
+            world.pages["Main"] = 1900 * MiB
+            world.run(IDLE_AFTER_LOAD // 60 + 1)
+            world.pages["Main"] = 2800 * MiB  # under 1.5 x 1900
+            world.run(5)
+            self.assertEqual(world.app.window.toasts, [])
+            world.pages["Main"] = 2900 * MiB
+            world.run(1)
+            self.assertEqual(len(world.app.window.toasts), 1)
+
+    def test_not_while_the_window_isnt_in_use(self):
+        for state in ("hidden", "behind", "locked", "call", "reply", "recording", "loading"):
+            with self.subTest(state), World() as world:
+                main = world.account()
+                world.pages["Main"] = 3000 * MiB
+                if state == "hidden":
+                    world.hide()
+                elif state == "behind":
+                    world.app.window.active = False
+                elif state == "locked":
+                    world.app.locked = True
+                elif state == "call":
+                    main.calling = True
+                    world.app._on_page_call(main, True)
+                elif state == "reply":
+                    main.replying = 1
+                elif state == "recording":
+                    main.recording = True
+                else:
+                    main.ready = False
+                world.run(3)
+                self.assertEqual(world.app.window.toasts, [], state)
+                if state == "hidden":
+                    world.show()
+                elif state == "call":
+                    main.calling = False
+                    world.app._on_page_call(main, False)
+                world.app.window.active, world.app.locked = True, False
+                main.replying, main.recording, main.ready = 0, False, True
+                world.run(1)
+                self.assertEqual(len(world.app.window.toasts), 1, state)
+
+    def test_reload_with_several_accounts_goes_to_the_oldest_load(self):
+        with World(accounts=("Work", "Main")) as world:
+            world.account("Main").loaded_at -= 3600
+            world.pages["Main"] = 2600 * MiB
+            world.run(1)
+            # The guard can't say whose page grew, so the toast promises no more than Reload does.
+            self.assertEqual(world.app.window.toasts, [("A WhatsApp page has grown to 2.5 GB. Reload refreshes the "
+                                                        "longest-open account.", "Reload", "app.fresh-page", 0)])
+            world.app._fresh_page_asked()
+            self.assertEqual((len(world.account("Main").fresh), len(world.account("Work").fresh)), (1, 0))
 
 
 class ReclaimerToSwapTest(unittest.TestCase):

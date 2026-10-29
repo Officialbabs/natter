@@ -593,7 +593,7 @@ _ERROR_NAME = re.compile(r"[A-Za-z]{1,40}")
 _FIELDS = {"dec": {"op", "kind", "id", "codec", "desc", "lat", "rewrite", "w", "h", "out", "open", "held", "queue",
                    "drops", "err"},
            "enc": {"op", "kind", "id", "codec", "mode", "w", "h", "out", "queue", "drops", "err"},
-           "page": {"op", "kind", "workers", "annexb", "open"}}
+           "page": {"op", "kind", "workers", "alive", "annexb", "open"}}
 
 
 def webcodecs_line(message: dict) -> Optional[tuple[str, str]]:
@@ -620,6 +620,11 @@ def webcodecs_line(message: dict) -> Optional[tuple[str, str]]:
         workers, annexb, held = count("workers"), count("annexb"), count("open")
         if workers is None or annexb is None or held is None:
             return None
+        if "alive" in message:  # how many of the workers started are still alive, and all started
+            alive = count("alive", workers)
+            if alive is None:
+                return None
+            return "page", f"workers={alive} alive ({workers} created) annexb-without-latency={annexb} open={held}"
         return "page", f"workers={workers} annexb-without-latency={annexb} open={held}"
 
     codec, error = message.get("codec", ""), message.get("err", "")

@@ -130,6 +130,21 @@ GROWN_SHARE = 1.5
 GROWN_FOR = 30 * 60  # seconds past the ceiling, hidden, before a fresh page
 IDLE_AFTER_LOAD = 10 * 60  # seconds after a load before the idle size is measured
 IDLE_WITHIN = 60 * 60  # and no later than this after its process came: by then it may have grown
+# What an idle page holds, within these. Under IDLE_LEAST is no page: WebKit's blank spare process
+# (20 MB; "idle, a page holds 20 MB" beside the real page in each run on 28 Oct 2026) or one not
+# loaded yet, so it's skipped. Past IDLE_MOST a page grew before its first quiet look (2166 MB on
+# 28 Oct, minutes after growing at 94 MB/s, which raised its ceiling to 3249 MB): the floor
+# alone stays its ceiling. Idle pages measured 1053-1392 MB that week, 1644 MB with swap once.
+IDLE_LEAST, IDLE_MOST = 300, GROWN_FLOOR  # MB
+NOT_IDLE = -1  # _idle for a page past IDLE_MOST at its first quiet look: measured, and not idle
+# With the window in use Natter never gives a page a fresh one by itself (it would reload under
+# you). A page past GROWN_NOTICE, or its growth ceiling when that's more, gets a toast instead,
+# once per web process, whose Reload gives it one. On 28 Oct 2026 the pages that passed 2.5 GB
+# went on to 3.1-4.3 GB or to the freeze, which came with the page only just past 2560 MB; one
+# that stopped at 2.06 GB didn't. So the line is below that, and above any idle page seen
+# (1644 MB). WhatsApp's own reload (Reload in the menu) stays in the same process and frees
+# nothing: one page held 3096 MB after two of them.
+GROWN_NOTICE = 2304  # MB
 HIDDEN_BEFORE_RECLAIM = 90  # seconds hidden before Natter gives memory back
 RECLAIM_AGAIN = 15 * 60  # and again this often while it stays hidden
 SETTLE_BEFORE_RECLAIM = 10 * 60  # seconds after a page's last load before its memory goes to swap
@@ -650,6 +665,7 @@ class Natter(Adw.Application):
         self._seen: dict[int, float] = {}
         self._idle: dict[int, int] = {}
         self._grown_since: Optional[float] = None
+        self._noticed: set[int] = set()  # web processes whose growth was told (_notice_growth)
         self._fresh_at: Optional[float] = None  # when the last fresh page for memory began (FRESH_GAP)
         # The app lock (lock.py): while locked, the window shows only the passcode, and what
         # would show a chat waits for the unlock.
@@ -835,6 +851,11 @@ class Natter(Adw.Application):
         restart.connect("activate", self._gated(lambda *_: self.restart()))
         restart.set_enabled(False)
         self.add_action(restart)
+        # Likewise only while a growth notice is out (_notice_growth): its Reload.
+        fresh = Gio.SimpleAction.new("fresh-page", None)
+        fresh.connect("activate", self._gated(lambda *_: self._fresh_page_asked()))
+        fresh.set_enabled(False)
+        self.add_action(fresh)
         if GLib.getenv("NATTER_DEBUG"):
             self._debug_actions()
         # Held until ready: a first launch's command line waits in the queue, not on a main loop
@@ -2156,6 +2177,9 @@ class Natter(Adw.Application):
 
     def _on_download(self, _account: Account, path: str, ok: bool, reason: str) -> None:
         name = f"“{Path(path).name}”" if path else "the file"
+        if not ok and os.path.isabs(path):
+            from .prefs import shown_folder
+            name += f" in {shown_folder(Path(path).parent)}"  # the folder that couldn't take it
         if ok:
             self.downloaded.add(path)
             open_it = ("Open", "app.open-file", GLib.Variant("s", path))
@@ -2551,7 +2575,10 @@ class Natter(Adw.Application):
                       f"{own_swap() >> 20} MB of it in swap)", flush=True)
                 if kind == "grown":
                     measured = self._idle.get(grown)
-                    idle = f"idle {measured >> 20} MB" if measured else f"idle not measured, floor {GROWN_FLOOR} MB"
+                    if measured == NOT_IDLE:
+                        idle = f"not idle at its first quiet look, floor {GROWN_FLOOR} MB"
+                    else:
+                        idle = f"idle {measured >> 20} MB" if measured else f"idle not measured, floor {GROWN_FLOOR} MB"
                     print(f"natter: page: reloaded because it grew to {over[grown] >> 20} MB while hidden ({idle})",
                           flush=True)
                 self._memory_waiting = None
@@ -2592,7 +2619,7 @@ class Natter(Adw.Application):
         """Bytes the page in web process `pid` may hold, hidden, before it counts as grown:
         GROWN_FLOOR, or GROWN_SHARE times its idle size (_measure_idle) when that's more; the
         floor alone while that process's idle size isn't known."""
-        floor, idle = GROWN_FLOOR * MiB, self._idle.get(pid, 0)
+        floor, idle = GROWN_FLOOR * MiB, max(self._idle.get(pid, 0), 0)  # NOT_IDLE: the floor alone
         return max(floor, int(idle * GROWN_SHARE))
 
     def _measure_idle(self, now: float) -> None:
@@ -2617,6 +2644,13 @@ class Natter(Adw.Application):
             return
         for pid, size in pages.items():
             if pid not in self._idle and IDLE_AFTER_LOAD <= now - self._seen[pid] <= IDLE_WITHIN:
+                if size < IDLE_LEAST * MiB:
+                    continue  # the blank spare process, or a page not loaded yet
+                if size > IDLE_MOST * MiB:
+                    self._idle[pid] = NOT_IDLE  # measured, and not idle: the floor alone
+                    print(f"natter: memory: a page holds {size >> 20} MB at its first quiet look, more than an "
+                          f"idle page; hidden, it may grow to {self._growth_ceiling(pid) >> 20} MB", flush=True)
+                    continue
                 self._idle[pid] = size
                 print(f"natter: memory: idle, a page holds {size >> 20} MB; hidden, it may grow to "
                       f"{self._growth_ceiling(pid) >> 20} MB", flush=True)
@@ -2673,8 +2707,51 @@ class Natter(Adw.Application):
     def _check_memory(self) -> bool:
         if not self.calling:  # the pages aren't read during a call (held_by_page: the guard's last look, or /proc)
             self._measure_idle(time.monotonic())
+            self._notice_growth()
         self._fresh_pages_for_memory()
         return GLib.SOURCE_CONTINUE
+
+    def _notice_growth(self) -> None:
+        """With the window in use, a page past GROWN_NOTICE, or its growth ceiling when that's
+        more, gets a toast once per web process: how big it is, and Reload for a fresh page
+        (_fresh_page_asked). Never a fresh page by itself while shown. No toast during a call
+        (_check_memory doesn't ask then), a reply or a recording, or while a page loads: it waits
+        for the next look, as it does while the window isn't in use.
+        WhatsApp's own reload frees nothing, so Reload here is a new process."""
+        window = self.window
+        if window is None or not window.get_visible() or not window.is_active() or self.locked:
+            return
+        pages = held_by_page(self.memory_guard)
+        self._noticed &= set(pages)
+        over = {pid: size for pid, size in pages.items() if pid not in self._noticed
+                and size > max(GROWN_NOTICE * MiB, self._growth_ceiling(pid))}
+        if not over or any(account.replying or account.recording or account.crashing or account.reloading
+                           or not account.ready for account in self.accounts):
+            return
+        pid = max(over, key=over.get)
+        self._noticed.add(pid)
+        action = self.lookup_action("fresh-page")
+        if action is not None:
+            action.set_enabled(True)
+        print(f"natter: memory: a page holds {over[pid] >> 20} MB with the window in use; told, with Reload",
+              flush=True)
+        grown = f"{over[pid] / (1024 * MiB):.1f} GB"
+        # With several accounts Reload may not reach the page that grew (_fresh_page_asked).
+        title = (f"WhatsApp's page has grown to {grown}. Reload frees it." if len(self.accounts) <= 1 else
+                 f"A WhatsApp page has grown to {grown}. Reload refreshes the longest-open account.")
+        window.toast(title, "Reload", "app.fresh-page", timeout=0)
+
+    def _fresh_page_asked(self) -> None:
+        """The growth notice's Reload (_notice_growth): a fresh page, in a new web process. The
+        guard can't tell whose page is whose, so with several accounts the one longest since its
+        last load, as for memory while hidden. Not during a call: fresh_page refuses one."""
+        action = self.lookup_action("fresh-page")
+        if action is not None:
+            action.set_enabled(False)
+        for account in sorted(self.accounts, key=lambda account: account.loaded_at):
+            if not (account.calling or account.crashing or account.reloading):
+                account.fresh_page("Reload was chosen in the growth notice")  # say_reload logs it
+                return
 
     def _check_network_process(self) -> bool:
         """WebKit's network process holds all of WhatsApp's connections: its websocket, its

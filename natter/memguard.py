@@ -9,7 +9,8 @@ pushed the page into swap and stalled Natter's window along with it.
 
 This guard looks from Natter's side, in a thread of its own, so a stalled main loop doesn't stall
 it: every GUARD_POLL seconds, each of Natter's WebKit web processes, by the private memory it
-holds, resident or swapped (RssAnon + VmSwap). Past its limit and growing like a runaway, or far
+holds, resident or swapped (RssAnon + VmSwap), and its GPU buffers where they can be read (see
+GPU_COUNTED). Past its limit and growing like a runaway, or far
 past it whatever it does, the guard ends that process with SIGKILL, through a pidfd and after
 checking the name again, so a pid the kernel gave to another process meanwhile is never hit.
 WebKit reports it as a crash to the view that process served, and the view asks recent_kill()
@@ -36,8 +37,8 @@ MiB = 1024 ** 2
 PROC = Path("/proc")
 GUARD_POLL = 2.0  # seconds between looks
 # A page's limit is this share of the computer's memory, within these bounds, and never more than
-# half of it. An idle WhatsApp page holds 1.0-1.4 GB; a 16 GB laptop (14.8 GiB to the kernel)
-# gives 3.7 GiB.
+# half of it. An idle WhatsApp page holds 1.0-1.4 GB of its own, and 0.4-1.6 GB of GPU buffers
+# beside (GPU_COUNTED); a 16 GB laptop (14.8 GiB to the kernel) gives 3.7 GiB.
 PAGE_SHARE, PAGE_FLOOR, PAGE_CEILING = 0.25, int(2.5 * GiB), 6 * GiB
 # Past its limit a page is ended once it grows like a runaway: faster than RUNAWAY_RATE at two
 # looks in a row (a video's frames decoded and kept grew 130-1000 MB/s; an idle page creeps about
@@ -87,6 +88,24 @@ KILL_MEMORY = 120.0
 # launcher's unit (OOMPolicy=stop) the kernel's ending a page stops all of Natter.
 OOM_SCORE_ADJ = 500
 WEB_PROCESS = "WebKitWebProces"  # /proc/<pid>/comm is cut to 15 characters
+# GPU_COUNTED: the page's GPU buffers (gem_held) count towards ending it, beside RssAnon and
+# VmSwap. The i915 driver backs them with shmem, charged to Natter's unit and swapped like the
+# rest. On 28 Oct 2026 a page held 1.4-1.6 GB of them all afternoon beside 1.6-2.6 GB of its own,
+# and the computer swapped Natter's window to a 30 s stall; in an earlier run, one the guard
+# ended at 4.3 GB held 1.4 GB more of them, unseen. The unit's MemoryMax counts them too, so
+# leaving them out let the kernel come first: against the ceiling (page_ceiling) they count in
+# full. The limits above are sized for the page's own memory, and an idle page holds up to
+# GPU_ROOM of them, so against those only what's past GPU_ROOM counts; on an 8 GB computer an
+# idle page would otherwise sit past its limit already. Nor do they count in the growth rate:
+# a fullscreen video, a resize or a new DRM file found makes them jump without a runaway.
+# Only what can be read: a page without DRM files counts none. Its open files are all looked
+# through every GPU_RESCAN looks (hundreds of descriptors, a few milliseconds); in between only
+# the DRM ones found then.
+GPU_ROOM = int(1.5 * GiB)
+GPU_RESCAN = 15
+# A Web Worker's thread in WebKitGTK 2.52: what is alive of the workers WhatsApp started
+# (rtc.js counts the ones started and ended).
+WORKER_THREAD = "WebCore: Worker"
 
 
 def _read(path) -> str:
@@ -221,15 +240,23 @@ _GEM_UNITS = {"": 1, "kib": 1024, "mib": MiB, "gib": GiB}
 def gem_held(pid: int, proc: Path = PROC) -> int:
     """Bytes of GPU buffers the process owns in system memory, by its DRM files' fdinfo
     (drm-total-system…: the i915 driver backs them with shmem). None of it is in the process's
-    RssAnon or VmSwap, or in any limit of Natter's or WebKit's: the page's held 542 MB of them on
-    24 Oct 2026, seen only as its unit's shmem. Each DRM client once, however many descriptors
-    it has (drm-client-id); 0 when there's nothing to read."""
-    try:
-        entries = os.listdir(proc / str(pid) / "fdinfo")
-    except OSError:
-        return 0
+    RssAnon or VmSwap, or in WebKit's limit: the page's held 542 MB of them on 24 Oct 2026, seen
+    only as its unit's shmem. Each DRM client once, however many descriptors it has
+    (drm-client-id); 0 when there's nothing to read."""
+    return gpu_files(pid, proc)[0] or 0
+
+
+def gpu_files(pid: int, proc: Path = PROC, fds: Optional[list[str]] = None) -> tuple[Optional[int], list[str]]:
+    """(bytes, the descriptors read them from) for gem_held, from the open files `fds`, or all
+    of them when None. None for the bytes when no DRM file among them gives a total."""
+    if fds is None:
+        try:
+            fds = os.listdir(proc / str(pid) / "fdinfo")
+        except OSError:
+            return None, []
     clients: dict[str, int] = {}
-    for entry in entries:
+    found = []
+    for entry in fds:
         client, total = None, None
         for line in _read(proc / str(pid) / "fdinfo" / entry).splitlines():
             key, _, value = line.partition(":")
@@ -241,7 +268,17 @@ def gem_held(pid: int, proc: Path = PROC) -> int:
                 total = (total or 0) + int(parts[0]) * _GEM_UNITS.get(unit, 1)
         if total is not None:
             clients[client or entry] = total
-    return sum(clients.values())
+            found.append(entry)
+    return (sum(clients.values()) if found else None), found
+
+
+def worker_threads(pid: int, proc: Path = PROC) -> int:
+    """How many Web Workers the process runs (WORKER_THREAD): those alive, not all ever started."""
+    try:
+        tasks = os.listdir(proc / str(pid) / "task")
+    except OSError:
+        return 0
+    return sum(_read(proc / str(pid) / "task" / task / "comm").rstrip("\n") == WORKER_THREAD for task in tasks)
 
 
 def descends(pid: int, ancestor: int, proc: Path = PROC, depth: int = 4) -> bool:
@@ -369,6 +406,9 @@ class _Page:
         self.fast = 0  # looks in a row growing faster than GROWTH_RATE
         self.threads: Optional[tuple[float, dict]] = None  # thread_times at the first fast look
         self.told = False  # its busiest threads were logged for this spell of growth
+        self.gpu = 0  # its GPU buffers at the last read (GPU_COUNTED)
+        self.gpu_fds: list[str] = []  # its DRM files, found at the last full look through them
+        self.gpu_scan = 0  # looks left before the next full look
 
     def rates(self) -> list[float]:
         """Bytes a second between each look and the one before, oldest first."""
@@ -380,13 +420,16 @@ class _Page:
 class MemoryGuard:
     """Looks at each of Natter's pages every `poll` seconds from a thread of its own, and ends
     one past `limit_bytes` (page_limit) that grows like a runaway, or one past the room above it
-    whatever it does (limits). `ceiling` (page_ceiling), when given, is the most any page may
+    whatever it does (limits). What a page holds is held() plus its GPU buffers where they can be
+    read, those past GPU_ROOM against the limits and all of them against the ceiling
+    (GPU_COUNTED). `ceiling` (page_ceiling), when given, is the most any page may
     hold. `calling()`, when given, says whether a call is on in any page (it's asked from the
     guard's thread). `on_kill(pid, held)` runs on the main loop after a kill: the kill itself
     and its log line don't wait for it. Each page's oom_score_adj is set to `oom_score_adj`,
     unless that's None (see OOM_SCORE_ADJ). `charge()`, when given, says what the kernel charges
     Natter's unit beside its pages' private memory ({"shmem": bytes, "zswap": bytes},
-    system.unit_charge), for the step line only: none of it counts towards ending a page."""
+    system.unit_charge), for the step line only: none of it counts towards ending a page (the
+    page's own GPU buffers do, and are in that shmem)."""
 
     def __init__(self, limit_bytes: int, on_kill: Optional[Callable[[int, int], None]] = None,
                  poll: float = GUARD_POLL, calling: Optional[Callable[[], bool]] = None, *,
@@ -481,20 +524,34 @@ class MemoryGuard:
             if page is None:
                 page = self._pages[pid] = _Page(size)
                 self._raise_oom_score(pid)
-            page.looks.append((now, size))
+            gpu = self._gpu(pid, page)
+            total = size + gpu  # what the unit is charged for it, weighed against the ceiling
+            weighed = size + max(0, gpu - GPU_ROOM)  # what the limits weigh (GPU_COUNTED)
+            page.looks.append((now, size))  # the growth rate: its own memory alone
             rates = page.rates()
             rate = round(rates[-1] / MiB) if rates else 0
             soft, hard = self.limits(in_call)
             runaway = len(rates) >= 2 and min(rates[-2:]) > RUNAWAY_RATE
-            if (size > hard or (size > soft and runaway)) and self._end(pid, now):
+            if weighed > hard:
+                past = hard
+            elif self.ceiling is not None and total > self.ceiling:
+                past = self.ceiling
+            elif weighed > soft and runaway:
+                past = soft
+            else:
+                past = None
+            if past is not None and self._end(pid, now):
                 del self._pages[pid]
                 self._ended.add(pid)
                 ended.append(pid)
-                print(f"natter: memory: page {pid} held {size >> 20} MB, past its limit of "
-                      f"{(hard if size > hard else soft) >> 20} MB{' in a call' if in_call else ''}, "
+                counted = total if past == self.ceiling and weighed <= hard else weighed
+                split = (f" ({size >> 20} MB its own, {gpu >> 20} MB GPU buffers"
+                         + (f"; {counted >> 20} MB counted" if counted != total else "") + ")") if gpu else ""
+                print(f"natter: memory: page {pid} held {total >> 20} MB{split}, past its limit of "
+                      f"{past >> 20} MB{' in a call' if in_call else ''}, "
                       f"growing {rate} MB/s; ended it", flush=True)
                 if self.on_kill is not None:
-                    self._idle_add(self._report, pid, size)
+                    self._idle_add(self._report, pid, total)
                 continue
             try:
                 self._diagnose(pid, page, size, rates, rate, now, in_call)
@@ -514,6 +571,21 @@ class MemoryGuard:
         if last is None or now - last[0] > 3 * self.poll:
             return None
         return dict(last[1])
+
+    def _gpu(self, pid: int, page: _Page) -> int:
+        """The page's GPU buffers now (gem_held): from the DRM files found at the last full look
+        through its open files, and from all of them every GPU_RESCAN looks, or at once when
+        those are gone. 0 for a page with none."""
+        total = None
+        if page.gpu_scan > 0 and page.gpu_fds:
+            total, found = gpu_files(pid, self.proc, page.gpu_fds)
+        if page.gpu_scan <= 0 or (page.gpu_fds and total is None):
+            total, page.gpu_fds = gpu_files(pid, self.proc)
+            page.gpu, page.gpu_scan = total or 0, GPU_RESCAN
+        elif total is not None:
+            page.gpu, page.gpu_fds = total, found
+        page.gpu_scan -= 1
+        return page.gpu
 
     def _end(self, pid: int, now: float) -> bool:
         # Noted before the signal goes, so WebKit's report of the crash can't come before it.
@@ -554,18 +626,19 @@ class MemoryGuard:
         if size >= QUIET and size // STEP > page.step and not in_call:
             page.step = size // STEP
             regions = anon_regions(_read(self.proc / str(pid) / "smaps"))
+            workers = worker_threads(pid, self.proc)
             print(f"natter: memory: page {pid} holds {size >> 20} MB, growing {rate} MB/s; largest regions: "
                   + ("; ".join(describe_region(region) for region in regions) or "unreadable")
-                  + self._beside(pid), flush=True)
+                  + (f"; {workers} worker{'s' if workers != 1 else ''} alive" if workers else "")
+                  + self._beside(page.gpu), flush=True)
 
-    def _beside(self, pid: int) -> str:
-        """What the page holds that its size (RssAnon + VmSwap) doesn't count, for the step line:
-        its GPU buffers (gem_held), and what the kernel charges the unit as shmem and zswap
-        (`charge`). Said only where there's something to say."""
+    def _beside(self, gpu: int) -> str:
+        """What the page holds beside its size (RssAnon + VmSwap), for the step line: its GPU
+        buffers (`gpu`, which the limits count), and what the kernel charges the unit as shmem
+        and zswap (`charge`). Said only where there's something to say."""
         parts = []
-        gem = gem_held(pid, self.proc)
-        if gem:
-            parts.append(f"GPU buffers {gem >> 20} MB")
+        if gpu:
+            parts.append(f"GPU buffers {gpu >> 20} MB")
         if self.charge is not None:
             try:
                 charged = self.charge()

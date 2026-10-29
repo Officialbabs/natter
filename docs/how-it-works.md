@@ -51,6 +51,19 @@ full preview into an image, and WebKitGTK decodes a video given to an image as a
 every frame at once. An `<img>` gets an empty address instead, which fails to load the way any
 picture that can't be decoded does; `<video>` elements are untouched.
 
+WhatsApp saves a file by clicking a link to a `blob:` address of it, or by opening that address in
+a new window. WebKit saves a link with a download name itself. Natter Den has no other windows, so
+a `blob:` or `data:` address that WhatsApp's page opens in one (a link with `target="_blank"`, or
+`window.open()`), or loads into a frame or the page, is saved instead. Only addresses WhatsApp's own
+page made are saved, and never opened in the browser. A `data:` address says nothing of who made
+it, so it's saved only when you clicked, and never from a frame. The page may revoke the address straight
+after, and a revoked `blob:` can't be fetched, so the bridge revokes an address clicked or opened in
+the last minute a minute later. It also tells Natter Den the file's name (the link's download name,
+or the File's), which keeps its spaces; without one, the file is "download" with its type's
+extension. Files go to Preferences → General → Downloads, or to Downloads when that folder can't
+take them. Natter Den makes the empty file first, so a folder it can't write in, or a full disk, is said
+by name. WebKit only says "Load request cancelled" when it can't write a `blob:` download.
+
 ## Calls
 
 WhatsApp Web disables its call buttons where the browser has no WebRTC, as in the WebKitGTK
