@@ -1,10 +1,17 @@
 """Natter tests for what it takes from WhatsApp's page: messages, crashes, downloads, links."""
 
 import base64
+import contextlib
+import io
+import json
+import os
 import re
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
-from natter.account import (BACKOFF, BRIDGE, ICON_LIMIT, INVISIBLE, LOOP_SECONDS, STEADY, clean, clean_icon,
+from natter import NAME
+from natter.account import (BACKOFF, BRIDGE, ICON_LIMIT, INVISIBLE, LOOP_SECONDS, STEADY, Account, clean, clean_icon,
                             file_name, parse_message, reload_delay)
 from natter.links import same_site, short_link
 
@@ -18,6 +25,56 @@ class MessageTest(unittest.TestCase):
         self.assertIsNone(parse_message({"type": "canary", "found": "pane", "missing": []}))
         self.assertIsNone(parse_message({"type": "canary", "found": [], "missing": [7]}))
         self.assertIsNone(parse_message({"type": "canary", "found": [], "missing": ["x" * 25]}))
+
+    def test_canary_counts(self):
+        # The chat list's counts with it (bridge.js canary), numbers only, each kept within bounds;
+        # a bridge from before them sends none.
+        message = parse_message({"type": "canary", "found": ["row"], "missing": ["row-name"], "rows": 17,
+                                 "chatLike": 12, "named": 0, "token": "x"})
+        self.assertEqual(message, {"type": "canary", "found": ["row"], "missing": ["row-name"], "rows": 17,
+                                   "chat_like": 12, "named": 0})
+        self.assertEqual(parse_message({"type": "canary", "found": [], "missing": [], "rows": 5000})["rows"], 999)
+        self.assertEqual(parse_message({"type": "canary", "found": [], "missing": [], "named": 3}),
+                         {"type": "canary", "found": [], "missing": [], "named": 3})
+        for count in (-1, True, 1.5, "3", None, [3]):
+            for key in ("rows", "chatLike", "named"):
+                self.assertIsNone(parse_message({"type": "canary", "found": [], "missing": [], key: count}),
+                                  (key, count))
+
+    def test_the_canarys_log_line(self):
+        # What's missing, with the list's counts when the bridge sent them, and the notification.
+        said, changed = [], []
+        account = SimpleNamespace(name="Personal", _token="t", _trusted=lambda: True,
+                                  app=SimpleNamespace(page_changed=changed.append))
+        for counts in ({"rows": 17, "chatLike": 12, "named": 0}, {}):
+            message = {"type": "canary", "found": ["app", "pane", "row"], "missing": ["row-name"], "token": "t", **counts}
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                Account._on_message(account, None, SimpleNamespace(to_json=lambda _indent: json.dumps(message)))
+            said.append(out.getvalue())
+        self.assertEqual(said, [
+            f"natter: Personal: WhatsApp's page has changed: row-name not found (rows 17, chat-like 12, named 0); "
+            f"what relies on them is off until {NAME} catches up\n",
+            f"natter: Personal: WhatsApp's page has changed: row-name not found; what relies on them is off until "
+            f"{NAME} catches up\n"])
+        self.assertEqual(changed, [["row-name"], ["row-name"]])
+
+    def test_the_canarys_line_for_names_partly_read(self):
+        # All found, but not every chat's name read: a line with the counts, and no notification. Every
+        # one read: nothing (outside NATTER_DEBUG), nor without counts.
+        said, changed = [], []
+        account = SimpleNamespace(name="Personal", _token="t", _trusted=lambda: True,
+                                  app=SimpleNamespace(page_changed=changed.append))
+        with mock.patch.dict(os.environ):
+            os.environ.pop("NATTER_DEBUG", None)
+            for counts in ({"rows": 17, "chatLike": 17, "named": 15}, {"rows": 17, "chatLike": 17, "named": 17}, {}):
+                message = {"type": "canary", "found": ["app", "pane", "row", "row-name"], "missing": [], "token": "t",
+                           **counts}
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    Account._on_message(account, None, SimpleNamespace(to_json=lambda _indent: json.dumps(message)))
+                said.append(out.getvalue())
+        self.assertEqual(said, ["natter: Personal: canary: some chats' names can't be read (rows 17, chat-like 17, "
+                                "named 15)\n", "", ""])
+        self.assertEqual(changed, [])
 
     def test_notification(self):
         message = parse_message({"type": "notify", "id": 7, "title": "Mum\x00\x1b", "body": "Line 1\nLine 2\x07",

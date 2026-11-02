@@ -13,17 +13,53 @@
 
   // ---- Chats (the same way Natter's main window finds them) ---------------------------------
 
+  // Text with emoji pictures put back as their characters, icons (an SVG's <title>) aside.
   function textOf(element) {
     return [...element.childNodes].map((node) => {
       if (node.nodeType === Node.TEXT_NODE) return node.textContent;
       if (node.tagName === "IMG") return node.getAttribute("alt") || "";
-      return node.nodeType === Node.ELEMENT_NODE ? textOf(node) : "";
+      return node.nodeType === Node.ELEMENT_NODE && String(node.tagName).toLowerCase() !== "svg" ? textOf(node) : "";
     }).join("");
   }
 
-  function nameOf(row) {
-    const span = row.querySelector('[data-testid="cell-frame-title"] span[title]') || row.querySelector("span[title]");
-    return span ? plainName(span.getAttribute("title")) : "";
+  // Where a chat's name is in its row, as Natter's main window reads it (bridge.js rowName): in the
+  // row's title cell, its titled span's title, else its words, from the one place in it with words
+  // (its one outer span[dir=auto], else its one element with words of its own). Only in a row with
+  // no title cell, a titled span with no other words before it, not a community's name over a
+  // group's or a label. Never in the row's second line or by its status or time, nor holding them,
+  // where the other titled span holds the last message. Never a time or a bare count read from
+  // anything but the title cell's titled span. [element, name], or null.
+  const NAME_PLACES = ['[data-testid="cell-frame-title"] span[title]', '[data-testid="cell-frame-title"] [dir="auto"]',
+                       '[data-testid="cell-frame-title"]'];
+  const NOT_NAME = ['[data-testid="cell-frame-secondary"]', '[data-testid="last-msg-status"]',
+                    '[data-testid="chat-list-timestamp"]'].join(", ");
+  const BESIDE = '[data-testid="subgroup-identity"], [data-testid="cell-frame-label"]';
+  const NOT_A_NAME = /^(\p{Nd}{1,2}[:.]\p{Nd}{2}(\s?[ap]\.?m\.?)?|\p{Nd}{1,2}[/.-]\p{Nd}{1,2}[/.-]\p{Nd}{2,4}|\p{Nd}{1,4}\+?)$/iu;
+  // Text of its own, or an emoji picture (not a picture hidden from screen readers), icons aside.
+  const ownWords = (element) => !element.closest("svg") && [...element.childNodes].some((node) =>
+    (node.nodeType === Node.TEXT_NODE ? node.textContent.trim()
+      : node.tagName === "IMG" && (node.getAttribute("alt") || "").trim() && node.getAttribute("aria-hidden") !== "true"));
+  const outermost = (elements) => elements.filter((one) => !elements.some((other) => other !== one && other.contains(one)));
+
+  function rowName(row) {
+    let at = 0;
+    let element = null;
+    while (at < NAME_PLACES.length && !(element = row.querySelector(NAME_PLACES[at]))) at++;
+    if (!element) {
+      element = row.querySelector("span[title]");
+      if (!element || element.closest(BESIDE) || element.querySelector(BESIDE)) return null;
+      const all = [...row.querySelectorAll("*")];
+      if (all.slice(0, all.indexOf(element)).some((other) => !other.contains(element) && ownWords(other))) return null;
+    }
+    if (element.closest(NOT_NAME) || element.querySelector(NOT_NAME)) return null;
+    if (at === 1 || at === 2) {
+      const cell = at === 1 ? element.closest(NAME_PLACES[2]) : element;
+      const spots = at === 1 ? outermost([...cell.querySelectorAll(NAME_PLACES[1])])
+        : [cell, ...cell.querySelectorAll("*")].filter(ownWords);
+      if (spots.length !== 1) return null;
+    }
+    const name = plainName((element.getAttribute("title") || textOf(element)).replace(/\s+/g, " "));
+    return name && (at === 0 || !NOT_A_NAME.test(name)) ? [element, name] : null;
   }
 
   function activeChat() {
@@ -35,11 +71,10 @@
   }
 
   function rowFor(name) {
-    for (const span of document.querySelectorAll("#pane-side span[title]")) {
-      if (plainName(span.getAttribute("title")) === name) {
-        const row = span.closest(ROWS);
-        if (row && nameOf(row) === name) return span;
-      }
+    const pane = document.getElementById("pane-side");
+    for (const row of pane ? pane.querySelectorAll(ROWS) : []) {
+      const found = rowName(row);
+      if (found && found[1] === name) return found[0];
     }
     return null;
   }

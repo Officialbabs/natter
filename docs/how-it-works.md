@@ -237,11 +237,13 @@ press Send:
    by their host and path, as the same picture comes with other query strings), the reply's own
    click having opened it, from no chat or from one with another name, or the chat list marking it
    as the chat open while it's the only chat of that name in the list, the list shows all the chats
-   from its top with the chat among its first four rows (up to three pinned chats, then the latest),
-   and the notification was still shown when you asked to reply (`listed`). A name alone is never
-   enough, as two chats can share one; a chat of that name open before the click needs the message,
-   the picture or the list. Only messages that came in count as the message, not your own; where
-   WhatsApp no longer marks which way its messages went, any of the latest messages counts, but only
+   from its top with the chat among its first four chats (up to three pinned chats, then the latest;
+   the Archived row above them takes no place, told by its icon; any other row does, one still
+   loading too), and the notification was still shown when you asked to reply (`listed`). A name
+   alone is never enough, as two chats can share one; a chat of that name open before the click
+   needs the message, the picture or the list. Only messages that came in count as the message, not
+   your own; where WhatsApp no longer marks which way its messages went, any of the latest messages
+   counts, but only
    for a notification still shown when you asked, with the chat list as for `listed` (it needn't
    mark the chat open). A message drawn with a word set apart at its start (bold, a link, an
    @mention) counts for the words after that only when they have four letters or digits at least,
@@ -254,13 +256,17 @@ press Send:
    message between that WhatsApp says another person sent. One WhatsApp closes after you asked (the
    reply having the chat read) counts as still shown. A chat the click didn't open is never taken
    while the chat list shows two chats of that name, nor while a search is typed or a filter chip is
-   on, when the list may leave one out: the click may open nothing, or open the other one only
-   later, and the chat open may be the other one, with the same words. Where messages do carry the
-   chat's id, as WhatsApp's once did, that id decides instead. The bridge waits for the chat's
+   on, when the list may leave one out, nor while its names can't be counted: no chat drawn, a row
+   drawn that may be a chat's (WhatsApp's cell for one, or a name and a time, say) whose name can't
+   be read, or the open chat's row read as a name its header doesn't show (`mismatch (unnamed)`).
+   The click may open nothing, or open the other one only later, and the chat open may be the other
+   one, with the same words. Where messages do carry the chat's id, as WhatsApp's once did, that id
+   decides instead. The bridge waits for the chat's
    messages as long as the reply may take, less the time typing and Send need: when the message
    isn't the chat's latest, WhatsApp can take some seconds to load the ones around it. Just before
    Send it checks it's still the same chat, with the same name, and for a chat the click didn't
-   open, with the message, the picture or the list's mark still there. One case remains: with two
+   open, with the message, the picture or the list's mark still there, and still no second chat of
+   that name in the list, nor names there that can't be counted. One case remains: with two
    chats of the same name that aren't both in the visible chat list, and WhatsApp's click not opening
    the chat, or opening it only after a second or so, the open one can be taken for the other if it
    shows the same message. The list's mark only counts near the list's top, where the other, just

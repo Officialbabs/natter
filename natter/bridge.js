@@ -491,7 +491,20 @@
     "app": ["#app"],                                       // everything WhatsApp draws
     "pane": ["#pane-side"],                                // the chat list
     "row": ['[role="listitem"]', '[role="row"]'],          // one chat in the list
-    "row-name": ['[data-testid="cell-frame-title"] span[title]', "span[title]"],  // in a row
+    // A chat's name in its row, read by rowName alone (never find), as the canary judges it: the
+    // title cell's titled span, else that cell's words (its span[dir=auto]'s, else all of it); in a
+    // row with no title cell, a titled span, with rowName's rules: another one holds the last message.
+    "row-name": ['[data-testid="cell-frame-title"] span[title]', '[data-testid="cell-frame-title"] [dir="auto"]',
+                 '[data-testid="cell-frame-title"]', "span[title]"],
+    // Not judged by the canary: what tells a chat's row (chatLike), the Archived row's icon (a row
+    // with it and no chat's cell is the list's own), and the parts of a row that are never its name:
+    // its second line (the last message, a draft), its status and its time; and only where its
+    // title cell is gone, a community's name over a group's and a label.
+    "row-cell": ['[data-testid="cell-frame-container"]', '[data-testid="cell-frame-title"]'],
+    "row-own": ['[data-icon^="archive"]'],
+    "row-other": ['[data-testid="cell-frame-secondary"]', '[data-testid="last-msg-status"]',
+                  '[data-testid="chat-list-timestamp"]'],
+    "row-beside": ['[data-testid="subgroup-identity"]', '[data-testid="cell-frame-label"]'],
     "row-selected": ['[aria-selected="true"]'],            // the open chat's mark, on its row or in it
     "side": ["#side"],                                     // the panel with the list and search
     "search": ['#side [contenteditable="true"][role="textbox"]', '#side [contenteditable="true"]',
@@ -532,13 +545,62 @@
 
   const ROWS = WHERE.row.join(", ");
   const CHIPS = WHERE.chips.join(", ");
+  const CELLS = WHERE["row-cell"].join(", ");
+  const OWN = WHERE["row-own"].join(", ");
+  const NOT_NAME = WHERE["row-other"].join(", ");
+  const BESIDE = WHERE["row-beside"].join(", ");
+  // What a chat's name read from words never is: a time ("10:42", "9.05 pm", in any script's
+  // digits), a date, or a bare count (an unread badge).
+  const NOT_A_NAME = /^(\p{Nd}{1,2}[:.]\p{Nd}{2}(\s?[ap]\.?m\.?)?|\p{Nd}{1,2}[/.-]\p{Nd}{1,2}[/.-]\p{Nd}{2,4}|\p{Nd}{1,4}\+?)$/iu;
+
+  // Whether `element` has words of its own: text in it, or an emoji picture (its alt), not only in
+  // elements within it. An icon's (an SVG's <title>) aren't anyone's, nor a picture hidden from
+  // screen readers (a chat's photo).
+  const ownWords = (element) => !element.closest("svg") && [...element.childNodes].some((node) =>
+    (node.nodeType === Node.TEXT_NODE ? node.textContent.trim()
+      : node.tagName === "IMG" && (node.getAttribute("alt") || "").trim() && node.getAttribute("aria-hidden") !== "true"));
+
+  // How many elements in `row`, itself included, have words of their own.
+  const wordsIn = (row) => [row, ...row.querySelectorAll("*")].filter(ownWords).length;
+
+  // Of `elements`, those not inside another of them.
+  const outermost = (elements) => elements.filter((one) => !elements.some((other) => other !== one && other.contains(one)));
+
+  // A chat's name in its row and the element it's read from, [element, name], or null for none
+  // (WHERE "row-name"). In the row's title cell: its titled span's title, else its words with emoji
+  // pictures put back, from the one place in it with words (its one outer span[dir=auto], else its
+  // one element with words of its own), never a guess between two (a group's label and its name).
+  // Only in a row with no title cell, a titled span: one with no other words before it in the row,
+  // and not a community's name over a group's or a label (row-beside). Never in the row's second
+  // line or by its status or time, nor holding them (row-other), where WhatsApp's other titled span
+  // holds the last message. Never a time or a bare count read from anything but the title cell's
+  // titled span: no name, rather than the wrong one.
+  function rowName(row) {
+    const places = WHERE["row-name"];
+    const last = places.length - 1;
+    let at = 0;
+    let element = null;
+    while (at < last && !(element = row.querySelector(places[at]))) at++;
+    if (!element) {
+      element = row.querySelector(places[last]);
+      if (!element || element.closest(BESIDE) || element.querySelector(BESIDE)) return null;
+      const all = [...row.querySelectorAll("*")];
+      if (all.slice(0, all.indexOf(element)).some((other) => !other.contains(element) && ownWords(other))) return null;
+    }
+    if (element.closest(NOT_NAME) || element.querySelector(NOT_NAME)) return null;
+    if (at === 1 || at === 2) {
+      const cell = at === 1 ? element.closest(places[2]) : element;
+      const spots = at === 1 ? outermost([...cell.querySelectorAll(places[1])])
+        : [cell, ...cell.querySelectorAll("*")].filter(ownWords);
+      if (spots.length !== 1) return null;
+    }
+    const name = nameIn(element);
+    return name && (at === 0 || !NOT_A_NAME.test(name)) ? [element, name] : null;
+  }
 
   function nameOf(row) {
-    // The name is in the row's title cell. Other titled spans hold the last message, which
-    // Natter never reads; the title comes first when the cell isn't marked.
-    const span = find("row-name", row);
-    const name = span && span.getAttribute("title");
-    return name ? plainName(name) : "";
+    const found = rowName(row);
+    return found ? found[1] : "";
   }
 
   // WhatsApp's list is virtual: each row sits at translateY(place × row height). The row height
@@ -566,28 +628,67 @@
     return Number.isFinite(position) ? Math.max(0, position) : fallback;
   }
 
-  // The list's rows with a name, as drawn: [name, row, its translateY, its place in the page].
-  function namedRows() {
+  // The list's rows as drawn, the outer ones (a row may hold rows of its own): {row, offset: its
+  // translateY, i: its place in the page, cell, own, chat, sure, name}. `chat`: it may be a chat's,
+  // with WhatsApp's cell for a chat (row-cell) or two elements with words of their own (a name and
+  // a time, say): not a placeholder still loading (no words, or one), nor the list's own row
+  // (`own`: the Archived row, by its icon, without a chat's cell, and no more words than its own
+  // and a count). `sure`: a chat's for certain, its cell there or no row's anywhere: only theirs
+  // reach Natter and the canary. Only a row that may be a chat's has a name read (`name`, "" for none).
+  function listRows() {
     const list = find("pane");
     if (!list) return [];
-    const found = [];
+    const rows = [];
     list.querySelectorAll(ROWS).forEach((row, i) => {
-      if (row.parentElement && row.parentElement.closest(ROWS)) return;  // a nested row
-      const name = nameOf(row);
-      if (name) found.push([name, row, offsetOf(row), i]);
+      if (!(row.parentElement && row.parentElement.closest(ROWS))) rows.push({ row, offset: offsetOf(row), i });
     });
-    return found;
+    for (const entry of rows) {
+      entry.cell = Boolean(entry.row.querySelector(CELLS));
+      const words = entry.cell ? 0 : wordsIn(entry.row);  // only needed without the cell
+      entry.own = !entry.cell && words <= 2 && Boolean(entry.row.querySelector(OWN));
+      entry.chat = !entry.own && (entry.cell || words >= 2);
+      entry.name = entry.chat ? nameOf(entry.row) : "";
+    }
+    const cells = rows.some((entry) => entry.cell);
+    for (const entry of rows) entry.sure = entry.chat && (entry.cell || !cells);
+    return rows;
+  }
+
+  // The list's chats with a name, as drawn, those surely a chat's (listRows): [name, row, its
+  // translateY, its place in the page].
+  function namedRows(rows = listRows()) {
+    return rows.filter((entry) => entry.sure && entry.name).map((entry) => [entry.name, entry.row, entry.offset, entry.i]);
   }
 
   // Whether the list marks `row` as the open chat's (WhatsApp's aria-selected, on the row or in it).
   const selectedRow = (row) => WHERE["row-selected"].some((selector) => row.matches(selector)
     || Boolean(row.querySelector(selector)));
 
-  function chatRows() {
-    const found = namedRows();
+  function chatRows(rows = listRows()) {
+    const found = namedRows(rows);
     const height = rowHeight(found.map((entry) => entry[2]));
-    const rows = found.map(([name, row, offset, i]) => [name, positionOf(row, offset, height, i)]);
-    return rows.sort((a, b) => a[1] - b[1]).slice(0, 200);
+    const places = found.map(([name, row, offset, i]) => [name, positionOf(row, offset, height, i)]);
+    return places.sort((a, b) => a[1] - b[1]).slice(0, 200);
+  }
+
+  // A chat's name as Natter compares them (activeChat): spaces as one, no invisible marks, and NFC
+  // with U+FE0F aside, which emoji pictures may or may not carry.
+  const nameKey = (text) => plainName(String(text || "").replace(/\s+/g, " ")).normalize("NFC").replace(/\uFE0F/g, "");
+
+  function sameName(a, b) {
+    const key = nameKey(a);
+    return Boolean(key) && key === nameKey(b);
+  }
+
+  // Whether the list reads the open chat's row as a name its header doesn't show (namesOf, compared
+  // as a reply told by the list compares them: sameName): names misread, the last message's words
+  // taken for them, say. Told only with a chat open and one row drawn marked as it, with a name;
+  // false otherwise.
+  function misread(rows = listRows()) {
+    const header = find("header");
+    const marked = activeChat() ? rows.filter((entry) => selectedRow(entry.row)) : [];
+    return marked.length === 1 && Boolean(marked[0].name)
+      && !namesOf(header).some((name) => sameName(name.name, marked[0].name));
   }
 
   // The list is in recency order only with no search typed and the first filter chip ("All")
@@ -651,10 +752,28 @@
   // ---- The canary ---------------------------------------------------------------------------
   // Which WHERE entries still match the live page, told once the chat list is up (the rows need
   // a moment to arrive) and again whenever Python asks. What can't be judged right now — an
-  // empty list, no open chat — is left out rather than called missing.
+  // empty list, one still loading, no open chat — is left out rather than called missing.
+  // The chats' names are judged as Natter reads them (nameOf), on the list's first CANARY_ROWS
+  // rows by place, the chats' among them (listRows, surely a chat's and with words drawn): found
+  // when most have a name and the open chat's row, when it's drawn and marked, has a name its
+  // header shows (misread). With the counts of all the rows drawn, never a name. It first looks a
+  // moment after the list is up, again while anything is missing or the names can't be judged yet,
+  // and tells Natter once a page: at the first look with nothing missing, or else the last, with
+  // the list as last seen and its names as last judged (a search typed then, say, or WhatsApp
+  // between screens); a last look that finds only the open chat's row misread looks once more a
+  // moment on, as a chat being switched to has its row marked before its header is drawn.
 
+  const CANARY_ROWS = 12;
+  const CANARY_LOOKS = [10000, 30000, 120000];  // ms after the chat list is first up
+  const CANARY_AGAIN = 5000;  // ms on, the last look once more, for the open chat's row misread
+  const ROW_KEYS = ["row", "row-name"];
   let canaryTold = false;
+  let canaryList = null;  // the canary's latest look with the chat list up
+  let canaryRows = null;  // its latest look that judged the list's rows, the open chat's row misread aside
+  let namesMisread = false;  // the canary told Natter the open chat's row reads another name
 
+  // What the canary finds ({found, missing}, the counts, and `misread`: row-name missing only for
+  // the open chat's row, which isn't told to Natter).
   function canary() {
     const found = [];
     const missing = [];
@@ -662,8 +781,9 @@
     judge("app", Boolean(find("app")));
     const pane = find("pane");
     if (!pane) {
-      // The link screen has no list; anything else without one is loading or a redesign.
-      judge("link-screen", linkScreen());
+      // Looked at only once the list has been up: without it now, WhatsApp is between screens (the
+      // link screen, its own loading, in use in another window), and nothing of it can be judged.
+      if (linkScreen()) found.push("link-screen");
       return { found, missing };
     }
     found.push("pane");
@@ -671,14 +791,64 @@
     judge("side", Boolean(side));
     judge("search", Boolean(find("search")));
     if (side) judge("chips", Boolean(side.querySelector(CHIPS)));
-    const row = find("row", pane);
-    if (row || pane.querySelector("span[title]")) {  // an empty list can't be judged
-      judge("row", Boolean(row));
-      if (row) judge("row-name", Boolean(find("row-name", row)));
+    const rows = listRows();
+    // The chats' rows: surely a chat's (listRows), and not one still loading, words not drawn yet.
+    const chats = rows.filter((entry) => entry.sure && wordsIn(entry.row) > 0);
+    const height = rowHeight(rows.map((entry) => entry.offset));
+    const first = new Set(rows.map((entry) => [positionOf(entry.row, entry.offset, height, entry.i), entry])
+      .sort((a, b) => a[0] - b[0]).slice(0, CANARY_ROWS).map(([, entry]) => entry));
+    const judged = chats.filter((entry) => first.has(entry));
+    const named = (list) => list.filter((entry) => entry.name).length;
+    const most = named(judged) * 2 > judged.length;
+    if (!rows.length) {
+      // No rows but a chat's parts: the rows have changed. An empty list can't be judged.
+      if (pane.querySelector(`span[title], ${CELLS}`)) judge("row", false);
+    } else if (judged.length >= (rows.some((entry) => entry.cell) ? Math.min(3, rows.length) : 3)) {
+      // Fewer chats than that: placeholders still loading, say, or only the list's own row. Without
+      // WhatsApp's cell for a chat anywhere, three chats, as a banner has two lines of words.
+      judge("row", true);
+      judge("row-name", most && !misread(rows));
     }
     const header = find("header");
     if (header) judge("header-name", Boolean(find("header-name", header)));
-    return { found, missing };
+    return { found, missing, rows: rows.length, chatLike: chats.length, named: named(chats),
+             misread: missing.includes("row-name") && most };
+  }
+
+  // Whether a look of the canary's judged the list's rows.
+  const rowsJudged = (look) => ROW_KEYS.some((key) => look.found.includes(key) || look.missing.includes(key));
+
+  // `look` with the list's rows as the look `judged` judged them, and its counts; null: not judged.
+  function withRows(look, judged) {
+    const keep = (keys, from) => [...keys.filter((key) => !ROW_KEYS.includes(key)),
+                                  ...from.filter((key) => ROW_KEYS.includes(key))];
+    if (!judged) return { ...look, found: keep(look.found, []), missing: keep(look.missing, []), misread: false };
+    return { ...look, found: keep(look.found, judged.found), missing: keep(look.missing, judged.missing),
+             rows: judged.rows, chatLike: judged.chatLike, named: judged.named, misread: judged.misread };
+  }
+
+  // The canary's look `at` (of CANARY_LOOKS; `again`: the last once more): told to Natter, or
+  // looked at again later while something's missing or the names can't be judged yet.
+  function canaryLook(at, again = false) {
+    const look = canary();
+    if (look.found.includes("pane")) canaryList = look;
+    if (rowsJudged(look) && !look.misread) canaryRows = look;
+    const named = look.found.includes("row-name") || look.missing.includes("row-name");
+    if (at + 1 < CANARY_LOOKS.length && (look.missing.length || !named)) {
+      setTimeout(() => canaryLook(at + 1), CANARY_LOOKS[at + 1] - CANARY_LOOKS[at]);
+      return;
+    }
+    if (look.misread && !again) {
+      setTimeout(() => canaryLook(at, true), CANARY_AGAIN);
+      return;
+    }
+    // The list as last seen, its rows as last judged when it can't judge them, or when it's an
+    // earlier look's that found the open chat's row misread, not seen again.
+    let result = look.found.includes("pane") ? look : canaryList || look;
+    if (!rowsJudged(result) || (result !== look && result.misread)) result = withRows(result, canaryRows);
+    const { misread: wrong, ...told } = result;
+    if (wrong) namesMisread = true;
+    post({ type: "canary", ...told });
   }
 
   // ---- Calls --------------------------------------------------------------------------------
@@ -854,10 +1024,13 @@
     scanQueued = false;
     rewatch();
     enableCalls();
-    if (!searching() && !filtered()) {
-      const rows = chatRows();
+    // Names misread never reach Natter's list of chats: not while the open chat's row reads another
+    // name than its header, nor on a page the canary found that on.
+    if (!searching() && !filtered() && !namesMisread) {
+      const listed = listRows();
+      const rows = chatRows(listed);
       const signature = JSON.stringify(rows);
-      if (signature !== lastRows && rows.length) {
+      if (signature !== lastRows && rows.length && !misread(listed)) {
         lastRows = signature;
         post({ type: "chats", rows });
       }
@@ -874,7 +1047,7 @@
       if (ready) reportLook();
       if (ready && !canaryTold) {
         canaryTold = true;
-        setTimeout(() => post({ type: "canary", ...canary() }), 10000);
+        setTimeout(() => canaryLook(0), CANARY_LOOKS[0]);
       }
     }
     const state = ready ? "chats" : linkScreen() ? "needs-link" : "";
@@ -1156,14 +1329,13 @@
 
   // ---- Opening a chat -----------------------------------------------------------------------
 
+  // Where to press for the chat named `name` in the list: where its row has its name (rowName).
   function rowFor(name) {
     const pane = find("pane");
     if (!pane) return null;
-    for (const span of pane.querySelectorAll("span[title]")) {
-      if (plainName(span.getAttribute("title")) === name) {
-        const row = span.closest(ROWS);
-        if (row && nameOf(row) === name) return span;
-      }
+    for (const row of pane.querySelectorAll(ROWS)) {
+      const found = rowName(row);
+      if (found && found[1] === name) return found[0];
     }
     return null;
   }
@@ -1609,19 +1781,10 @@
   // while its notification can be clicked: the click (WhatsApp's open by id) comes first. One
   // WhatsApp closed may not open its chat when clicked, so its message is held to more (`strict`):
   // longer words, and a group's sender's too. And a chat the click didn't open is never taken while
-  // the chat list shows two of that name, or shows only some chats (namesakes): the click may open
-  // nothing, or the other one only later.
+  // the chat list shows two of that name, shows only some chats, or names that can't be read
+  // (namesakes): the click may open nothing, or the other one only later.
 
   const LAST_ROWS = 12;  // the latest rows of the open chat, where the notified message is looked for
-
-  // A chat's name as Natter compares them (activeChat): spaces as one, no invisible marks, and NFC
-  // with U+FE0F aside, which emoji pictures may or may not carry.
-  const nameKey = (text) => plainName(String(text || "").replace(/\s+/g, " ")).normalize("NFC").replace(/\uFE0F/g, "");
-
-  function sameName(a, b) {
-    const key = nameKey(a);
-    return Boolean(key) && key === nameKey(b);
-  }
 
   // Words as a message and its notification both have them: NFC, without spaces, invisible marks,
   // U+FE0F or WhatsApp's formatting marks (* _ ~ `), which a message shows as styles instead.
@@ -1882,13 +2045,20 @@
       : signs.listed ? "name+listed" : "";
   }
 
-  // How many chats in the list (chatRows, those WhatsApp has drawn) have the name `title`. Two or
-  // more, and a chat of that name the click didn't open is never taken for the one notified: it may
-  // be the other, with the same words, while WhatsApp's click opens nothing, or opens it later.
-  // With a search typed or a filter chip on, the list isn't all the chats (scan): not known, null.
+  // How many chats in the list (those WhatsApp has drawn) have the name `title`. Two or more, and
+  // a chat of that name the click didn't open is never taken for the one notified: it may be the
+  // other, with the same words, while WhatsApp's click opens nothing, or opens it later.
+  // Not known, null: with a search typed or a filter chip on, the list isn't all the chats (scan);
+  // and names that can't be read can't be counted: no chat drawn, one drawn that may be a chat's
+  // (listRows: with WhatsApp's cell for one or not) without a name to read, or the open chat's row
+  // read as a name its header doesn't show (misread). A row with the name that isn't told for a
+  // chat's counts all the same: it may be one.
   function namesakes(title) {
     if (searching() || filtered()) return null;
-    return chatRows().filter(([name]) => sameName(name, title)).length;
+    const rows = listRows();
+    const chats = rows.filter((entry) => entry.chat);
+    if (!chats.length || chats.some((entry) => !entry.name) || misread(rows)) return null;
+    return rows.filter((entry) => sameName(entry.chat ? entry.name : nameOf(entry.row), title)).length;
   }
 
   // The rows the chat list marks as the open chat's (selectedRow): how many, and whether there's
@@ -1903,26 +2073,36 @@
   const TOP_ROWS = 4;
 
   // The list's one row of the name `title`, when the list shows all the chats (namesakes) from its
-  // top and has that row among its first TOP_ROWS; else null. The notified chat has just had a
-  // message, so it sits up there: one of the same name drawn there would be counted, and one not
-  // drawn (the list scrolled down) is never left out. Archived chats aren't in the list at all.
+  // top and has that row among its first TOP_ROWS chats; else null. The notified chat has just had
+  // a message, so it sits up there: one of the same name drawn there would be counted, and one not
+  // drawn (the list scrolled down) is never left out. Archived chats aren't in the list at all. A
+  // place above it that only the list's own row is drawn at (listRows: the Archived row, told by
+  // its icon) isn't a chat's; any other is, drawn or not, or still loading, words or none. The
+  // rows' height is told by all the rows drawn, those still loading too.
   function topRow(title) {
     if (namesakes(title) !== 1) return null;
-    const rows = namedRows();
-    const height = rowHeight(rows.map((entry) => entry[2]));
+    const rows = listRows();
+    const height = rowHeight(rows.map((entry) => entry.offset));
     // A row's place by its aria-rowindex or translateY only, NaN if neither tells it.
-    const place = ([, row, offset]) => positionOf(row, offset, height, offset === 0 ? 0 : NaN);
-    const named = rows.filter(([name]) => sameName(name, title));
-    if (named.length !== 1 || !rows.some((entry) => place(entry) === 0)) return null;
-    return place(named[0]) < TOP_ROWS ? named[0][1] : null;
+    const place = (entry) => positionOf(entry.row, entry.offset, height, entry.offset === 0 ? 0 : NaN);
+    const named = rows.filter((entry) => entry.chat && sameName(entry.name, title));
+    // The list's top drawn: a chat with its name there, or the list's own row.
+    if (named.length !== 1 || !rows.some((entry) => place(entry) === 0 && (entry.name || entry.own))) return null;
+    const at = place(named[0]);
+    let above = 0;
+    for (let p = 0; p < at && above < TOP_ROWS; p++) {
+      const there = rows.filter((entry) => place(entry) === p);
+      if (!there.length || !there.every((entry) => entry.own)) above++;
+    }
+    return Number.isFinite(at) && above < TOP_ROWS ? named[0].row : null;
   }
 
   // Whether the list, showing all the chats from its top, has one row of the name `title` near the
-  // top (topRow), and marks that row, and only it, as the chat open.
+  // top (topRow), and marks that row, and only it, of all its rows, as the chat open.
   function listedAlone(title) {
     const row = topRow(title);
-    const marked = namedRows().filter(([, other]) => selectedRow(other));
-    return Boolean(row) && marked.length === 1 && marked[0][1] === row;
+    const marked = listRows().filter((entry) => selectedRow(entry.row));
+    return Boolean(row) && marked.length === 1 && marked[0].row === row;
   }
 
   // ---- What the log may say of the page
@@ -2321,7 +2501,9 @@
       if (!still(found)) return failed(["mismatch", "moved"], notification, before);
       unopened = found.how !== "ids" && !chatSigns(found.main, facts, before).navigated;
       const same = unopened ? namesakes(facts.title) : 0;
-      if (same === null) return failed(["mismatch", "filtered"], notification, before);
+      if (same === null) {
+        return failed(["mismatch", searching() || filtered() ? "filtered" : "unnamed"], notification, before);
+      }
       if (same > 1) return failed(["mismatch", "ambiguous"], notification, before);
     }
     progress.how = found.how;
@@ -2361,9 +2543,11 @@
     if (!left()) return ["left-as-draft", "late"];
     if (!button) return described(["left-as-draft", "no-button"]);
     // Still this chat, this box, these words, this button, nothing waiting to be sent with them;
-    // and one told without the click having opened it, told again by all its signs.
+    // and one told without the click having opened it, told again by all its signs, and still with
+    // no other chat of its name in the list, nor names there that can't be counted (namesakes).
+    const others = () => { const same = namesakes(facts.title); return same === null || same > 1; };
     if (!still(found) || composerIn(main) !== box || !sameText(canonical(boxText(box)), wanted)
-        || sendButton(main) !== button || previewOpen() || (unopened && !sameChat(main, facts, before))) {
+        || sendButton(main) !== button || previewOpen() || (unopened && (!sameChat(main, facts, before) || others()))) {
       return ["left-as-draft", "moved"];
     }
     if (chatIds(main).size) progress.how = "ids";  // keys with chat ids, this chat's (still)

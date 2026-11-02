@@ -13,12 +13,28 @@ in one table there (`WHERE`). When a WhatsApp update moves one, the feature that
 (Ctrl+K stops opening chats, say). Once the chat list is up, the bridge's canary checks the chat
 list's landmarks (and the open chat's header, when a chat is open) against the live page, and
 Natter Den's log names any it didn't find (`natter: <account>: WhatsApp's page has changed: … not found`).
+It judges the chat names on the list's first dozen rows, the chats' among them (not placeholders still
+loading, nor the Archived row or a banner), as Natter Den reads them: found when most of them have
+one, and the open chat's row, if the list marks it, has a name its header shows. While anything is
+missing or the list is still loading, it looks again at 30 s and at 2 minutes, and it reports once a
+page, with the counts of all the rows drawn and never a name
+(`row-name not found (rows 17, chat-like 17, named 0)`): at the first look with nothing missing, or
+else the last, with the list as last seen and its names as last judged (WhatsApp between screens
+then, or a search typed). A last look that finds only the open chat's row misread looks once more
+5 s on, as a chat being switched to has its row marked before its header is drawn. With everything
+found but some chats' names unread, the log says so with the counts
+(`canary: some chats' names can't be read (…)`), without a notification.
+Names it can't trust go nowhere: while the open chat's row reads another name, and on a page where
+the canary found that, Natter Den saves none of the list's names; and replies that need the list to
+count the chats of a name stop while a row that may be a chat's has a name that can't be read
+(`mismatch (unnamed)`).
 
 | Landmark | What leans on it |
 |---|---|
 | `#pane-side` and its rows (`[role="listitem"]`, `[role="row"]`) | the chat list, Ctrl+K, the dock menu, desktop search, and replies (two chats of the same name in it) |
 | the open chat's row marked `[aria-selected="true"]` (on a `#pane-side` row or in it), and the rows' places (`aria-rowindex` or `translateY`) | replies telling an open chat by the list marking it, near the list's top (`name+listed`) |
-| `[data-testid="cell-frame-title"] span[title]` in a row (else its `span[title]`) | chat names |
+| a row's title cell, `[data-testid="cell-frame-title"]`: its `span[title]`, else its words when they're in one place in it (one outer `[dir="auto"]`, else one element); only in a row with no title cell, a `span[title]` with no other words before it, not a community's name or a label (`[data-testid="subgroup-identity"]`, `[data-testid="cell-frame-label"]`); never in the row's second line (`[data-testid="cell-frame-secondary"]`) or by its status or time (`[data-testid="last-msg-status"]`, `[data-testid="chat-list-timestamp"]`), where the last message's titled span is, nor holding them | chat names |
+| a chat's row told by `[data-testid="cell-frame-container"]` or its title cell, or by two pieces of text; the Archived row by its icon (`[data-icon^="archive"]`, without a chat's cell) | telling chats from placeholders and the Archived row, for the canary and replies (only rows with the cell, where any row has it, are saved or judged by the canary; any row that may be a chat's must have a name for replies to count the chats of a name) |
 | `#main header`, with the title in `[data-testid="conversation-info-header-chat-title"]` | which chat is open |
 | the link screen: a `canvas`, `[data-ref]` or `[data-link-code]` in `#app` (the QR code), with no `#pane-side` | telling the link screen from a page still loading |
 | filter chips: `[role="tab"][aria-selected]` (or `button[aria-pressed]`) in `#side` | not taking a filtered list's order for the recent chats |

@@ -1350,16 +1350,17 @@ class DrawerTest(unittest.TestCase):
                              count, selector)
 
 
-# The bridge's parts the reply leans on from outside its section, as the bridge has them: names
-# as Natter compares them, and the open chat's name in a header (titleOf).
+# The bridge's parts the reply leans on from outside its section, as the bridge has them: words
+# with emoji pictures put back (textOf), and the open chat's name in a header (titleOf, activeChat).
 NAMES = "\n".join((re.search(r"^  const NAME_LIMIT = .*$", BRIDGE, re.M)[0],
                    re.search(r"^  const INVISIBLE = .*$", BRIDGE, re.M)[0],
                    re.search(r"^  const plainName = .*$", BRIDGE, re.M)[0],
                    BRIDGE[BRIDGE.index("  // Text with WhatsApp's emoji pictures"):
-                          BRIDGE.index("  function activeChat()")]))
+                          BRIDGE.index("  // WhatsApp's link screen")]))
 WHERE = BRIDGE[BRIDGE.index("  const WHERE = {"):BRIDGE.index("  // ---- The chat list")]
-# The chat list as the bridge reads it (chatRows), for replies telling two chats of a name apart,
-# and whether it shows all the chats (a filter chip on, a search typed).
+# The chat list as the bridge reads it (listRows, chatRows) and names as Natter compares them
+# (sameName), for replies telling two chats of a name apart, and whether it shows all the chats (a
+# filter chip on, a search typed).
 CHAT_LIST = "\n".join((BRIDGE[BRIDGE.index("  // ---- The chat list"):BRIDGE.index("  // Text with WhatsApp's emoji pictures")],
                        BRIDGE[BRIDGE.index("  function searchBox()"):BRIDGE.index("  function setSearch(")],
                        BRIDGE[BRIDGE.index("  function searching()"):BRIDGE.index("  function focusComposer()")]))
@@ -1955,6 +1956,9 @@ class ReplyWaitTest(unittest.TestCase):
         self.js = JavaScriptCore.Context()
         self.run_js("\n".join((FAKE_PAGE, FAKE_RUNTIME, WHERE, CHAT_LIST, NAMES, SECTION)))
         self.run_js(f"load({json.dumps(mock_template('chats'))}); document.visibilityState = 'hidden'")
+        # Chats in the list, as the live page always has them: with none drawn, how many chats have
+        # a name can't be told (namesakes). A test draws its own list in their place (list_rows).
+        self.list_rows("Book Club", "Landlord")
         self.chat_wait = int(re.search(r"const CHAT_WAIT_MS = (\d+);", SECTION)[1])
         self.reserve = self.run_js("TYPE_RESERVE_MS").to_int32()
 
@@ -2133,10 +2137,12 @@ class ReplyWaitTest(unittest.TestCase):
             self.run_js('onPress = () => { find("main").querySelector("footer [contenteditable]").childNodes = []; }')
 
     def list_rows(self, *names, start=0):
-        """The chat list's rows, as the live page draws them (list_row): each name in a titled span,
-        the one starting with "*" marked as the chat open; the first at place `start`."""
+        """The chat list's rows, as the live page draws them (list_row), in place of those drawn: each
+        name in a titled span, the one starting with "*" marked as the chat open; the first at place
+        `start`."""
         rows = [list_row(start + i, name.lstrip("*"), name.startswith("*")) for i, name in enumerate(names)]
-        self.run_js(f'add(find("pane").querySelector("#grid"), {json.dumps(rows)})')
+        self.run_js(f'find("pane").querySelector("#grid").childNodes = []; '
+                    f'add(find("pane").querySelector("#grid"), {json.dumps(rows)})')
 
     def assert_private(self, diag):
         self.assertEqual(reply_diag({"diag": diag}), diag)
@@ -2329,6 +2335,264 @@ class ReplyWaitTest(unittest.TestCase):
         self.later(3000, f'add(find("main").querySelector("#send-slot"), [{json.dumps(self.SEND)}]); mutate();')
         self.run_js('onPress = () => { find("main").querySelector("footer [contenteditable]").childNodes = []; }')
         self.assertEqual(self.run_reply()[:2], ("sent", "name+listed"))
+
+    # ---- Names the list can't read, or reads as another's -----------------------------------------
+
+    @staticmethod
+    def unreadable(start=0):
+        """The list's names from its `start`th row on as a redesign might leave them: no title cell and
+        nothing titled, the rows still a chat's (WhatsApp's cell for one). A script for the page."""
+        return ('[...find("pane").querySelectorAll(\'[data-testid="cell-frame-title"]\')].slice(%d).forEach((cell) => { '
+                'cell.attributes["data-testid"] = "cell-frame-container"; '
+                'cell.querySelectorAll("[title]").forEach((span) => { delete span.attributes.title; }); })' % start)
+
+    def own_row(self, place, words="Archived"):
+        """A row of the list's own at `place` (own_row: the Archived row, or a placeholder with no
+        `words`), as list_row's are placed, drawn after the chats' rows in the page."""
+        tree = own_row(0, words)
+        tree["attrs"] = {"role": "listitem", "style": f"transform: translateY({place * 72}px)"}
+        self.run_js(f'add(find("pane").querySelector("#grid"), [{json.dumps(tree)}])')
+
+    def test_two_of_the_name_whose_names_cant_be_read(self):
+        # The list's names unreadable: how many chats have the name can't be told, so a chat told
+        # without the click having opened it isn't taken, by its words or its picture. (They were
+        # counted as none of the name: sent.)
+        self.list_rows("Mum", "Work Team", "Mum")
+        self.run_js(self.unreadable())
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.send_button()
+        diag = self.assert_mismatch(self.run_reply(), "unnamed")
+        self.assertEqual((diag["name"], diag["navigated"], diag["body"]), (True, False, True))
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+        self.setUp()
+        self.list_rows("Mum", "Mum")
+        self.run_js(self.unreadable())
+        self.header("Mum", picture="blob:file:///mum")
+        self.add_row(row(bare(1), "See you"))
+        self.send_button()
+        self.assert_mismatch(self.run_reply(dict(self.MUM, icon="blob:file:///mum")), "unnamed")
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+        # One row of the list without a name to read is enough: it may be the other of the name.
+        self.setUp()
+        self.list_rows("Mum", "Work Team", "Mum")
+        self.run_js(self.unreadable(2))
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.send_button()
+        self.assert_mismatch(self.run_reply(), "unnamed")
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+        # Natter's log takes the word.
+        self.assertEqual(reply_answer({"result": "mismatch", "why": "unnamed"}), ("mismatch", "unnamed"))
+
+    def test_two_of_the_name_read_from_their_words(self):
+        # The titles gone, the names still in the title cells' words: both of the name are counted.
+        self.list_rows("Mum", "Work Team", "Mum")
+        self.run_js('find("pane").querySelectorAll("[title]").forEach((span) => { delete span.attributes.title; })')
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.send_button()
+        self.assert_mismatch(self.run_reply(), "ambiguous")
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+
+    def test_the_open_chats_row_read_as_another_name(self):
+        # The list marks the open chat's row and reads another name there than its header's: the
+        # list's names are misread, and none are counted.
+        self.list_rows("*Mother", "Work Team")
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.send_button()
+        self.assert_mismatch(self.run_reply(), "unnamed")
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+
+    def test_the_owners_live_case_with_a_row_of_the_lists_own_first(self):
+        # As the owner's live case, with the Archived row at the list's top: it takes no chat's place,
+        # and the chat is told as it was without it.
+        for rows, how in (([live_row(bare(1), "Hi"), live_row(bare(2), "Did you eat?")], "name+body"),
+                          ([live_row(bare(1), "Hi"), live_row(bare(2), "\U0001F4F7 Photo")], "name+listed")):
+            self.setUp()
+            self.list_rows("Work Team", "*Mum", "Football Sunday", start=1)
+            self.own_row(0)
+            self.header("Mum", picture="https://pps.whatsapp.net/v/t61/mum.jpg?oh=1")
+            for tree in rows:
+                self.add_row(tree)
+            self.send_button()
+            said = dict(self.MUM, icon="data:image/png;base64,iVBORw0KGgo=")
+            self.assertEqual(self.run_reply(said)[:2], ("sent", how), how)
+            self.assertEqual((self.run_js("clicked").to_int32(), self.run_js("pressed").to_int32()), (1, 1), how)
+
+    def test_only_a_row_of_the_lists_own_takes_no_place(self):
+        # The fifth chat, below the Archived row, is still too far from the top; and a placeholder still
+        # loading at the top may be any chat (another of the name): neither the list nor the words.
+        def trap(*names, words="Archived"):
+            self.setUp()
+            self.list_rows(*names, start=1)
+            self.own_row(0, words)
+            self.header("Mum")
+            self.add_row(live_row(bare(1), "Did you eat?"))
+            self.send_button()
+            return self.run_reply()
+        diag = self.assert_refused(trap("A", "B", "C", "D", "*Mum"))
+        self.assertEqual((diag["listed"], diag["body"], diag["selected"], diag["selectedName"]), (False, False, 1, True))
+        diag = self.assert_refused(trap("*Mum", "Work Team", words=""))
+        self.assertEqual((diag["listed"], diag["body"], diag["selected"], diag["selectedName"]), (False, False, 1, True))
+
+    def test_a_row_not_told_for_a_chats_still_counts(self):
+        # A row with the name but without WhatsApp's cell for a chat may be a chat all the same: two of
+        # the name. And a row of any kind marked as the chat open besides the chat's: not listed.
+        self.list_rows("Mum", "Work Team")
+        tree = own_row(0, "Mum")
+        tree["children"][0]["children"][1]["children"][0]["attrs"]["title"] = "Mum"
+        tree["attrs"] = {"role": "listitem", "style": "transform: translateY(144px)"}
+        self.run_js(f'add(find("pane").querySelector("#grid"), [{json.dumps(tree)}])')
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.send_button()
+        self.assert_mismatch(self.run_reply(), "ambiguous")
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+        self.setUp()
+        self.list_rows("*Mum", "Work Team")
+        tree = own_row(0)
+        tree["attrs"] = {"role": "listitem", "style": "transform: translateY(144px)", "aria-selected": "true"}
+        self.run_js(f'add(find("pane").querySelector("#grid"), [{json.dumps(tree)}])')
+        self.header("Mum")
+        self.add_row(live_row(bare(1), "See you"))
+        self.send_button()
+        diag = self.assert_refused(self.run_reply())
+        self.assertEqual((diag["listed"], diag["selected"], diag["selectedName"]), (False, 1, True))
+
+    def test_names_lost_just_before_send(self):
+        # Told by the list: just before Send its names can't be read any more, and Send isn't pressed.
+        self.list_rows("*Mum", "Work Team")
+        self.header("Mum")
+        self.add_row(live_row(bare(1), "See you"))
+        self.later(3000, f'add(find("main").querySelector("#send-slot"), [{json.dumps(self.SEND)}]); '
+                         f'{self.unreadable()}; mutate();')
+        self.assertEqual(self.run_reply()[:2], ("left-as-draft", "moved"))
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+
+    def draw(self, *trees):
+        """The chat list's rows, these trees (live_list_row's, own_row's, plain_row's), in place of
+        those drawn."""
+        self.run_js(f'find("pane").querySelector("#grid").childNodes = []; '
+                    f'add(find("pane").querySelector("#grid"), {json.dumps(list(trees))})')
+
+    def test_a_chats_row_without_the_cell_for_one(self):
+        # A chat's row drawn without WhatsApp's cell for one, in a list whose other rows have it, and
+        # its name unreadable: it may be a chat's all the same (its name, time and last message), never
+        # the list's own. At the top, it takes a place there: the older "Mum" open below it isn't
+        # listed, by the list or by its words; nor is it near the top below five such rows. (They
+        # were taken for the list's own, and the reply sent there.)
+        photo = [live_row(bare(1), "Hi"), live_row(bare(2), "\U0001F4F7 Photo")]
+        words = [live_row(bare(1), "Did you eat?")]
+        for rows, messages in (([plain_row(0, "Mum"), live_list_row(1, "Work Team"), live_list_row(2, "Ana Souza"),
+                                 live_list_row(3, "Mum", marked=True)], photo),
+                               ([plain_row(0, "Mum"), live_list_row(1, "Work Team"), live_list_row(2, "Ana Souza"),
+                                 live_list_row(3, "Mum", marked=True)], words),
+                               ([*(plain_row(i, f"Friend {i}", last="See you") for i in range(5)),
+                                 live_list_row(5, "Mum", marked=True), live_list_row(6, "Landlord")], photo)):
+            self.setUp()
+            self.draw(*rows)
+            self.header("Mum")
+            for tree in messages:
+                self.add_row(tree)
+            self.send_button()
+            self.assert_refused(self.run_reply())
+        # Told by the message: such a row whose name can't be read may be the other "Mum".
+        self.setUp()
+        self.draw(live_list_row(0, "Mum", marked=True), live_list_row(1, "Work Team"), plain_row(2, "Mum"))
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.send_button()
+        self.assert_mismatch(self.run_reply(), "unnamed")
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+        # With its name titled, it's read: two of the name.
+        self.setUp()
+        self.draw(live_list_row(0, "Mum", marked=True), live_list_row(1, "Work Team"), plain_row(2, "Mum", titled=True))
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.send_button()
+        self.assert_mismatch(self.run_reply(), "ambiguous")
+
+    def test_only_the_archived_row_is_the_lists_own(self):
+        # The list's own row is told by the Archived icon: with its unread count too, it takes no place
+        # and the chat below it is listed. A row with words and no icon at the top (a row still loading
+        # with a hidden "Loading…", say, or "Archived" without its icon) may be any chat, the other of
+        # the name too: the top isn't drawn, and nothing is listed.
+        archived = own_row(0)
+        archived["children"][0]["children"].append(el("div", {}, el("span", {"aria-label": "3 unread"}, "3")))
+        loading = el("div", {"role": "row", "style": "transform: translateY(0px)"},
+                     el("div", {}, el("span", {"class": "visually-hidden"}, "Loading\N{HORIZONTAL ELLIPSIS}")))
+        plain = el("div", {"role": "row", "style": "transform: translateY(0px)"}, el("div", {}, el("span", {}, "Archived")))
+        # Nor a chat's row with an icon of the name, its words more than the Archived row's.
+        chat = plain_row(0, "Mum")
+        chat["children"][0]["children"][0]["children"].append(el("span", {"data-icon": "archive-refreshed"}))
+        for top, sent in ((archived, True), (loading, False), (plain, False), (chat, False)):
+            self.setUp()
+            self.draw(top, live_list_row(1, "Work Team"), live_list_row(2, "Mum", marked=True))
+            self.header("Mum")
+            self.add_row(live_row(bare(1), "Hi"))
+            self.add_row(live_row(bare(2), "\U0001F4F7 Photo"))
+            self.send_button()
+            if sent:
+                self.assertEqual(self.run_reply()[:2], ("sent", "name+listed"))
+            else:
+                diag = self.assert_refused(self.run_reply())
+                self.assertEqual((diag["listed"], diag["selected"], diag["selectedName"]), (False, 1, True))
+
+    def test_rows_still_loading_take_their_places(self):
+        # A chat at the top, rows still loading below it, and the "Mum" open at the sixth place: the
+        # rows' height is told by them all, and "Mum" is too far down to be listed. (Told by the
+        # chats' rows alone, it came out five rows high, and "Mum" second.)
+        self.draw(live_list_row(0, "Work Team"), *(own_row(i, "") for i in range(1, 5)),
+                  live_list_row(5, "Mum", marked=True))
+        self.header("Mum")
+        self.add_row(live_row(bare(1), "Hi"))
+        self.add_row(live_row(bare(2), "\U0001F4F7 Photo"))
+        self.send_button()
+        diag = self.assert_refused(self.run_reply())
+        self.assertEqual((diag["listed"], diag["selected"], diag["selectedName"]), (False, 1, True))
+
+    def test_a_label_never_read_as_the_name(self):
+        # The titles gone, a group's label before its name in the title cell: with a direction of its
+        # own, or with none in the cell, neither the label nor the two glued are taken for its name.
+        # Unread, the notified group's names can't be counted. (It was counted under another name:
+        # none of its name, and sent.)
+        said = {"title": "Football Sunday", "body": "See you at 5"}
+        dirs = ('find("pane").querySelectorAll(\'[data-testid="cell-frame-title"] span:not([dir])\')'
+                '.forEach((span) => { span.attributes.dir = "auto"; })')
+        no_dirs = ('find("pane").querySelectorAll(\'[data-testid="cell-frame-title"] [dir]\')'
+                   '.forEach((span) => { delete span.attributes.dir; })')
+        for change in (dirs, no_dirs):
+            self.setUp()
+            self.draw(live_list_row(0, "Football Sunday", label="Sunday league", unread=2),
+                      live_list_row(1, "Work Team"), live_list_row(2, "Ana Souza"))
+            self.run_js(STRIP_TITLES)
+            self.run_js(change)
+            self.header("Football Sunday")
+            self.add_row(row(bare(1), "See you at 5"))
+            self.send_button()
+            self.assert_mismatch(self.run_reply(said), "unnamed")
+            self.assertEqual(self.run_js("pressed").to_int32(), 0)
+            self.assertEqual(self.run_js("nameOf(listRows()[0].row)").to_string(), "")
+
+    def test_the_message_told_again_just_before_send(self):
+        # Told by the message, with one of the name in the list: a second of the name drawn by then
+        # (the list scrolled), and Send isn't pressed.
+        self.draw(live_list_row(0, "Mum", marked=True), live_list_row(1, "Work Team"))
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.later(3000, f'add(find("main").querySelector("#send-slot"), [{json.dumps(self.SEND)}]); '
+                         f'add(find("pane").querySelector("#grid"), [{json.dumps(live_list_row(2, "Mum"))}]); mutate();')
+        self.assertEqual(self.run_reply()[:2], ("left-as-draft", "moved"))
+        self.assertEqual(self.run_js("pressed").to_int32(), 0)
+        # Without it, sent.
+        self.setUp()
+        self.draw(live_list_row(0, "Mum", marked=True), live_list_row(1, "Work Team"))
+        self.header("Mum")
+        self.add_row(row(bare(1), "Did you eat?"))
+        self.send_button()
+        self.assertEqual(self.run_reply()[:2], ("sent", "name+body"))
 
     def test_the_words_without_direction_classes_told_again_just_before_send(self):
         # Told by the words, with one of the name in the list: a second of the name drawn by then
@@ -2636,6 +2900,650 @@ class ReplyWaitTest(unittest.TestCase):
         answer, why, diag, _when = self.run_reply(chat=OTHER)
         self.assertEqual((answer, why), ("mismatch", "other-chat"))
         self.assertEqual(diag["shape"], "a_9@a.a_9a9a")  # its first 40 characters only
+
+
+# ---- The chat list's names, and the canary ------------------------------------------------------
+
+def el(tag, attrs=None, *children):
+    """An element for the fake page: its tag, attributes and children (elements, or words)."""
+    return {"tag": tag, "attrs": dict(attrs or {}),
+            "children": [{"text": child} if isinstance(child, str) else child for child in children]}
+
+
+def live_list_row(place, name, last="See you tomorrow", marked=False, unread=0, sender="", label="", emoji="",
+                  when="10:42", draft=""):
+    """A chat's row in the list as the live page drew it on 2 Nov 2026 (a probe of its structure,
+    no names): a row at its place (translateY, 76 px apart) marked in it when it's the chat open,
+    its picture, its title cell with the name in a titled span[dir=auto] (`emoji` after it as a
+    picture; in some rows a `label` before it), its time, and its second line: the last message in
+    a titled span with its status icon (a group's `sender` before it; or a `draft`), and the unread
+    count."""
+    icon = el("svg", {"viewBox": "0 0 16 11"}, el("title", {}, "msg-dblcheck"))
+    picture = el("div", {}, el("div", {}, el("div", {"data-testid": "chatlist-status-ring"},
+                                              el("div", {"role": "button", "tabindex": "0", "aria-label": "View status"},
+                                                 el("img", {"src": "blob:file:///picture", "alt": "", "draggable": "false",
+                                                            "aria-hidden": "true"})))))
+    shown = [name] + ([el("img", {"alt": emoji, "class": "emoji", "src": "data:image/gif;base64,R0lGOD",
+                                  "draggable": "false", "data-ellipsifiable": "true"})] if emoji else [])
+    title = el("div", {"data-testid": "cell-frame-title"}, *([el("span", {}, label)] if label else []),
+               el("div", {}, el("div", {}, el("span", {"dir": "auto", "title": name + emoji, "class": "x1iyjqo2"}, *shown))))
+    detail = el("div", {"data-testid": "cell-frame-primary-detail"},
+                el("span", {"data-testid": "chat-list-timestamp"}, el("span", {}, when)))
+    if draft:
+        said = [el("span", {"class": "draft"}, "Draft: "), el("span", {"dir": "ltr"}, draft)]
+        told = f"Draft: {draft}"
+    else:
+        said = ([el("div", {}, el("div", {}, el("span", {"dir": "auto"}, sender))), el("span", {}, ":")] if sender else [])
+        said += [el("div", {"data-testid": "chat-msg-symbol"}, el("span", {"aria-hidden": "true"}, icon)),
+                 el("span", {"dir": "ltr"}, last)]
+        told = f"{sender}: {last}" if sender else last
+    preview = el("span", {"data-testid": "last-msg-status", "title": told},
+                 el("div", {}, el("span", {"aria-hidden": "true"}, icon)), *said)
+    count = [el("div", {"aria-hidden": "true"}, el("span", {"data-testid": "icon-unread-count",
+                                                            "aria-label": f"{unread} unread messages"},
+                                                    el("span", {}, str(unread))))] if unread else []
+    badges = el("div", {"role": "gridcell", "aria-colindex": "1"}, el("span", {}, *count), el("span", {}), el("span", {}))
+    second = el("div", {"data-testid": "cell-frame-secondary"}, el("div", {}, preview, badges))
+    container = el("div", {"data-testid": "cell-frame-container"}, picture,
+                   el("div", {}, el("div", {"role": "gridcell", "aria-colindex": "2"}, title, detail), second))
+    return el("div", {"role": "row", "data-testid": f"list-item-{place}",
+                      "style": f"transform: translateY({place * 76}px)"},
+              el("div", {"role": "gridcell", "tabindex": "0"},
+                 el("div", {"tabindex": "-1", "aria-selected": "true" if marked else "false"}, container)))
+
+
+# The owner's list as the live page drew it, 17 chats (made-up names): a name with an emoji
+# picture, groups with a label before the name and a sender before the last message, unread
+# counts, a number wrapped in bidi marks, a draft, and times as WhatsApp shows them.
+LIVE_CHATS = (
+    {"name": "Mum", "emoji": "\N{HEAVY BLACK HEART}", "last": "Did you eat?"},
+    {"name": "Work Team", "sender": "Bo", "last": "Standup at 10", "unread": 3, "label": "Neighbourhood group"},
+    {"name": "Ana Souza", "last": "ok", "when": "Yesterday"},
+    {"name": "\N{LEFT-TO-RIGHT EMBEDDING}+44 7700 900123\N{POP DIRECTIONAL FORMATTING}",
+     "last": "Is this still available?", "when": "Monday"},
+    {"name": "Football Sunday", "sender": "Ana", "last": "See you at 5", "unread": 12, "label": "Sunday league"},
+    {"name": "Dad", "draft": "On my way", "when": "09:15"},
+    {"name": "Landlord", "last": "The boiler is fixed", "when": "31/10/2026"},
+    {"name": "Book Club", "last": "Chapter 4 by Friday", "unread": 1},
+    *({"name": f"Old Friend {i}", "last": f"Catch up soon {i}?"} for i in range(1, 10)),
+)
+# Their names as Natter has them: the emoji put back, the bidi marks dropped.
+LIVE_NAMES = ["Mum\N{HEAVY BLACK HEART}", "Work Team", "Ana Souza", "+44 7700 900123", "Football Sunday", "Dad",
+              "Landlord", "Book Club", *(f"Old Friend {i}" for i in range(1, 10))]
+# Everything else the rows show, none of it ever a name.
+NOT_NAMES = ("Did you eat?", "Bo: Standup at 10", "Standup at 10", "Neighbourhood group", "Sunday league", "ok",
+             "Yesterday", "Monday", "10:42", "09:15", "31/10/2026", "3", "12", "1", "Draft: On my way", "On my way",
+             "Ana: See you at 5", "See you at 5", "Bo", "Ana", ":", "msg-dblcheck", "Catch up soon 1?")
+
+
+def live_rows(start=0, marked="", chats=LIVE_CHATS):
+    """The live list's rows from place `start`, the chat named `marked` marked as the one open."""
+    return [live_list_row(start + i, marked=chat["name"] == marked, **chat) for i, chat in enumerate(chats)]
+
+
+def own_row(place, words="Archived"):
+    """A row of the list's own at `place`: the Archived row (an icon and its word), or with no
+    `words`, a placeholder still loading."""
+    inside = [el("span", {"data-icon": "archived"}, el("svg", {}, el("title", {}, "archived")))]
+    if words:
+        inside.append(el("div", {}, el("span", {}, words)))
+    else:
+        inside = [el("div", {"class": "placeholder"}), el("div", {"class": "placeholder"})]
+    return el("div", {"role": "row", "style": f"transform: translateY({place * 76}px)"}, el("div", {}, *inside))
+
+
+def plain_row(place, name, last="Did you eat?", when="10:45", titled=False):
+    """A chat's row drawn without WhatsApp's cell for one (another kind of row, a redesign under
+    way): its picture, its name (in a titled span only when `titled`), its time and its last
+    message."""
+    shown = el("span", {"dir": "auto", **({"title": name} if titled else {})}, name)
+    return el("div", {"role": "row", "style": f"transform: translateY({place * 76}px)"},
+              el("div", {"role": "gridcell", "tabindex": "0"},
+                 el("div", {"tabindex": "-1", "aria-selected": "false"},
+                    el("div", {}, el("img", {"src": "blob:file:///picture", "alt": "", "aria-hidden": "true"})),
+                    el("div", {}, el("div", {}, shown), el("div", {}, el("span", {}, when))),
+                    el("div", {}, el("span", {"dir": "ltr"}, last)))))
+
+
+def live_page(*rows, title=None):
+    """The page as the live one: #side with the search box, the filter chips and #pane-side (the
+    chat list's grid of `rows`, and the note on encryption below it); `title`: a chat open with that
+    name in its header."""
+    side = chat_list()
+    side["children"][2] = el("div", {"id": "pane-side"},
+                             el("div", {"data-testid": "chat-list"}, el("div", {"role": "grid"}, *rows),
+                                el("div", {"data-testid": "chatlist-e2e-message"},
+                                   el("span", {}, "Your personal messages are end-to-end encrypted"))))
+    return el("div", {}, el("div", {"id": "app"}, side, *([chat_main(title)] if title else [])))
+
+
+# What a redesign might do to the list's rows, run in the page: each takes something away.
+STRIP_TITLES = 'find("pane").querySelectorAll("[title]").forEach((span) => { delete span.attributes.title; })'
+STRIP_NAME_TITLES = ('find("pane").querySelectorAll(\'[data-testid="cell-frame-title"] [title]\')'
+                     '.forEach((span) => { delete span.attributes.title; })')
+STRIP_TITLE_CELLS = ('find("pane").querySelectorAll(\'[data-testid="cell-frame-title"]\')'
+                     '.forEach((cell) => { delete cell.attributes["data-testid"]; })')
+
+OPENING = BRIDGE[BRIDGE.index("  // ---- Opening a chat"):BRIDGE.index("  function press(")]
+CANARY = BRIDGE[BRIDGE.index("  // WhatsApp's link screen"):BRIDGE.index("  // ---- Calls")]
+WATCHING = BRIDGE[BRIDGE.index("  // ---- Watching the page"):BRIDGE.index("  function watch()")]
+# What the bridge has from elsewhere for those: its messages to Natter, kept here (posted), and
+# nothing to do about calls or WhatsApp's look.
+PAGE_STUBS = """
+const posted = [];
+const post = (message) => posted.push(JSON.parse(JSON.stringify(message)));
+function enableCalls() {}
+function reportLook() {}
+"""
+CALLS_JS = (Path(__file__).resolve().parent.parent / "natter" / "calls.js").read_text()
+# The call window's own way to the chat to call (calls.js): its names, and where it presses.
+CALL_ROWS = "\n".join((CALLS_JS[CALLS_JS.index("  const INVISIBLE"):CALLS_JS.index("  function activeChat()")],
+                       CALLS_JS[CALLS_JS.index("  function rowFor("):CALLS_JS.index("  function press(")]))
+CALL_PAGE = 'FakeElement.prototype.getElementById = function (id) { return this.querySelector("#" + id); };'
+
+
+class ChatNamesTest(unittest.TestCase):
+    """The chat list's names as the bridge reads them (nameOf, namedRows, rowFor) and as the call
+    window does (calls.js), run as they are on lists shaped as the live page's, and on what a
+    redesign might leave of them: a name is read from its title cell, or not at all, and never
+    from the last message, a draft, the time or the unread count."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = JavaScriptCore.Context()
+        cls.js.evaluate("\n".join((FAKE_PAGE, WHERE, CHAT_LIST, NAMES, OPENING)), -1)
+        exception = cls.js.get_exception()
+        assert exception is None, exception and exception.get_message()
+        cls.calls = JavaScriptCore.Context()
+        cls.calls.evaluate("\n".join((FAKE_PAGE, CALL_ROWS, CALL_PAGE)), -1)
+        exception = cls.calls.get_exception()
+        assert exception is None, exception and exception.get_message()
+
+    def run_js(self, script, js=None):
+        js = js or self.js
+        value = js.evaluate(script, -1)
+        exception = js.get_exception()
+        self.assertIsNone(exception, exception and exception.get_message())
+        return value
+
+    def load(self, page, *changes):
+        """`page` in both pages, the bridge's and the call window's, with `changes` (STRIP_…) run on it."""
+        for js in (self.js, self.calls):
+            self.run_js(f"load({json.dumps(page)})", js)
+            for change in changes:
+                self.run_js(change.replace('find("pane")', 'document.querySelector("#pane-side")'), js)
+
+    def names(self):
+        """Each of the list's rows' names (nameOf), the outer rows as drawn, "" for none."""
+        return json.loads(self.run_js('JSON.stringify([...find("pane").querySelectorAll(ROWS)]'
+                                      '.filter((row) => !row.parentElement.closest(ROWS)).map(nameOf))').to_string())
+
+    def listed(self):
+        """The chats Natter is told of (chatRows): [name, place]."""
+        return [tuple(entry) for entry in json.loads(self.run_js("JSON.stringify(chatRows())").to_string())]
+
+    def pressed(self, name, js=None):
+        """Where opening the chat `name` would press (rowFor): the row it's in, by its data-testid, or None."""
+        found = self.run_js(f"(() => {{ const at = rowFor({json.dumps(name)}); "
+                            f"return at ? at.closest('[role=\"row\"]').getAttribute('data-testid') : null; }})()",
+                            js).to_string()
+        return None if found in ("null", "undefined") else found
+
+    def assert_no_wrong_names(self, names):
+        for name in names:
+            self.assertNotIn(name, NOT_NAMES)
+
+    def test_the_live_lists_names(self):
+        self.load(live_page(*live_rows()))
+        self.assertEqual(self.names(), LIVE_NAMES)
+        self.assertEqual(self.listed(), [(name, place) for place, name in enumerate(LIVE_NAMES)])
+        for place, name in enumerate(LIVE_NAMES):
+            for js in (self.js, self.calls):
+                self.assertEqual(self.pressed(name, js), f"list-item-{place}", name)
+
+    def test_names_without_their_titles(self):
+        # WhatsApp dropping the titles: the names from the title cells' words, the emoji put back,
+        # a label before the name (a group's) left out.
+        self.load(live_page(*live_rows()), STRIP_TITLES)
+        self.assertEqual(self.names(), LIVE_NAMES)
+        for place, name in enumerate(LIVE_NAMES):
+            for js in (self.js, self.calls):
+                self.assertEqual(self.pressed(name, js), f"list-item-{place}", name)
+
+    def test_never_the_last_message(self):
+        # The title cell gone and the names untitled, the last message still titled: no names at all,
+        # and no chat is opened by its last message's words.
+        self.load(live_page(*live_rows()), STRIP_NAME_TITLES, STRIP_TITLE_CELLS)
+        self.assertEqual(self.names(), [""] * len(LIVE_NAMES))
+        self.assertEqual(self.listed(), [])
+        for words in ("Did you eat?", "Bo: Standup at 10", "Draft: On my way", "Is this still available?"):
+            for js in (self.js, self.calls):
+                self.assertIsNone(self.pressed(words, js), words)
+        # The title cell gone, the names still titled: the name where nothing comes before it in the
+        # row; none where a label does. Never the last message.
+        self.load(live_page(*live_rows()), STRIP_TITLE_CELLS)
+        names = self.names()
+        self.assertEqual([name for name in names if name], [name for name, chat in zip(LIVE_NAMES, LIVE_CHATS)
+                                                           if not chat.get("label")])
+        self.assert_no_wrong_names(names)
+
+    def test_a_list_without_testids(self):
+        # Rows with none of WhatsApp's marks: a titled name first is read; a titled span after other
+        # words never is (the last message, after an untitled name; a name after its time).
+        def plain(place, name, last, titled=True, time_first=False):
+            parts = [el("span", {"dir": "auto", **({"title": name} if titled else {})}, name), el("span", {}, "10:42")]
+            if time_first:
+                parts.reverse()
+            return el("div", {"role": "listitem", "style": f"transform: translateY({place * 72}px)"},
+                      el("div", {}, *parts), el("div", {}, el("span", {"title": last}, last), el("span", {}, "2")))
+        self.load(live_page(plain(0, "Mum", "Did you eat?"), plain(1, "Work Team", "Standup at 10", titled=False),
+                            plain(2, "Dad", "On my way", time_first=True)))
+        self.assertEqual(self.names(), ["Mum", "", ""])
+        self.assertEqual(self.listed(), [("Mum", 0)])
+        self.assertIsNone(self.pressed("Standup at 10"))
+        self.assertIsNone(self.pressed("Standup at 10", self.calls))
+
+    def test_what_a_name_never_is(self):
+        # Read from words, never a time, a date or a bare count; a title cell's titled span is taken
+        # as it is (a group named for a year).
+        def cell(place, words, titled=False):
+            span = el("span", {"dir": "auto", **({"title": words} if titled else {})}, words)
+            title = el("div", {"data-testid": "cell-frame-title"}, span)
+            return el("div", {"role": "row", "style": f"transform: translateY({place * 76}px)"},
+                      el("div", {"data-testid": "cell-frame-container"}, title))
+        words = ("12", "10:42", "9.05 pm", "31/10/2026", "999+")
+        self.load(live_page(*(cell(i, text) for i, text in enumerate(words)), cell(5, "1975", titled=True)))
+        self.assertEqual(self.names(), [""] * len(words) + ["1975"])
+        # Nor in a row with no title cell: a titled time first isn't a name.
+        self.load(live_page(el("div", {"role": "row"}, el("span", {"title": "10:42"}, "10:42"),
+                               el("span", {"title": "Did you eat?"}, "Did you eat?"))))
+        self.assertEqual(self.names(), [""])
+
+    def call_names(self):
+        """Each of the list's rows' names as the call window reads them (calls.js rowName), "" for none."""
+        return json.loads(self.run_js('JSON.stringify([...document.querySelector("#pane-side").querySelectorAll(ROWS)]'
+                                      '.filter((row) => !row.parentElement.closest(ROWS))'
+                                      '.map((row) => { const found = rowName(row); return found ? found[1] : ""; }))',
+                                      self.calls).to_string())
+
+    def test_a_time_in_other_digits(self):
+        # A time or a count in any script's digits is no name either: Arabic-Indic, say.
+        time, count = "١٠:٤٢", "١٢"
+        self.load(live_page(el("div", {"role": "row"}, el("span", {"title": time}, time),
+                               el("span", {"title": "Did you eat?"}, "Did you eat?")),
+                            el("div", {"role": "row"}, el("span", {"title": count}, count),
+                               el("span", {"title": "See you"}, "See you"))))
+        self.assertEqual(self.names(), ["", ""])
+        self.assertEqual(self.call_names(), ["", ""])
+
+    def test_a_title_cell_around_both_lines(self):
+        # The title cell's mark moved up to the box with both lines and the names untitled: the titled
+        # span in it is the last message's, never taken for the name, by the bridge or the call window,
+        # and no chat is told to Natter. With no titles at all, the words read are never the rest.
+        around = ('find("pane").querySelectorAll(\'[data-testid="cell-frame-title"]\').forEach((cell) => { '
+                  'delete cell.attributes["data-testid"]; }); '
+                  'find("pane").querySelectorAll(\'[aria-colindex="2"]\').forEach((cell) => { '
+                  'cell.parentElement.attributes["data-testid"] = "cell-frame-title"; })')
+        self.load(live_page(*live_rows()), STRIP_NAME_TITLES, around)
+        self.assertEqual(self.names(), [""] * len(LIVE_NAMES))
+        self.assertEqual(self.call_names(), [""] * len(LIVE_NAMES))
+        self.assertEqual(self.listed(), [])
+        for words in ("Did you eat?", "Bo: Standup at 10", "Draft: On my way"):
+            for js in (self.js, self.calls):
+                self.assertIsNone(self.pressed(words, js), words)
+        self.load(live_page(*live_rows()), STRIP_TITLES, around)
+        self.assert_no_wrong_names(self.names())
+        self.assert_no_wrong_names(self.call_names())
+
+    def test_an_emoji_name_before_the_last_message(self):
+        # None of WhatsApp's marks, the names untitled and an emoji alone (its picture), no time, the
+        # last message titled: the emoji is words before it, so the last message is never the name,
+        # nor told to Natter (an unread count making the rows a chat's).
+        def bare_row(place, emoji):
+            said = f"PIN is 447{place}, delete this"
+            return el("div", {"role": "row", "style": f"transform: translateY({place * 76}px)"},
+                      el("div", {}, el("img", {"src": "blob:file:///picture", "alt": "", "aria-hidden": "true"})),
+                      el("div", {}, el("span", {"dir": "auto"}, el("img", {"alt": emoji, "class": "emoji",
+                                                                          "src": "data:image/gif;base64,R0lGOD"}))),
+                      el("div", {}, el("span", {"title": said}, el("span", {"dir": "ltr"}, said)), el("span", {}, "2")))
+        self.load(live_page(*(bare_row(i, emoji) for i, emoji in enumerate(("\N{PARTY POPPER}", "\N{SUN WITH FACE}",
+                                                                            "\N{DOG FACE}")))))
+        self.assertEqual(self.names(), ["", "", ""])
+        self.assertEqual(self.call_names(), ["", "", ""])
+        self.assertEqual(self.listed(), [])
+
+    def test_a_label_before_the_name_without_titles(self):
+        # The titles gone, a group's label before its name in the title cell: with no direction in the
+        # cell its words are the label's and the name's, glued; with one on the label as on the name,
+        # two places with words. Neither is taken for the name; a name alone in its cell still is.
+        no_dirs = ('find("pane").querySelectorAll(\'[data-testid="cell-frame-title"] [dir]\')'
+                   '.forEach((span) => { delete span.attributes.dir; })')
+        dirs = ('find("pane").querySelectorAll(\'[data-testid="cell-frame-title"] span:not([dir])\')'
+                '.forEach((span) => { span.attributes.dir = "auto"; })')
+        names = [("" if chat.get("label") else name) for name, chat in zip(LIVE_NAMES, LIVE_CHATS)]
+        for change in (no_dirs, dirs):
+            self.load(live_page(*live_rows()), STRIP_TITLES, change)
+            self.assertEqual(self.names(), names)
+            self.assertEqual(self.call_names(), names)
+
+    def test_a_communitys_name_over_a_groups(self):
+        # The title cell's mark gone, a group's row with its community's name (titled, WhatsApp's
+        # subgroup-identity) before its own: the community's isn't taken for the group's.
+        def subgroup(place, name, community):
+            tree = live_list_row(place, name, last="See you there")
+            container = tree["children"][0]["children"][0]["children"][0]
+            container["children"].insert(1, el("div", {"data-testid": "subgroup-identity"},
+                                               el("span", {"dir": "auto", "title": community}, community)))
+            return tree
+        self.load(live_page(live_list_row(0, "Parents Community", last="Welcome"),
+                            subgroup(1, "Class 3B", "Parents Community"), *live_rows(2, chats=LIVE_CHATS[1:3])),
+                  STRIP_TITLE_CELLS)
+        self.assertEqual(self.names(), ["Parents Community", "", "", "Ana Souza"])
+        self.assertEqual(self.call_names(), ["Parents Community", "", "", "Ana Souza"])
+        for js in (self.js, self.calls):
+            self.assertEqual(self.pressed("Parents Community", js), "list-item-0")
+
+    def test_rows_of_the_lists_own_arent_chats(self):
+        # The Archived row, even with its word titled, and placeholders still loading: not chats, so
+        # never in Natter's list; the chats after them in their places.
+        archived = own_row(0)
+        archived["children"][0]["children"][1]["children"][0]["attrs"]["title"] = "Archived"
+        self.load(live_page(archived, *live_rows(1, chats=LIVE_CHATS[:3]), own_row(4, "")))
+        self.assertEqual(self.listed(), [(name, place) for place, name in enumerate(LIVE_NAMES[:3], 1)])
+
+    def test_the_mock_pages_rows(self):
+        # tests/mock-whatsapp.html's: the name in the title cell, a titled "secret last message" after it.
+        markup = re.search(r"row\.innerHTML = `(.*?)`;", MOCK, re.S)[1].replace("${name}", "Mum")
+        row_tree = {"tag": "div", "attrs": {"role": "listitem", "style": "transform: translateY(0px)"},
+                    "children": _Markup(markup).root["children"]}
+        self.load(live_page(row_tree))
+        self.assertEqual(self.listed(), [("Mum", 0)])
+        self.assertIsNone(self.pressed("secret last message from Mum"))
+
+
+class CanaryTest(unittest.TestCase):
+    """The bridge's canary, run as it is (with the scan that starts it and posts the chat list) on
+    lists shaped as the live page's: what it judges of the chat names and when it tells Natter.
+    Placeholders, a row of the list's own and a moment's loading are never called a layout change;
+    names that are the last message's, or that aren't the open chat's, are."""
+
+    def setUp(self):
+        self.js = JavaScriptCore.Context()
+        self.run_js("\n".join((FAKE_PAGE, FAKE_RUNTIME, WHERE, CHAT_LIST, NAMES, CANARY, PAGE_STUBS, WATCHING)))
+
+    def run_js(self, script):
+        value = self.js.evaluate(script, -1)
+        exception = self.js.get_exception()
+        self.assertIsNone(exception, exception and exception.get_message())
+        return value
+
+    def up(self, page, *changes):
+        """`page` loaded, `changes` run on it, and the bridge's first scan: the chat list is up."""
+        self.run_js(f"load({json.dumps(page)})")
+        for change in changes:
+            self.run_js(change)
+        self.run_js("scan()")
+
+    def until(self, ms):
+        while self.run_js(f"step({ms})").to_boolean():
+            pass
+
+    def told(self, kind="canary"):
+        return [message for message in json.loads(self.run_js("JSON.stringify(posted)").to_string())
+                if message["type"] == kind]
+
+    def judged(self, message):
+        """What the canary said of the list's rows and names: (found, missing), those keys only."""
+        keys = ("row", "row-name")
+        return ([key for key in message["found"] if key in keys], [key for key in message["missing"] if key in keys])
+
+    def test_the_live_list_is_found(self):
+        self.up(live_page(*live_rows()))
+        self.until(10000)
+        [told] = self.told()
+        self.assertEqual(told["missing"], [])
+        self.assertEqual(self.judged(told), (["row", "row-name"], []))
+
+    def test_the_counts(self):
+        # Numbers only, of all the rows drawn (the names judged on the first twelve): the list's rows,
+        # the chats' among them, how many have a name.
+        self.up(live_page(*live_rows()))
+        self.until(10000)
+        [told] = self.told()
+        self.assertEqual((told["rows"], told["chatLike"], told["named"]), (17, 17, 17))
+        self.assertEqual(set(told), {"type", "found", "missing", "rows", "chatLike", "named"})
+        for name in LIVE_NAMES + list(NOT_NAMES):
+            if len(name) > 2:
+                self.assertNotIn(name, json.dumps(told, ensure_ascii=False))
+
+    def test_placeholders_are_never_missing(self):
+        # The list still loading at every look: neither found nor missing, told once at the last look.
+        self.up(live_page(*(own_row(i, "") for i in range(8))))
+        self.until(119999)
+        self.assertEqual(self.told(), [])
+        self.until(300000)
+        [told] = self.told()
+        self.assertEqual(self.judged(told), ([], []))
+        self.assertEqual((told["rows"], told["chatLike"], told["named"]), (8, 0, 0))
+        # Loaded by the second look: told then, found.
+        self.setUp()
+        self.up(live_page(*(own_row(i, "") for i in range(8))))
+        self.until(10000)
+        self.assertEqual(self.told(), [])
+        self.run_js(f'find("pane").querySelector(\'[role="grid"]\').childNodes = []; '
+                    f'add(find("pane").querySelector(\'[role="grid"]\'), {json.dumps(live_rows())})')
+        self.until(30000)
+        [told] = self.told()
+        self.assertEqual(self.judged(told), (["row", "row-name"], []))
+        self.until(300000)
+        self.assertEqual(len(self.told()), 1)
+
+    def test_a_row_of_the_lists_own_first(self):
+        # The Archived row at the top (and first in the page), the chats below it: found.
+        self.up(live_page(own_row(0), *live_rows(1)))
+        self.until(10000)
+        [told] = self.told()
+        self.assertEqual(self.judged(told), (["row", "row-name"], []))
+        self.assertEqual((told["rows"], told["chatLike"], told["named"]), (18, 17, 17))
+
+    def test_names_from_words_without_titles(self):
+        self.up(live_page(*live_rows()), STRIP_TITLES)
+        self.until(10000)
+        [told] = self.told()
+        self.assertEqual(self.judged(told), (["row", "row-name"], []))
+        [chats] = self.told("chats")
+        self.assertEqual([name for name, _place in chats["rows"]], LIVE_NAMES)
+
+    def test_the_last_message_is_never_a_name(self):
+        # The title cell gone and the names untitled: the last message, still titled, isn't taken for
+        # them. Missing, at the last look, and no chats told.
+        self.up(live_page(*live_rows()), STRIP_NAME_TITLES, STRIP_TITLE_CELLS)
+        self.until(119999)
+        self.assertEqual(self.told(), [])
+        self.until(300000)
+        [told] = self.told()
+        self.assertEqual(self.judged(told), (["row"], ["row-name"]))
+        self.assertEqual((told["rows"], told["chatLike"], told["named"]), (17, 17, 0))
+        self.assertEqual(self.told("chats"), [])
+
+    def test_the_open_chats_row_has_its_headers_name(self):
+        # The list's mark on the open chat's row, read as another name than its header's: misread.
+        rows = live_rows(marked="Ana Souza")
+        self.up(live_page(*rows, title="Ana"))
+        self.until(300000)
+        [told] = self.told()
+        self.assertEqual(self.judged(told), (["row"], ["row-name"]))
+        self.assertEqual(self.told("chats"), [])  # nor told to Natter
+        # The same name as names are compared (bidi marks, U+FE0F), or the open chat's row not drawn
+        # or not marked: found.
+        for title, marked in (("+44 7700 900123", LIVE_CHATS[3]["name"]),
+                              ("Mum\N{HEAVY BLACK HEART}\N{VARIATION SELECTOR-16}", "Mum"), ("Ana", "")):
+            self.setUp()
+            self.up(live_page(*live_rows(marked=marked), title=title))
+            self.until(10000)
+            [told] = self.told()
+            self.assertEqual(self.judged(told), (["row", "row-name"], []), title)
+            self.assertEqual(len(self.told("chats")), 1, title)
+
+    def test_misread_names_never_reach_natter(self):
+        # Not while the open chat's row reads another name; told once it doesn't, until the canary
+        # has found it so on the page: then never again on that page.
+        self.up(live_page(*live_rows(marked="Ana Souza"), title="Ana"))
+        self.assertEqual(self.told("chats"), [])
+        self.run_js(f'setHeader({json.dumps(header("Ana Souza"))}); scan()')
+        self.assertEqual(len(self.told("chats")), 1)
+        self.setUp()
+        self.up(live_page(*live_rows(marked="Ana Souza"), title="Ana"))
+        self.until(300000)
+        self.assertEqual(self.judged(self.told()[0]), (["row"], ["row-name"]))
+        self.run_js(f'setHeader({json.dumps(header("Ana Souza"))}); scan()')
+        self.assertEqual(self.told("chats"), [])
+
+    def test_when_it_tells(self):
+        # All found at the first look: told then, once.
+        self.up(live_page(*live_rows()))
+        self.until(9999)
+        self.assertEqual(self.told(), [])
+        self.until(10000)
+        self.assertEqual(len(self.told()), 1)
+        self.until(300000)
+        self.assertEqual(len(self.told()), 1)
+        # Something missing at the first look and back by the second: told at the second, all found.
+        self.setUp()
+        self.up(live_page(*live_rows()))
+        self.run_js('find("search").remove()')
+        self.until(10000)
+        self.assertEqual(self.told(), [])
+        self.run_js(f'add(find("side"), [{json.dumps(chat_list()["children"][0])}])')
+        self.until(30000)
+        [told] = self.told()
+        self.assertEqual(told["missing"], [])
+        self.assertIn("search", told["found"])
+        # Missing at every look: told at the last, with what's missing.
+        self.setUp()
+        self.up(live_page(*live_rows()))
+        self.run_js('find("search").remove()')
+        self.until(119999)
+        self.assertEqual(self.told(), [])
+        self.until(300000)
+        [told] = self.told()
+        self.assertEqual(told["missing"], ["search"])
+
+    def test_once_a_page(self):
+        # The list going and coming back on the same page: still one look, one message.
+        self.up(live_page(*live_rows()))
+        self.run_js('const pane = find("pane"); const home = pane.parentElement; pane.remove(); scan(); '
+                    'home.childNodes.push(pane); scan();')
+        self.assertEqual([message["ready"] for message in self.told("ready")], [True, False, True])
+        self.until(300000)
+        self.assertEqual(len(self.told()), 1)
+
+    def regrid(self, rows, *changes):
+        """The list's rows from now on: `rows`, with `changes` (STRIP_…) run on them."""
+        self.run_js(f'find("pane").querySelector(\'[role="grid"]\').childNodes = []; '
+                    f'add(find("pane").querySelector(\'[role="grid"]\'), {json.dumps(rows)})')
+        for change in changes:
+            self.run_js(change)
+
+    def test_the_list_gone_at_the_last_look(self):
+        # The list up at the first looks and gone at the last (WhatsApp between screens: its own
+        # loading, in use in another window): told as last seen, and never the link screen missing.
+        # A list that can't be judged (empty, or the Archived row and one chat): nothing missing.
+        for rows in ([], [own_row(0), *live_rows(1, chats=LIVE_CHATS[:1])]):
+            self.setUp()
+            self.up(live_page(*rows))
+            self.until(110000)
+            self.run_js('find("pane").remove(); scan()')
+            self.until(300000)
+            [told] = self.told()
+            self.assertEqual(told["missing"], [])
+            self.assertIn("pane", told["found"])
+        # Its names missing at the first looks: still missing.
+        self.setUp()
+        self.up(live_page(*live_rows()), STRIP_NAME_TITLES, STRIP_TITLE_CELLS)
+        self.until(110000)
+        self.run_js('find("pane").remove(); scan()')
+        self.until(300000)
+        [told] = self.told()
+        self.assertEqual((told["missing"], told["rows"], told["chatLike"], told["named"]), (["row-name"], 17, 17, 0))
+
+    def test_names_missing_and_too_few_rows_at_the_last_look(self):
+        # The names missing at the first looks, and too few rows to judge at the last (a search typed,
+        # one chat found): still missing, as last judged.
+        self.up(live_page(*live_rows()), STRIP_NAME_TITLES, STRIP_TITLE_CELLS)
+        self.until(100000)
+        self.regrid([*live_rows(chats=LIVE_CHATS[:1]), el("div", {"role": "row"}, el("div", {}, el("span", {}, "Chats")))],
+                    STRIP_NAME_TITLES, STRIP_TITLE_CELLS)
+        self.run_js('add(find("search"), [{text: "M"}])')
+        self.until(300000)
+        [told] = self.told()
+        self.assertEqual(self.judged(told), (["row"], ["row-name"]))
+        self.assertEqual((told["rows"], told["chatLike"], told["named"]), (17, 17, 0))
+
+    def test_a_chat_being_switched_to_at_the_last_look(self):
+        # The list still loading at the first looks; at the last, a chat being switched to: its row
+        # marked, its header not drawn yet. Looked at once more a moment on: all found, and the chat
+        # list told to Natter once the header is drawn.
+        self.up(live_page(*(own_row(i, "") for i in range(8)), title="Ana Souza"))
+        self.until(100000)
+        self.regrid(live_rows(marked="Dad"))
+        self.until(119800)
+        self.run_js(f'setTimeout(() => {{ setHeader({json.dumps(header("Dad"))}); scan(); }}, 400)')
+        self.until(400000)
+        [told] = self.told()
+        self.assertEqual(told["missing"], [])
+        self.assertEqual(self.judged(told), (["row", "row-name"], []))
+        self.assertEqual(len(self.told("chats")), 1)
+        # The list gone by then (WhatsApp between screens): what wasn't seen again isn't told.
+        self.setUp()
+        self.up(live_page(*(own_row(i, "") for i in range(8)), title="Ana Souza"))
+        self.until(100000)
+        self.regrid(live_rows(marked="Dad"))
+        self.until(122000)
+        self.run_js('find("pane").remove(); scan()')
+        self.until(400000)
+        [told] = self.told()
+        self.assertEqual(told["missing"], [])
+        self.assertEqual(self.judged(told), ([], []))
+
+    def test_the_open_chats_row_by_any_name_its_header_shows(self):
+        # The header's title one name and its words another, as a reply told by the list takes either:
+        # the open chat's row with its words' name isn't misread.
+        tree = header("Ana Souza")
+        tree["children"][0]["attrs"]["title"] = "Ana"
+        self.up(live_page(*live_rows(marked="Ana Souza"), title="Ana Souza"))
+        self.run_js(f"setHeader({json.dumps(tree)})")
+        self.until(300000)
+        [told] = self.told()
+        self.assertEqual(self.judged(told), (["row", "row-name"], []))
+
+    def test_lone_rows_of_the_lists_own(self):
+        # No chats drawn, only the Archived row with its unread count (every chat archived), or a
+        # banner of two lines (no chat yet): neither found nor missing.
+        archived = own_row(0)
+        archived["children"][0]["children"].append(el("div", {}, el("span", {"aria-label": "3 unread"}, "3")))
+        banner = el("div", {"role": "row", "style": "transform: translateY(0px)"},
+                    el("div", {}, el("span", {}, "Turn on notifications")),
+                    el("div", {}, el("span", {}, "Get notified of new messages")))
+        for row_tree in (archived, banner):
+            self.setUp()
+            self.up(live_page(row_tree))
+            self.until(300000)
+            [told] = self.told()
+            self.assertEqual(self.judged(told), ([], []))
+
+    def test_rows_loading_with_the_cell_for_a_chat(self):
+        # Rows still loading drawn with WhatsApp's cell for a chat but no words yet, for two minutes:
+        # not judged, never missing.
+        def loading(place):
+            return el("div", {"role": "row", "style": f"transform: translateY({place * 76}px)"},
+                      el("div", {"data-testid": "cell-frame-container"}, el("div", {"class": "bar"}),
+                         el("div", {"data-testid": "cell-frame-title"}, el("div", {"class": "bar"}))))
+        self.up(live_page(*(loading(i) for i in range(10))))
+        self.until(300000)
+        [told] = self.told()
+        self.assertEqual(self.judged(told), ([], []))
+        self.assertEqual((told["rows"], told["chatLike"], told["named"]), (10, 0, 0))
 
 
 if __name__ == "__main__":

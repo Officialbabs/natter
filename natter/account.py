@@ -173,6 +173,9 @@ MEMORY_AGAIN = 10 * 60
 NAME_LIMIT = 200  # a chat's name, a notification's title
 BODY_LIMIT = 2000
 ROWS_LIMIT = 200
+# The canary's counts of the chat list's rows (bridge.js canary), as sent and as the log names them.
+CANARY_COUNTS = (("rows", "rows", "rows"), ("chatLike", "chat_like", "chat-like"), ("named", "named", "named"))
+COUNT_LIMIT = 999  # a count past this is told as this
 ICON_TYPES = ("image/jpeg", "image/png", "image/webp")
 ICON_LIMIT = 2_000_000  # bytes
 # Bidi controls and invisible marks, dropped from all of it: they can disguise a name
@@ -320,13 +323,22 @@ def parse_message(message) -> Optional[dict]:
     if kind == "recording":
         return {"type": kind, "on": message["on"]} if isinstance(message.get("on"), bool) else None
     if kind == "canary":
-        # The bridge's selector check: which WHERE entries matched WhatsApp's live page.
+        # The bridge's selector check: which WHERE entries matched WhatsApp's live page, and the
+        # chat list's counts, numbers only: its rows drawn, the chats' among them, how many of those
+        # had a name. A bridge from before them sends none.
         found, missing = message.get("found"), message.get("missing")
         if not (isinstance(found, list) and isinstance(missing, list)):
             return None
         if not all(isinstance(key, str) and 0 < len(key) <= 24 for key in found + missing):
             return None
-        return {"type": kind, "found": found[:16], "missing": missing[:16]}
+        counts = {}
+        for sent, key, _label in CANARY_COUNTS:
+            if sent in message:
+                count = message[sent]
+                if type(count) is not int or count < 0:
+                    return None
+                counts[key] = min(count, COUNT_LIMIT)
+        return {"type": kind, "found": found[:16], "missing": missing[:16], **counts}
     if kind == "look":
         # WhatsApp's own look, as the bridge reads it (reportLook): whether its colour names are
         # there, whether they're dark, whether its dark class is on, and the style WebKit tells it.
@@ -342,6 +354,13 @@ def parse_message(message) -> Optional[dict]:
             return None
         return {"type": kind, "url": url, "name": name}
     return None
+
+
+def canary_counts(message: dict) -> str:
+    """The canary's counts (parse_message) as its log line has them: " (rows 17, chat-like 17,
+    named 0)", or "" without any."""
+    told = [f"{label} {message[key]}" for _sent, key, label in CANARY_COUNTS if key in message]
+    return f" ({', '.join(told)})" if told else ""
 
 
 def media_gstreamer_version() -> str:
@@ -1687,12 +1706,17 @@ class Account(GObject.Object):
             if self._seen_chats(message["rows"]):
                 self.emit("chats-changed")
         elif kind == "canary":
+            counts = canary_counts(message)
             if message["missing"]:
                 print(f"natter: {self.name}: WhatsApp's page has changed: {', '.join(message['missing'])} "
-                      f"not found; what relies on them is off until {NAME} catches up", flush=True)
+                      f"not found{counts}; what relies on them is off until {NAME} catches up", flush=True)
                 self.app.page_changed(message["missing"])
+            elif message.get("named", 0) < message.get("chat_like", 0):
+                # Most chats' names read, not all: the others are left out of the chat list, and
+                # replies that count the chats of a name stop while they're drawn. Said, not notified.
+                print(f"natter: {self.name}: canary: some chats' names can't be read{counts}", flush=True)
             elif GLib.getenv("NATTER_DEBUG"):
-                print(f"natter: {self.name}: canary: all of WhatsApp's page found", flush=True)
+                print(f"natter: {self.name}: canary: all of WhatsApp's page found{counts}", flush=True)
         elif kind == "active":
             changed = message["name"] != self.active_chat
             self.active_chat = message["name"]
