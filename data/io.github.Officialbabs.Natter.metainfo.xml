@@ -81,6 +81,18 @@
   </content_rating>
 
   <releases>
+    <release version="0.1.9" date="2026-11-02">
+      <description>
+        <p>No false warnings that WhatsApp changed its layout, and safer chat names and replies.</p>
+        <ul>
+          <li>The check for WhatsApp layout changes looks at the chat list's first dozen chats, leaves out rows still loading, and looks again before warning, so a page reconnecting no longer brings a false notice</li>
+          <li>A chat's name is read only from its own place in its row, never from its last message, so a message can't reach the chat list or desktop search as a name</li>
+          <li>A reply to a chat its notification's click didn't open is refused while any chat's name in the list can't be read, as two chats of that name couldn't be told apart</li>
+          <li>Just before Send, a reply checks again that no second chat of that name has appeared</li>
+          <li>The log line for a layout change gives the chat list's counts, never a name</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.8" date="2026-10-29">
       <description>
         <p>Downloads that save, and a notice before the page grows too big.</p>
