@@ -188,13 +188,14 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>No false warnings that WhatsApp changed its layout, and safer chat names and replies.</p>"
+RELEASE_NOTES = ("<p>Says when a new version is out, and updates itself in place.</p>"
                  "<ul>"
-                 "<li>The check for WhatsApp layout changes looks at the chat list's first dozen chats, leaves out rows still loading, and looks again before warning, so a page reconnecting no longer brings a false notice</li>"
-                 "<li>A chat's name is read only from its own place in its row, never from its last message, so a message can't reach the chat list or desktop search as a name</li>"
-                 "<li>A reply to a chat its notification's click didn't open is refused while any chat's name in the list can't be read, as two chats of that name couldn't be told apart</li>"
-                 "<li>Just before Send, a reply checks again that no second chat of that name has appeared</li>"
-                 "<li>The log line for a layout change gives the chat list's counts, never a name</li>"
+                 "<li>Once a day it asks GitHub whether a newer release is out, never while offline, during a call or while WhatsApp loads; the request carries no cookies, ids or version</li>"
+                 "<li>A new version shows in the window's banner, the tray menu and Preferences, and as one notification when the window is hidden; Skip This Version keeps it quiet until the next one</li>"
+                 "<li>Installed with get.sh, Update downloads and checks the new version while the app still runs, then closes, installs it and opens again, and puts the old version back if installing fails or the new one won't start</li>"
+                 "<li>Update holds off during a call or while a voice message is recorded, lets a reply being sent finish, and asks first about replies not yet sent</li>"
+                 "<li>Installed another way (the Flatpak, a git checkout, a package), Details gives the way to update it</li>"
+                 "<li>Check for Updates in Preferences turns the daily check off, and packages can be built with it off</li>"
                  "</ul>")
 
 
