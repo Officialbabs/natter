@@ -188,14 +188,13 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>Says when a new version is out, and updates itself in place.</p>"
+RELEASE_NOTES = ("<p>The media player a voice message leaves in the desktop's media controls goes once nothing plays.</p>"
                  "<ul>"
-                 "<li>Once a day it asks GitHub whether a newer release is out, never while offline, during a call or while WhatsApp loads; the request carries no cookies, ids or version</li>"
-                 "<li>A new version shows in the window's banner, the tray menu and Preferences, and as one notification when the window is hidden; Skip This Version keeps it quiet until the next one</li>"
-                 "<li>Installed with get.sh, Update downloads and checks the new version while the app still runs, then closes, installs it and opens again, and puts the old version back if installing fails or the new one won't start</li>"
-                 "<li>Update holds off during a call or while a voice message is recorded, lets a reply being sent finish, and asks first about replies not yet sent</li>"
-                 "<li>Installed another way (the Flatpak, a git checkout, a package), Details gives the way to update it</li>"
-                 "<li>Check for Updates in Preferences turns the daily check off, and packages can be built with it off</li>"
+                 "<li>After a voice message, tone or ringtone ends, its player leaves the desktop's media controls within 2 seconds</li>"
+                 "<li>One paused in the window keeps its player 2 minutes, to carry on from those controls; one paused from outside, from those controls or by another app, 30 minutes</li>"
+                 "<li>Nothing goes while anything else plays, a microphone is on or a call is: it waits for the end</li>"
+                 "<li>A sound that failed to load no longer counts as playing, so the page's audio rests as it should</li>"
+                 "<li>The log's audio sets count the sounds still playing</li>"
                  "</ul>")
 
 
