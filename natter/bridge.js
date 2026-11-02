@@ -128,6 +128,7 @@
   const streams = new Set();  // microphone streams (voice notes, calls) feeding a context
   const elements = new Set();  // <audio>/<video> played through a context
   const routed = new WeakMap();  // each of those → the context it plays through
+  const started = new Set();  // elements the page started, until they stop: WhatsApp's own `new Audio()`s too
   let lastStart = 0;
   const IDLE_MS = 30000;  // long enough that a burst of message sounds doesn't cycle the pipeline
 
@@ -157,13 +158,22 @@
     return streams.size;
   }
 
+  // A media element done playing for now: paused, ended, or failed to load (WebKit fires no
+  // "pause" then, and paused stays false).
+  const stopped = (m) => m.paused || m.ended || Boolean(m.error);
+
   function mediaPlaying() {
     // Elements no longer in the page and done playing go: each holds its context and a
     // GStreamer player with its decoded media.
     elements.forEach((element) => {
-      if (!element.isConnected && (element.paused || element.ended)) elements.delete(element);
+      if (!element.isConnected && stopped(element)) elements.delete(element);
     });
-    return [...elements, ...document.querySelectorAll("audio, video")].some((m) => !m.paused && !m.ended);
+    return [...elements, ...document.querySelectorAll("audio, video")].some((m) => !stopped(m));
+  }
+
+  function playingStarted() {
+    started.forEach((element) => { if (stopped(element)) started.delete(element); });
+    return started.size;
   }
 
   // A call's sound goes through audio worklets, which have no start or end to watch: while
@@ -416,13 +426,121 @@
         return result;
       };
     }
+    // WebKitGTK puts up a media player (MPRIS) in the desktop's media controls for an <audio> as
+    // it plays, and takes it down only once the element is gone or another sound in the page
+    // starts: only the element that last began to play has one (one play()ed before its data
+    // came begins when it comes, which play()'s promise tells). WhatsApp keeps its elements to play
+    // again, so the last voice note's or tone's player stayed there, paused, for good. So once that
+    // element stops and nothing else plays, no microphone is on and no call is, a context's
+    // resume() counts as a sound starting, which takes the player down, and plays nothing: a
+    // running context goes on as it was, one Natter rested rests again. How soon:
+    // - RELEASE_ENDED_MS after it ends, a looping one (a ringtone) is paused, or its source changes;
+    // - RELEASE_PAUSED_MS after a pause made in the page (the person's click or key just before,
+    //   not typing in a text box), to carry on from the desktop's controls;
+    // - RELEASE_HELD_MS after a pause from outside it: those controls, or an app that paused it for
+    //   its own sound and plays it again after (Handset does, for a phone, within 30 minutes).
+    // One due while anything else plays, a microphone is on or a call is (a ringtone paused for the
+    // call) is owed, and tried again with the idle check. A context the page suspended itself is
+    // left alone; with none to resume, the player stays.
+    const RELEASE_ENDED_MS = 2000;
+    const RELEASE_PAUSED_MS = 120000;
+    const RELEASE_HELD_MS = 30 * 60000;
+    const INPUT_MS = 1500;  // a pause this soon after the person's click or key is the page's
+    const stopping = new WeakSet();  // elements whose stopping is watched
+    let primary = null;  // WeakRef: the element that last began to play, the one with a player
+    let releaseRound = 0;  // a later start or stop makes an earlier timer count for nothing
+    let owed = false;  // a release came due while something was on
+    let lastInput = -Infinity;
+    if (typeof window.addEventListener === "function") {
+      for (const type of ["pointerup", "click", "keydown"]) {
+        // Only the person's: Natter's own presses (press()) aren't trusted, and typing in the
+        // message box or search pauses nothing.
+        window.addEventListener(type, (event) => {
+          const target = event.target;
+          if (event.isTrusted && !(target && (target.isContentEditable || /^(INPUT|TEXTAREA)$/.test(target.tagName)))) {
+            lastInput = performance.now();
+          }
+        }, true);
+      }
+    }
+
+    function began(element) {
+      started.add(element);
+      primary = new WeakRef(element);
+      releaseRound++;  // nothing is left over now
+      owed = false;
+    }
+
+    function releaseLater(element, ms) {
+      started.delete(element);
+      const last = primary && primary.deref();
+      if (last && last !== element) return;  // another started since: this one's player went then
+      const round = ++releaseRound;
+      setTimeout(() => { if (round === releaseRound) release(); }, ms);
+    }
+
+    function pauseDelay(element) {
+      if (element.ended || element.loop) return RELEASE_ENDED_MS;
+      return performance.now() - lastInput <= INPUT_MS ? RELEASE_PAUSED_MS : RELEASE_HELD_MS;
+    }
+
+    function release() {
+      owed = false;
+      playingStarted();
+      // WebKit gives a muted element no player, nor one with no source (NETWORK_EMPTY: it never
+      // plays): either goes on beside it unheeded.
+      const holds = (m) => !stopped(m) && !m.muted && m.networkState !== 0;
+      if ([...started, ...elements, ...document.querySelectorAll("audio, video")].some(holds)
+          || liveStreams() || calling()) {
+        owed = true;
+        return;
+      }
+      let running = null, resting = null;
+      eachContext((context) => {
+        if (context.state === "running") running = running || context;
+        else if (context.state === "suspended" && rested.has(context)) resting = resting || context;
+      });
+      if (running) {
+        running.resume().catch(() => {});
+        return;
+      }
+      if (!resting) return;
+      const since = lastStart;
+      resting.resume().then(() => {
+        // Back to rest, unless something started meanwhile: then it stays up for that.
+        if (lastStart === since && rested.has(resting) && resting.state === "running") resting.suspend().catch(() => {});
+      }, () => {});
+    }
+
+    function watchStopping(element) {
+      if (stopping.has(element) || typeof element.addEventListener !== "function") return;
+      stopping.add(element);
+      // "play" also when the desktop's controls play it again, no play() called.
+      element.addEventListener("play", () => began(element));
+      element.addEventListener("pause", () => releaseLater(element, pauseDelay(element)));
+      // "ended" comes after "pause", and after the page's own listeners: one that rewinds the
+      // element has made `ended` false by then.
+      element.addEventListener("ended", () => releaseLater(element, RELEASE_ENDED_MS));
+      // A new source, or load(), stops it without a "pause".
+      element.addEventListener("emptied", () => releaseLater(element, RELEASE_ENDED_MS));
+    }
+
     const play = HTMLMediaElement.prototype.play;
     HTMLMediaElement.prototype.play = function (...args) {
       lastStart = performance.now();
       eachContext((context) => { if (rested.has(context)) wake(context); });  // only what Natter suspended
-      return play.apply(this, args);
+      watchStopping(this);
+      const result = play.apply(this, args);
+      if (!this.paused) began(this);
+      // Its promise settles as WebKit makes it the one with the player: at once, or when its data
+      // comes, taking the player back from one started meanwhile.
+      if (result && typeof result.then === "function") result.then(() => { if (!this.paused) began(this); }, () => {});
+      return result;
     };
-    setInterval(rest, IDLE_MS);
+    setInterval(() => {
+      if (owed) release();
+      rest();
+    }, IDLE_MS);
   }
 
   // For Natter's debug info and log (audiosizes.py): what's live, and how much each set and map
@@ -440,12 +558,13 @@
     const playing = playingSources();
     const live = liveStreams();
     const media = mediaPlaying();  // after it, elements holds only what it keeps
+    const playingNow = playingStarted();
     const held = processing().size;  // contexts a connected worklet or script processor keeps up
     return { contexts: states, sources: playing, streams: live, media, elements: elements.size,
              idle: Math.round(performance.now() - lastStart),
              rtc: window.__natterRtc ? window.__natterRtc.counts() : null,
              sizes: { contexts: states.length, rested: restedCount, calls: callCount, elements: elements.size,
-                      sources: playing, streams: live, held, notifications: shown.size } };
+                      sources: playing, streams: live, held, notifications: shown.size, started: playingNow } };
   }
 
   // ---- Videos aren't pictures ---------------------------------------------------------------

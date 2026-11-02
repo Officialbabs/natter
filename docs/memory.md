@@ -27,7 +27,9 @@ and `tools/compare-memory.py` report them.
 ## Idle audio
 
 WhatsApp keeps a Web Audio context open, and in WebKitGTK an open context keeps a GStreamer
-pipeline running. The bridge suspends it after 30 s of silence.
+pipeline running. The bridge suspends it after 30 s of silence. Taking a played voice message's
+media player down from the desktop's controls wakes a rested context for a moment, and it rests
+again at once ([media controls](how-it-works.md#the-desktops-media-controls)).
 
 ## Memory back while hidden
 

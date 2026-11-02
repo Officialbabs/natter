@@ -179,7 +179,8 @@ While such a worklet (not a call's) is connected, or a script processor with `on
 or an `audioprocess` listener, the context isn't suspended, so a long note isn't cut off; a
 context with neither still rests, and so does one whose processor is fed only by microphone
 streams that have ended (a recorder left connected). The log's and About's audio sets say how many
-contexts are held up this way (`held`).
+contexts are held up this way (`held`), and how many elements the page started are still playing
+(`started`).
 
 The log's lines are there to tell these candidates apart, a few a page, each once for what it
 says: at the page's first sound, WebKit's and GStreamer's versions and how WebKit answers
@@ -219,6 +220,31 @@ already still plays again); the Flatpak has `--talk-name=org.mpris.MediaPlayer2.
 A call placed from WhatsApp's own call button can look like a voice message for a moment: if its
 microphone comes on more than 300 ms before the call's first data channel is made, other audio
 pauses a moment early, and plays again when the call ends.
+
+### The desktop's media controls
+
+WebKitGTK puts up a media player (`org.mpris.MediaPlayer2.<app id>.Sandboxed.instance-N`) for an
+`<audio>` in the page as it plays (a voice message, the send tone, a ringtone), only for the one
+that last began to play, and takes it down only when the element is gone or another sound in the
+page starts. WhatsApp keeps its elements to play them again, so the last one's player stayed in the
+desktop's media controls, paused, for good. WebKit has no setting for it. So the bridge
+(`natter/bridge.js`, with the idle audio) watches the elements the page plays, and once the last one
+has stopped, and nothing else plays (a muted element, or one with no source, doesn't count: it has
+no player), no microphone is on and no call is, it calls `resume()` on one of the page's audio
+contexts. To WebKit that's a sound starting, which takes the player down; it plays nothing. How
+soon:
+
+- 2 s after it ends, after a looping one (a ringtone) is paused, or after its source changes;
+- 2 minutes after a pause you make in the page (a click or key just before, not typing in a text
+  box), to carry on from the desktop's controls;
+- 30 minutes after a pause from outside it: those controls, or an app that paused it for its own
+  sound and plays it again after, as Handset does for a phone.
+
+One due while something else plays, or during a call or a recording (a ringtone paused for the
+call), waits for its end, looked for with the idle audio's check every 30 s. A running context goes
+on as it was; one the idle audio rested wakes for a moment (its sound stream opens and closes) and
+rests again. A context WhatsApp suspended itself is left alone, and with no context to resume the
+player stays. Playing a voice message again puts its player back up.
 
 ## Replies from notifications
 

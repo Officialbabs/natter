@@ -97,7 +97,7 @@ window.HTMLMediaElement = class extends Target {
   play() {
     if (this.refuse) return Promise.reject({ name: this.refuse, message: "a message with a https://url" });
     this.paused = false;
-    return Promise.resolve();
+    return this.later || Promise.resolve();  // a test's own: its data comes when it says
   }
 };
 window.HTMLAudioElement = class extends window.HTMLMediaElement {
@@ -387,6 +387,439 @@ class WakeTest(unittest.TestCase):
         value = context.evaluate(fakes + IDLE + '"createScriptProcessor" in new window.AudioContext();', -1)
         self.assertIsNone(context.get_exception())
         self.assertFalse(value.to_boolean())  # feature detection still says no
+
+
+class PlayerReleaseTest(unittest.TestCase):
+    """WebKit's media player for the element that started last goes from the desktop's media
+    controls once nothing plays: a context's resume() takes it down (bridge.js release)."""
+
+    # Timers that keep their delay, run by advance(ms) in the order they come due; the idle check
+    # run by tick(); the person's click (input()); each context's resume() counted.
+    LATER = """
+        const later = [];
+        setTimeout = function (callback, ms) { later.push({ callback, at: clock + (ms || 0) }); return later.length; };
+        const ticks = [];
+        setInterval = function (callback) { ticks.push(callback); return ticks.length; };
+        function tick() { ticks.forEach((callback) => callback()); }  // the idle check, every 30 s
+        function advance(ms) {
+          const until = clock + ms;
+          for (;;) {
+            const due = later.filter((timer) => timer.at <= until).sort((a, b) => a.at - b.at)[0];
+            if (!due) break;
+            later.splice(later.indexOf(due), 1);
+            clock = Math.max(clock, due.at);
+            due.callback();
+          }
+          clock = until;
+        }
+        const heard = {};
+        window.addEventListener = function (type, listener) { (heard[type] = heard[type] || []).push(listener); };
+        function input(trusted = true, type = "click", target = null) {
+          (heard[type] || []).forEach((listener) => listener({ isTrusted: trusted, target }));
+        }
+        let resumes = 0;
+        function counted(context) {
+          const resume = context.resume;
+          context.resume = function () { resumes++; return resume.call(this); };
+          return context;
+        }
+        function finish(element) {
+          element.paused = true;
+          element.ended = true;
+          element.fire("pause");
+          element.fire("ended");
+        }
+        function pause(element) {
+          element.paused = true;
+          element.fire("pause");
+        }
+    """
+
+    def evaluate(self, *scripts: str):
+        """Each script in turn in one context (promises settle in between); the last one's value."""
+        context = JavaScriptCore.Context()
+        value = None
+        for script in (FAKES + self.LATER + IDLE + scripts[0],) + scripts[1:]:
+            value = context.evaluate(script, -1)
+            exception = context.get_exception()
+            if exception is not None:
+                raise AssertionError(exception.get_message())
+        return json.loads(value.to_json(0))
+
+    def test_an_ended_voice_note_takes_its_player_down(self):
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const note = new window.HTMLAudioElement();
+            note.play();
+            finish(note);
+            advance(1999);
+            const before = resumes;
+            advance(1);
+            [before, resumes, context.state];
+        """)
+        self.assertEqual(result, [0, 1, "running"])
+
+    def test_one_the_person_paused_keeps_it_two_minutes(self):
+        # Long enough to carry on from the desktop's controls.
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const note = new window.HTMLAudioElement();
+            note.play();
+            input(true, "keydown");
+            clock += 1500;
+            pause(note);
+            advance(119999);
+            const before = resumes;
+            advance(1);
+            [before, resumes];
+        """)
+        self.assertEqual(result, [0, 1])
+
+    def test_one_paused_from_outside_keeps_it_half_an_hour(self):
+        # The desktop's controls, or Handset pausing it for a phone and playing it again after;
+        # Natter's own presses aren't the person's.
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const note = new window.HTMLAudioElement();
+            input();  // the person's click started it
+            note.play();
+            clock += 1501;
+            input(false);  // Natter's own press
+            pause(note);
+            advance(30 * 60000 - 1);
+            const before = resumes;
+            advance(1);
+            [before, resumes];
+        """)
+        self.assertEqual(result, [0, 1])
+
+    def test_ended_even_when_the_page_rewinds_it(self):
+        # WhatsApp's own listeners come first: one that rewinds makes `ended` false.
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const note = new window.HTMLAudioElement();
+            note.addEventListener("pause", () => { note.ended = false; });  // WhatsApp's, from before
+            note.play();
+            note.paused = true;
+            note.ended = true;
+            note.fire("pause");
+            note.fire("ended");
+            advance(2000);
+            resumes;
+        """)
+        self.assertEqual(result, 1)
+
+    def test_a_looping_ringtone_paused_counts_as_ended(self):
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const ringtone = new window.HTMLAudioElement();
+            ringtone.loop = true;
+            ringtone.play();
+            pause(ringtone);
+            advance(2000);
+            resumes;
+        """)
+        self.assertEqual(result, 1)
+
+    def test_a_new_source_stops_it_without_a_pause(self):
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const note = new window.HTMLAudioElement();
+            note.play();
+            note.paused = true;  // load() sets it, firing no "pause"
+            note.fire("emptied");
+            advance(2000);
+            resumes;
+        """)
+        self.assertEqual(result, 1)
+
+    def test_not_while_something_plays_or_listens(self):
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const note = new window.HTMLAudioElement();
+            const other = new window.HTMLAudioElement();
+            other.play();  // still playing
+            note.play();
+            finish(note);
+            advance(5000);
+            const playing = resumes;
+            other.paused = true;
+            const track = { readyState: "live" };
+            context.createMediaStreamSource({ getTracks: () => [track] });  // a voice note being recorded
+            note.play();
+            finish(note);
+            advance(5000);
+            const recording = resumes;
+            track.readyState = "ended";
+            window.__natterRtc = { active: () => true };
+            note.play();
+            finish(note);
+            advance(5000);
+            [playing, recording, resumes];
+        """)
+        self.assertEqual(result, [0, 0, 0])
+
+    def test_one_due_while_something_plays_is_owed(self):
+        # A video in the page the bridge never saw start (autoplay): the idle check tries again.
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const video = new window.HTMLVideoElement();
+            video.paused = false;
+            document.querySelectorAll = () => [video];
+            const note = new window.HTMLAudioElement();
+            note.play();
+            finish(note);
+            advance(5000);
+            tick();
+            const playing = resumes;
+            video.paused = true;
+            tick();
+            [playing, resumes];
+        """)
+        self.assertEqual(result, [0, 1])
+
+    def test_muted_or_failed_media_holds_nothing(self):
+        # WebKit gives a muted element no player; one whose load failed stays unpaused, unended.
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const gif = new window.HTMLVideoElement();
+            gif.muted = true;
+            gif.play();
+            const broken = new window.HTMLAudioElement();
+            broken.play();
+            broken.error = { code: 4 };
+            const note = new window.HTMLAudioElement();
+            note.play();
+            finish(note);
+            advance(2000);
+            [resumes, audio().sizes.started];
+        """)
+        self.assertEqual(result, [1, 1])  # the muted one still plays: counted, not held
+
+    def test_one_due_during_a_call_is_owed_until_it_is_over(self):
+        # A ringtone paused when the call is answered: its release comes due during the call.
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const ringtone = new window.HTMLAudioElement();
+            ringtone.loop = true;
+            let onCall = false;
+            window.__natterRtc = { active: () => onCall };
+            ringtone.play();
+            onCall = true;
+            pause(ringtone);
+            advance(5000);
+            tick();
+            const during = resumes;
+            onCall = false;
+            tick();
+            const after = resumes;
+            tick();
+            [during, after, resumes];
+        """)
+        self.assertEqual(result, [0, 1, 1])
+
+    def test_a_context_natter_rested_rests_again(self):
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const note = new window.HTMLAudioElement();
+            note.play();
+            input();
+            pause(note);
+            advance(60000);
+            rest();  // nothing for a minute: suspended by Natter
+            advance(60000);  // the paused note's two minutes are up
+            [resumes, context.state];
+        """, "[resumes, context.state, rested.has(context)];")
+        self.assertEqual(result, [1, "suspended", True])
+
+    def test_one_that_starts_meanwhile_stays_up(self):
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const note = new window.HTMLAudioElement();
+            note.play();
+            input();
+            pause(note);
+            advance(60000);
+            rest();
+            advance(60000);  // resume() asked for; before it's done, a sound starts
+            clock += 10;
+            new window.AudioScheduledSourceNode(context).start();
+        """, "[resumes, context.state];")
+        self.assertEqual(result, [1, "running"])
+
+    def test_a_context_the_page_suspended_is_left_alone(self):
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const note = new window.HTMLAudioElement();
+            note.play();
+            context.suspend();  // WhatsApp's own doing, not Natter's
+            finish(note);
+            advance(5000);
+            [resumes, context.state];
+        """)
+        self.assertEqual(result, [0, "suspended"])
+
+    def test_played_again_from_the_desktop_controls(self):
+        # WebKit plays it with no play() from the page: its "play" event still counts, and holds
+        # another element's release off while it plays.
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const note = new window.HTMLAudioElement();
+            note.play();
+            pause(note);
+            advance(60000);
+            note.paused = false;
+            note.fire("play");  // the desktop's Play
+            const tone = new window.HTMLAudioElement();
+            tone.play();
+            finish(tone);  // the tone had the player last; the note plays on
+            advance(30 * 60000);
+            tick();
+            const playing = resumes;
+            finish(note);
+            tick();
+            [playing, resumes];
+        """)
+        self.assertEqual(result, [0, 1])
+
+    def test_typing_is_not_the_persons_pause(self):
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const note = new window.HTMLAudioElement();
+            note.play();
+            input(true, "keydown", { isContentEditable: true });  // the message box
+            input(true, "keydown", { tagName: "INPUT" });  // search
+            pause(note);  // from outside, a moment after
+            advance(120000);
+            resumes;
+        """)
+        self.assertEqual(result, 0)
+
+    def test_media_with_no_source_holds_nothing(self):
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const empty = new window.HTMLAudioElement();
+            empty.networkState = 0;  // NETWORK_EMPTY: play() with no src, never playing
+            empty.play();
+            const note = new window.HTMLAudioElement();
+            note.play();
+            finish(note);
+            advance(2000);
+            resumes;
+        """)
+        self.assertEqual(result, 1)
+
+    def test_a_failed_element_holds_the_idle_audio_off_no_more(self):
+        result = self.evaluate("""
+            const context = new window.AudioContext();
+            const failed = new window.HTMLAudioElement();
+            context.createMediaElementSource(failed);
+            failed.play();
+            failed.error = { code: 4 };  // WebKit leaves paused false
+            const inPage = audio().media;
+            failed.isConnected = false;
+            [inPage, audio().sizes.elements];
+        """)
+        self.assertEqual(result, [False, 0])
+
+    def test_one_whose_data_comes_later_takes_the_player_back(self):
+        # WebKit makes it current again when its data comes (its play() promise settles then).
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const note = new window.HTMLAudioElement();
+            let ready;
+            note.later = new Promise((resolve) => { ready = resolve; });
+            note.play();  // before its data
+            const tone = new window.HTMLAudioElement();
+            tone.play();
+            finish(tone);
+            advance(2000);  // the note plays on: owed
+        """, "ready();", """
+            tick();
+            input();
+            pause(note);
+            tick();
+            advance(119999);
+            const before = resumes;
+            advance(1);
+            [before, resumes];
+        """)
+        self.assertEqual(result, [0, 1])
+
+    def test_a_refused_play_leaves_the_player_where_it_was(self):
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const note = new window.HTMLAudioElement();
+            note.play();
+            const tone = new window.HTMLAudioElement();
+            tone.refuse = "NotAllowedError";
+            tone.play();  // never plays: the note keeps its player
+            input();
+            pause(note);
+            advance(120000);
+            resumes;
+        """)
+        self.assertEqual(result, 1)
+
+    def test_an_element_used_again(self):
+        # A new source and play(): "emptied" comes before "play", which cancels its release.
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const note = new window.HTMLAudioElement();
+            note.play();
+            finish(note);
+            note.ended = false;
+            note.play();
+            note.fire("emptied");
+            note.fire("play");
+            advance(5000);
+            resumes;
+        """)
+        self.assertEqual(result, 0)
+
+    def test_a_new_start_settles_what_was_owed(self):
+        # Owed while unwatched media plays; a note started then is the one with the player, and
+        # its pause gets its full two minutes.
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const video = new window.HTMLVideoElement();
+            video.paused = false;
+            document.querySelectorAll = () => [video];
+            const tone = new window.HTMLAudioElement();
+            tone.play();
+            finish(tone);
+            advance(2000);  // owed
+            const note = new window.HTMLAudioElement();
+            note.play();
+            video.paused = true;
+            input();
+            pause(note);
+            tick();
+            const early = resumes;
+            advance(120000);
+            [early, resumes];
+        """)
+        self.assertEqual(result, [0, 1])
+
+    def test_only_the_element_that_started_last_counts(self):
+        # Only it has a player: an earlier one stopping later neither releases nor cuts its time.
+        result = self.evaluate("""
+            const context = counted(new window.AudioContext());
+            const note = new window.HTMLAudioElement();
+            const tone = new window.HTMLAudioElement();
+            note.play();
+            tone.play();
+            input();
+            pause(tone);  // two minutes
+            finish(note);
+            advance(110000);
+            const early = resumes;
+            advance(10000);
+            const due = resumes;
+            advance(30 * 60000);
+            [early, due, resumes];
+        """)
+        self.assertEqual(result, [0, 1, 1])
 
 
 class HeardTest(unittest.TestCase):
