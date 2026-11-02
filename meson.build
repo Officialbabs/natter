@@ -49,6 +49,19 @@ if gstreamer.found()
   )
 endif
 
+# Update checks (natter/update.py) are on unless a packager turns them off (-Dupdate_check=false),
+# where the distribution's own updates are the way a new version comes. update.py reads the file
+# installed next to it, as gstfix.py reads camfix-dir.
+if not get_option('update_check')
+  configure_file(
+    input: 'data' / 'update-check.in',
+    output: 'update-check',
+    configuration: {'UPDATE_CHECK': 'off'},
+    install: true,
+    install_dir: pkgdatadir / 'natter',
+  )
+endif
+
 # The launcher: the Python that has PyGObject on its first line, the package's folder in NATTER_DIR.
 configure_file(
   input: 'bin/natter',

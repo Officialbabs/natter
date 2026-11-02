@@ -11,7 +11,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
 
-from . import APP_ID, NAME, media, themes
+from . import APP_ID, NAME, VERSION, media, themes
 from . import lock as applock
 from .launcher import menu_supported
 from .settings import parse_clock
@@ -368,6 +368,8 @@ class Preferences(Adw.PreferencesDialog):
             self._show_custom()
         if key in dict(DEVICES):
             self._show_devices()  # what the switch now means: "can't use it", or the desktop's say
+        elif key.startswith("update_"):
+            self.update_status()
 
     def _closed(self) -> None:
         self.settings.disconnect(self._on_setting)
@@ -417,6 +419,9 @@ class Preferences(Adw.PreferencesDialog):
         running.add(self._switch("search_provider", "Chats in Desktop Search",
                                  "Lets the desktop's search find chats by name, on desktops that ask apps for results"))
         page.add(running)
+        updates = self._updates()
+        if updates is not None:
+            page.add(updates)
 
         look = Adw.PreferencesGroup(title="Appearance")
         keys = [key for key, _ in APPEARANCES]
@@ -613,6 +618,53 @@ class Preferences(Adw.PreferencesDialog):
             row.add_suffix(copy)
         self.media.add(row)
         self.media.set_visible(True)
+
+    def _updates(self) -> Optional[Adw.PreferencesGroup]:
+        """Updates (update.py): the daily check's switch, and a row with the version running and
+        what's known of a newer one, with Update…, Details or Check Now. A build whose packager
+        turned checks off has only a line saying where updates come from; a separate instance
+        (its own app id) has none of it."""
+        updates = getattr(self.app, "updates", None)
+        if updates is None or updates.channel == "lab":
+            return None
+        group = Adw.PreferencesGroup(title="Updates")
+        if updates.channel == "off":
+            group.add(plain_row(f"{NAME} {VERSION}", "Updates come with your system's other updates"))
+            return group
+        group.add(self._switch("update_check", "Check for Updates",
+                               "Asks GitHub once a day whether a new version is out"))
+        self.update_row = plain_row(f"{NAME} {VERSION}")
+        self._update_line = ""
+        self._update_button: tuple[str, Optional[Gtk.Widget]] = ("", None)
+        group.add(self.update_row)
+        self.update_status()
+        return group
+
+    def update_status(self) -> None:
+        """The Updates row as app.updates says now (Updates.status): its line, and its button.
+        The app calls this whenever that changes while the dialog is open."""
+        row = getattr(self, "update_row", None)
+        if row is None:
+            return
+        line, kind = self.app.updates.status()
+        # Set only when it changes: a line set again is a description changed, for screen readers.
+        if line != self._update_line:
+            self._update_line = line
+            row.set_subtitle(line)
+        if kind == self._update_button[0]:
+            return
+        if self._update_button[1] is not None:
+            row.remove(self._update_button[1])
+        button = None
+        if kind == "check":
+            button = icon_button("view-refresh-symbolic", "Check Now")
+            button.connect("clicked", lambda *_: self.app.updates.check_now())
+        elif kind in ("update", "details"):
+            button = Gtk.Button(label="Update…" if kind == "update" else "Details", valign=Gtk.Align.CENTER)
+            button.connect("clicked", lambda *_: self.app.activate_action("update", None))
+        if button is not None:
+            row.add_suffix(button)
+        self._update_button = (kind, button)
 
     def _notifications(self) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage(name="notifications", title="Notifications",

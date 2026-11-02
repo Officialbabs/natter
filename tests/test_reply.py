@@ -1710,10 +1710,14 @@ class RestartTest(unittest.TestCase):
         app = SimpleNamespace(accounts=[], tray=None, window=None, memory_guard=None, ada_style=None,
                               desktop_media=None, calls=None, notifier=Fake(), reclaimer=Fake(), call_sound=Fake(),
                               audio_follower=Fake(), voice_pause=Fake(when_idle=lambda then: then()), withdraw_notification=withdrawn.append,
-                              quit=lambda: quit_.append(1), replies={("main", PERSON): told, ("main", GROUP): quiet})
+                              quit=lambda: quit_.append(1), replies={("main", PERSON): told, ("main", GROUP): quiet},
+                              updates=Fake())
         Natter.quit_natter(app)
         # A failed reply's notice too: its words end with this Natter, and Show Reply would find nothing.
-        self.assertEqual((withdrawn, quit_), (["media-lost", "reply-told"], [1]))
+        # And a new release's (update.py), whose check or download under way ends, and an update's
+        # outcome: the next Natter would tell it again, or couldn't take What's New.
+        self.assertEqual((withdrawn, quit_), (["media-lost", "update", "updated", "update-failed", "reply-told"], [1]))
+        self.assertEqual(app.updates.called("stop"), [()])
 
     def test_the_banner(self):
         restart = (f"Restart {NAME} to use the microphone and camera", "Restart", "app.restart", "")

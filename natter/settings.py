@@ -139,6 +139,11 @@ DEFAULTS: dict[str, Any] = {
     "calls_linked": False,  # internal: the call window has been linked once
     "sw_cleared": False,  # whether WhatsApp's old service-worker data has been cleared, once
     "first_run_done": False,
+    "update_check": True,  # ask GitHub once a day whether a newer release is out (update.py)
+    "update_checked_at": 0,  # internal: Unix time GitHub last answered a check (with a release or with none)
+    "update_latest": "",  # internal: newest release tag found that is newer than VERSION ("" = none)
+    "update_notified": "",  # internal: the tag already announced (banner seen or notification sent): one per version
+    "update_dismissed": "",  # internal: the tag "Skip This Version" was chosen for; quiet until a newer one
 }
 
 

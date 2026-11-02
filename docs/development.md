@@ -6,6 +6,10 @@
 python3 -m unittest discover -s tests
 ```
 
+The tests never reach the network: the update check and download go to stand-ins
+(`tests/test_update.py`), and the updater runs in a home folder of its own
+(`tests/test_update_helper.py`).
+
 ## When WhatsApp changes
 
 The bridge (`natter/bridge.js`) finds its way around WhatsApp Web's page by a few landmarks, kept
@@ -69,6 +73,14 @@ An app id other than Natter Den's own (or its old `io.natter.Natter`) gets folde
 [One at a time](how-it-works.md#one-at-a-time)), so it runs beside yours. A separate instance still
 shares the desktop's notification server and its portal permission store with the Natter Den you
 use.
+
+A separate instance never asks GitHub for updates ([Updates](how-it-works.md#updates)), and never
+updates itself. To try the update notices in one, `NATTER_UPDATE_FEED` gives it a feed in place of
+GitHub's API: a `file://` path, or an `http://127.0.0.1:<port>/` address, with the API's answer for
+a release (`{"tag_name": "v9.9.9"}` is enough). It's read as GitHub would be, two minutes after
+start-up is ready and then once a day; Natter Den's own app id ignores it.
+`NATTER_UPDATE_CHECK=0` turns checks off altogether, a feed's too: for CI, and for packagers' test
+runs.
 
 `NATTER_DEBUG=1` also turns on WebKit's inspector (right-click → Inspect Element), prints the
 page's console, and adds D-Bus actions for poking at a running Natter Den: `debug-snapshot` and

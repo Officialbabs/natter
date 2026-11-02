@@ -1126,7 +1126,7 @@ class App:
         self._media_watchers, self._media_watch_next, self._asking_camera = {}, 0, False
         self._camera_waiting, self._camera_gate_before = [], None
         self._camera_gate_was, self._quitting, self.told = None, False, []
-        self._media_banner, self.locked = False, False
+        self._media_banner, self.locked, self.updates = False, False, None
         self.settings.connect(lambda key, value: Natter._on_setting(self, key, value))
 
     def __getattr__(self, name):

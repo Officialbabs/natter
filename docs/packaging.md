@@ -39,6 +39,13 @@ handler (unless another app already has it). It says if `~/.local/bin` isn't on 
 - `--uninstall` removes what it installed, and leaves your sessions and settings in
   `~/.local/share/natter`, `~/.config/natter` and `~/.cache/natter`.
 
+Natter Den takes the same steps itself when you choose *Update* in a copy `get.sh` installed
+([how](how-it-works.md#updating-in-place)), without running `get.sh`: it downloads the release it
+told you about into `~/.local/lib/natter/.update/`, checks it and runs the new copy's start-up
+check while it still runs, then quits, and its updater puts the new copy in place of the old one
+and runs its `install.sh --force --no-deps`, which never asks. If that fails, the old copy goes
+back.
+
 ## By hand
 
 The packages Natter Den needs, with the GStreamer codecs WhatsApp's videos (H.264, AAC) and voice
@@ -153,6 +160,20 @@ On Arch and its derivatives, [packaging/aur/natter-den-git](../packaging/aur/nat
 PKGBUILD (`makepkg -si`); it isn't on the AUR yet. Neither the meson build nor the PKGBUILD has
 been run on a real distribution yet.
 
+Natter Den asks GitHub once a day whether a newer release is out, and says so
+([Updates](how-it-works.md#updates)); installed from a package, it says to update it with the
+system's package manager, and never updates itself. A package whose updates come from the
+distribution should turn the check off: `-Dupdate_check=false` installs `natter/update-check`
+saying `off`, and Preferences then says updates come with the system's.
+
+```sh
+meson setup build --prefix=/usr -Dupdate_check=false && meson install -C build
+```
+
+The PKGBUILD leaves it on: nothing else would tell someone with a `-git` package that a release is
+out, and a build from a commit newer than the latest release stays quiet. `NATTER_UPDATE_CHECK=0`
+in the environment turns checks off at run time, for test runs and CI.
+
 ## Coming from io.natter.Natter
 
 Natter Den's app id is `io.github.Officialbabs.Natter` (it was `io.natter.Natter`). Quit the old
@@ -182,5 +203,8 @@ What's still to do before submitting Natter Den to Flathub:
   source with a tag and commit.
 - **Checks.** `meson test -C build` runs `appstreamcli validate` and `desktop-file-validate`, but
   skips each when it isn't installed.
+- **Update checks off.** Flathub's manifest adds `config-opts: [-Dupdate_check=false]` to the
+  natter module: Flathub updates the app itself. The manifest here leaves them on, as the Flatpak
+  `get.sh --flatpak` builds is updated by hand.
 - **Permissions a reviewer may ask about**, such as `--filesystem=xdg-config/os-ai:ro` (for Follow
   System on Ada).

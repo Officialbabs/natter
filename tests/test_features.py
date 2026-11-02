@@ -402,6 +402,7 @@ class TrayTest(unittest.TestCase):
         fake.chosen = []
         fake.choose_do_not_disturb = lambda: fake.chosen.append("dnd")
         fake.tray = None
+        fake.updates = type("Updates", (), {"menu_item": lambda _self: None})()  # no release to tell of (test_update_app)
         return fake, Natter._tray_menu(fake)
 
     def test_menu_has_only_the_key_items(self):

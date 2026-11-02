@@ -442,7 +442,7 @@ class AboutTest(unittest.TestCase):
             page.audio_sizes = Watch(page, later=lambda *args: 1, cancel=lambda timer: None, write=print)
         pages[0].audio_sizes.last = sizes(contexts=1)  # its last check's
         fake = SimpleNamespace(calls_in_page=True, calls=None, camera_fallback=False, window=None,
-                               _media=([], ""), accounts=pages,
+                               _media=([], ""), accounts=pages, updates=None,
                                media_state=lambda kind: {"on": True, "desktop": None, "present": None,
                                                          "lockdown": False})
         with mock.patch.multiple(natter_app, Adw=adw, Gtk=gtk):

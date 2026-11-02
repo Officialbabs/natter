@@ -53,6 +53,7 @@ class CallWindow(GObject.Object):
         self.queue: list[dict] = []
         self.state = "stopped"
         self.in_call = False
+        self.ringing = False  # a call is ringing there, not answered yet (what holds an update off, update.in_a_call)
         self.keep_running = False
         self._stopping = False
         self._restarts = 0
@@ -103,7 +104,7 @@ class CallWindow(GObject.Object):
         if which is not self.process:
             return
         self.process = self.connection = self.input = None
-        self.in_call = False
+        self.in_call = self.ringing = False
         self._set_state("stopped")
         if not self._stopping and self.keep_running and self._restarts < len(RESTART_DELAYS):
             delay = RESTART_DELAYS[self._restarts]
@@ -184,11 +185,14 @@ class CallWindow(GObject.Object):
         if event == "state":
             self._set_state(str(message.get("value", "")))
         elif event == "incoming":
+            self.ringing = True
             self.emit("incoming", str(message.get("name", ""))[:200], bool(message.get("video")))
         elif event == "incoming-ended":
+            self.ringing = False
             self.emit("incoming-ended")
         elif event == "in-call":
             self.in_call = bool(message.get("value"))
+            self.ringing = False  # answered, or over
             self.emit("in-call", self.in_call)
         elif event == "call-failed":
             self.emit("call-failed", str(message.get("reason", ""))[:100])

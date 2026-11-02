@@ -418,7 +418,8 @@ main loop one step at a time, with launches, searches and the bus answered in be
    check;
 4. WebKit's context (and, for calls in the page, the blank page that keeps the camera portal's
    identity valid);
-5. the memory guard, then notifications, the badge, sound and the timers.
+5. the memory guard, then notifications, the badge, sound and the timers (the daily
+   [update check](#updates) among them).
 
 The order is kept: no step starts before the lock is taken, and every WebKit process starts in
 the scope. What arrives meanwhile (the window asked for, a launch's command line with `--chat`,
@@ -481,3 +482,112 @@ same WhatsApp login, for seven hours. So there's more than the name now (`natter
 
 Each start logs `natter: primary instance: app id …, pid …, lock taken` (or `lock taken over
 from pid …`, with `which was ended` when it was).
+
+## Updates
+
+Once a day Natter Den asks GitHub whether a newer release is out (`natter/update.py`): a `GET` of
+`https://api.github.com/repos/Officialbabs/natter/releases/latest`, and when that doesn't answer as
+it should (rate-limited, an error), a `HEAD` of the Releases page's *latest* link, whose redirect
+names the release's tag, as `get.sh` finds it. The request has a fixed `User-Agent` (GitHub turns
+away requests without one) and nothing else: no cookies, no ETag, no version, no ids. Only the tag
+is read from the answer, and every address is made from the repository's and the tag. Drafts,
+pre-releases and tags that aren't plain versions (`v1.0-rc1`) are never offered, and a version is
+newer by its numbers (0.1.10 comes after 0.1.9). The check runs from the minute timer, two minutes
+after start-up is ready at the earliest, so it stays out of WhatsApp's own load; not while offline,
+during a call (ringing too), while a page loads or syncs (ten minutes at most: a page that never
+gets ready doesn't hold it off for good), or while you link an account. One GitHub didn't answer is
+tried again an hour later, then two, four and so on, a day apart at most, until it answers.
+*Check for Updates* in Preferences → General → Updates turns the daily check off, and with it the
+banner, the tray item and the notification; Preferences still says what was found, and *Check Now*
+there asks at once. A Natter Den started for desktop search alone never asks.
+
+A newer release shows in the window's banner, in the tray menu and in Preferences, and as a
+notification, once for each version, when the window is hidden or locked; while notifications are
+paused, the notification waits until they aren't, and in a visible window the release counts as
+told once its own banner is up. *Skip This Version* keeps it quiet until there's a newer one. What
+*Update* or *Details* offers depends on how this copy was installed:
+
+- **`get.sh`'s copy** (`~/.local/lib/natter/source`, which the `natter` command starts) updates in
+  place ([below](#updating-in-place)).
+- **A git checkout:** the commands to pull and run its `install.sh`.
+- **Any other copy** (an unpacked archive, or `get.sh`'s folder while the `natter` command starts
+  another copy): `get.sh`'s command.
+- **The Flatpak `get.sh --flatpak` builds:** `get.sh --flatpak`'s command, which builds the new one.
+- **A package** (meson's `/usr/share/natter`, a Snap, a folder Natter Den can't write in): update it
+  the way it was installed. Packages whose updates come from the distribution build with
+  `-Dupdate_check=false` ([Distribution packages](packaging.md#distribution-packages)), and never ask.
+- **A separate instance** (an app id of its own, as [the test page](development.md#the-test-page)
+  uses) never asks, unless `NATTER_UPDATE_FEED` gives it a feed of its own, and never updates itself.
+
+`NATTER_UPDATE_CHECK=0` turns checks off wherever it's set, a lab's feed too; Preferences then
+says so, and the copy is otherwise what it is.
+
+### Updating in place
+
+*Update* doesn't run `get.sh`. While Natter Den still runs, it:
+
+1. asks GitHub again when the last answer is more than ten minutes old, and takes the newer of the
+   release it told you about and the one found; if GitHub no longer offers the one it told you about
+   (pulled, or made a pre-release), it installs nothing, and says so;
+2. downloads that tag's archive from GitHub (redirects followed only to this repository on
+   `github.com` and `codeload.github.com`, 16 MB at most) into `~/.local/lib/natter/.update/<tag>/`;
+3. unpacks it there, writing each file itself: files and folders only, no links, nothing outside
+   that folder, 2000 files and 64 MB at most, headers included;
+4. checks that it's a whole copy of that version: `install.sh`, `bin/natter` and the `natter`
+   package, whose one `VERSION` is the tag's;
+5. runs the new copy's own start-up check, as `install.sh` would, so a release that can't run here
+   is turned down before anything changes.
+
+The banner says it's downloading meanwhile. A failure in any of these changes nothing outside that
+folder, and the banner and its *Details* say why (a notification too, when the window is hidden).
+Then Natter Den looks again for what would hold the update off (a call, in a page or the call
+window, ringing or on; a page loading; a voice message being recorded; a reply being sent, which
+finishes first; replies written since the dialog, which it asks about), starts the updater, and
+quits once the updater has taken its plan. If the updater doesn't start, Natter Den keeps running
+and says so. If a call comes in just then, Natter Den stays, and tells the updater to change
+nothing (the file `cancel` beside the plan).
+
+The updater (`natter/updater.py`) is a script of its own, copied to `~/.cache/natter/update/` before
+it starts, so swapping the folder it came from doesn't pull it from under itself. It needs only
+Python. It runs as a transient service of your systemd user manager (`systemd-run --user`), not as
+Natter Den's child: what ends Natter Den's unit doesn't end it, Natter Den's memory limit doesn't
+apply to it, and it has no terminal to ask on. Without systemd it runs in a session of its own.
+Each step has a time limit of its own:
+
+1. It waits for Natter Den, and the WebKit processes and call window it started, to end (a minute
+   at most). If Natter Den is still there, nothing changes, and it starts again as it was once it
+   has ended; if only what it started is, nothing changes, and Natter Den starts again as it was.
+2. It takes the instance lock ([One at a time](#one-at-a-time)), noting `updating` in its file, so a
+   Natter Den started meanwhile waits without loading WhatsApp, for as long as the update may take.
+3. It checks that the `natter` command still starts `~/.local/lib/natter/source`.
+4. It swaps that folder and the new copy in one step (`renameat2`'s exchange: a power cut leaves
+   one of them in place, never neither), moves the old one to `.update/<tag>/old`, and keeps a copy
+   of the `natter` command.
+5. It runs the new copy's `install.sh --force --no-deps` (five minutes at most), which never asks
+   and never runs `sudo`.
+6. It asks a Natter Den that was started meanwhile (by a notification's click, say) to stop: it's
+   still waiting on the lock, with nothing loaded.
+7. It starts Natter Den again, hidden if it was, and waits up to two minutes for it to say it's
+   ready. A Natter Den still in the updater's own unit then (its move to a scope of its own failed)
+   is waited for as long as it runs, as the unit's end would end it too. Started without
+   systemd, the updater shares the old Natter Den's scope, which outlives it, and doesn't wait.
+
+When anything after step 4 fails (`install.sh`'s error or time limit, or the new version ending
+before it's ready), the updater puts the old copy back, with its `natter` command, runs the old
+copy's own `install.sh` again for its menu entry and icons, ends a start that waited meanwhile (it
+came from the new copy), and starts the old one, all under the lock. If the new version ended
+before it was ready and another Natter Den has the lock by then (opened from the menu, say), it
+runs the new copy, and the updater leaves it be. What the new version said as it ended is in the
+journal of the updater's unit (`update.log` names it). What happened goes to
+`~/.cache/natter/update/result.json`, and the steps, with `install.sh`'s own output, to
+`update.log` beside it. The next Natter Den reads `result.json` once it's ready: *Updated to
+Natter Den 0.2.0* with *What's New* (the release's page), or why it failed, with the command to
+update by hand. A minute later `.update/` goes, with the old copy in it.
+
+If the computer stops halfway, the next start says the update was interrupted (without saying how
+far it got), and the old copy stays in `~/.local/lib/natter/.update/<tag>/old`. `get.sh`'s command puts the latest release in
+place whole. To go back to the old copy instead, with Natter Den closed:
+
+```sh
+cd ~/.local/lib/natter && mv source .update/<tag>/failed && mv .update/<tag>/old source && source/install.sh
+```

@@ -28,9 +28,9 @@ from gi.repository import Adw, Gio, GLib
 
 from natter import instance
 from natter.app import FIRST_SEARCH_WAIT, SEARCH_LINGER, Natter, main as app_main, stop_name_watch
-from natter.instance import (BUSY, LOST, MAYBE, NOT_ANSWERING, OK, STILL_RUNNING, UNKNOWN, Holder, InstanceLock,
-                             NameWatchdog, OwnerAsker, Taken, end_stale, end_webkit, holds_lock, lock_path,
-                             name_owner, primary_line, probe, start_ticks, take, take_later, verdict)
+from natter.instance import (BUSY, LOST, MAYBE, NOT_ANSWERING, OK, STILL_RUNNING, UNKNOWN, UPDATE_WAIT, Holder,
+                             InstanceLock, NameWatchdog, OwnerAsker, Taken, end_stale, end_webkit, holds_lock,
+                             lock_path, name_owner, primary_line, probe, start_ticks, take, take_later, verdict)
 
 OWN, OTHER = ":1.10", ":1.99"
 
@@ -67,13 +67,14 @@ class Temp(unittest.TestCase):
         os.chmod(self.dir, 0o700)
         self.path = self.dir / "run" / "natter-a.b.lock"
 
-    def hold(self, pid=4242):
-        """Another process's hold on the lock (flock treats each open of the file on its own):
-        call what it returns to let go."""
+    def hold(self, pid=4242, *more):
+        """Another process's hold on the lock (flock treats each open of the file on its own), with
+        `more` after its pid and start time: call what it returns to let go."""
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        os.write(fd, f"{pid} 1761390000\n".encode())
+        os.ftruncate(fd, 0)
+        os.write(fd, " ".join([str(pid), "1761390000", *more]).encode() + b"\n")
         held = [fd]
 
         def let_go():
@@ -142,6 +143,7 @@ class LockTest(Temp):
 
     def test_held_throughout_gives_up_after_the_wait(self):
         self.hold(4242)
+        self.assertFalse(self.lock().updating())
         clock, lines = Clock(), []
         taken = take(self.lock(), wait=20, poll=0.25, sleep=clock.sleep, clock=clock, log=lines.append)
         self.assertEqual(taken, Taken(False, "gave up", 4242))
@@ -151,6 +153,33 @@ class LockTest(Temp):
         self.assertIn("(pid 4242) still holds", lines[-1])
         self.assertIn("quitting without starting WhatsApp", lines[-1])
         self.assertEqual(self.path.read_text().split()[0], "4242")  # its details left as they were
+
+    def test_the_updater_is_waited_for_as_long_as_it_installs(self):
+        # updater.py holds the lock while install.sh runs (five minutes at most), then ends this
+        # start itself, or lets it have the lock: no giving up after LOCK_WAIT, saying another runs.
+        self.hold(4242, "updating")
+        clock, lines = Clock(), []
+        taken = take(self.lock(), wait=20, poll=0.25, sleep=clock.sleep, clock=clock, log=lines.append)
+        self.assertEqual(taken, Taken(False, "gave up", 4242))
+        self.assertGreaterEqual(clock.now, UPDATE_WAIT)
+        self.assertEqual(lines[0], "natter: Natter Den is being updated (pid 4242); waiting for the update to finish")
+        self.assertTrue(self.lock().updating())
+
+    def test_the_updater_taking_over_from_the_one_quitting(self):
+        let_go = self.hold(4242)
+        held = []
+
+        def looked(looks):
+            if looks == 3:
+                let_go()
+                held.append(self.hold(5151, "updating"))  # the Natter Den quitting for it has, and it took the lock
+
+        clock, lines = Clock(then=looked), []
+        taken = take(self.lock(), wait=20, poll=0.25, sleep=clock.sleep, clock=clock, log=lines.append)
+        self.assertEqual(taken, Taken(False, "gave up", 5151))
+        self.assertGreaterEqual(clock.now, UPDATE_WAIT)
+        self.assertIn("waiting for it to end", lines[0])
+        self.assertEqual(lines[1], "natter: Natter Den is being updated (pid 5151); waiting for the update to finish")
 
     def test_not_passed_on_to_what_natter_starts(self):
         lock = self.lock()
@@ -505,6 +534,7 @@ def startup_app(**more):
     waits = more.pop("waits", ())
     more.setdefault("get_dbus_connection", lambda: None)
     more.setdefault("get_flags", lambda: Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+    more.setdefault("updates", None)  # as Natter.__init__ sets it: made with the window (update.py)
     app = SimpleNamespace(events=events, go={}, settings={"accounts": [{}], "privacy_blur": False, "microphone": True,
                                                           "camera": True},
                           quit=lambda: events.append("quit"), hold=lambda: events.append("hold"),

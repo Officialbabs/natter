@@ -49,6 +49,7 @@ from .system import (AudioFollower, CallSound, LoopMeter, Reclaimer, footprint, 
                      memory_tight, move_to_own_scope_async,
                      network_processes, open_uri, own_swap, pages_end_alone, request_background, unit_charge)
 from .tray import MenuItem, Tray, tray_host_available
+from .update import Updates, dialog_for, in_a_call, loading, replies_dialog, unsent
 
 HERE = Path(__file__).resolve().parent
 LAUNCHER = HERE.parent / "bin" / "natter"  # in a checkout
@@ -365,13 +366,14 @@ def snapshot_path(path: str, folder: Path = SNAPSHOTS) -> Optional[Path]:
     return target if target != inside and target.is_relative_to(inside) else None
 
 
-def banner_for(dnd_until, media_missing: bool, now: float,
-               restart: bool = False) -> Optional[tuple[str, str, str, str]]:
+def banner_for(dnd_until, media_missing: bool, now: float, restart: bool = False, *,
+               update: Optional[tuple[str, str, str, bool]] = None) -> Optional[tuple[str, str, str, str]]:
     """What the window's banner says, as (title, button, action, page), else None. Only states
     that last go there, one at a time: paused notifications first, as they're the one that keeps
     messages from you, then a restart that would give calls back the microphone and camera
-    (`restart`, _on_anchor_gone), then media that can't play. `page` is the action's target, if
-    it takes one."""
+    (`restart`, _on_anchor_gone), then an update being downloaded or one that failed, then media
+    that can't play, and last a new release that's out. `update` is Updates.banner's (title,
+    button, action, urgent). `page` is the action's target, if it takes one."""
     if isinstance(dnd_until, (int, float)) and dnd_until != 0 and (dnd_until < 0 or dnd_until > now):
         if dnd_until < 0:
             return "Notifications paused", "Resume", "app.resume-notifications", ""
@@ -379,8 +381,12 @@ def banner_for(dnd_until, media_missing: bool, now: float,
         return f"Notifications paused until {until}", "Resume", "app.resume-notifications", ""
     if restart:
         return f"Restart {NAME} to use the microphone and camera", "Restart", "app.restart", ""
+    if update is not None and update[3]:
+        return update[0], update[1], update[2], ""
     if media_missing:
         return "Some videos and voice messages can't play", "Details", "app.preferences-page", "general"
+    if update is not None:
+        return update[0], update[1], update[2], ""
     return None
 
 
@@ -401,11 +407,12 @@ def media_debug(kind: str, state: dict, fallback: bool = False) -> str:
 
 
 def debug_info(calls: str, missing: Optional[list[str]], sandboxed: bool, devices: Iterable[str] = (),
-               audio: Iterable[str] = ()) -> str:
+               audio: Iterable[str] = (), updates: str = "") -> str:
     """The About dialog's troubleshooting text, for bug reports: versions and the desktop, never
     anything from WhatsApp. `missing` is None while the codec check hasn't answered; `devices`
     are media_debug's lines, `audio` audiosizes.debug_line's (how much the bridge's audio sets
-    hold: counts only)."""
+    hold: counts only), `updates` Updates.debug_line's (how this copy updates, and the newest
+    release found)."""
     def version(library) -> str:
         return f"{library.get_major_version()}.{library.get_minor_version()}.{library.get_micro_version()}"
 
@@ -423,6 +430,7 @@ def debug_info(calls: str, missing: Optional[list[str]], sandboxed: bool, device
         f"System: {os_release().get('PRETTY_NAME') or 'unknown'}",
         f"Desktop: {GLib.getenv('XDG_CURRENT_DESKTOP') or 'unknown'} ({GLib.getenv('XDG_SESSION_TYPE') or 'unknown'})",
         f"Sandboxed (Flatpak or Snap): {'yes' if sandboxed else 'no'}",
+        *([updates] if updates else []),
         f"Calls: {calls}",
         camera_fix_line(),
         f"Codecs for videos and voice messages: {codecs}",
@@ -708,6 +716,12 @@ class Natter(Adw.Application):
         self.restart_args: Optional[list[str]] = None  # quitting to start again (restart): its options
         self._restart_wait = 0  # restart, waiting for a reply under way to be answered
         self._restart_alert = None  # restart, asking about replies not sent yet
+        # New releases, and updating in place (update.py): made with the window (_build), so a
+        # search's start never checks. update_now, waiting for a reply under way to be answered.
+        self.updates: Optional[Updates] = None
+        self._update_wait = 0
+        self._update_warned = False  # Update was chosen in a dialog that said replies not sent would be lost
+        self.banner_shown = ""  # the banner's title, "" when there's none (_show_banner)
         # The microphone and the camera (media.py): what the desktop says about the camera, once
         # the window's services start; whether WebKit may find the camera itself (udev); whether
         # calls lost their devices for this run (_on_anchor_gone); whether there's a microphone;
@@ -857,6 +871,16 @@ class Natter(Adw.Application):
         fresh.connect("activate", self._gated(lambda *_: self._fresh_page_asked()))
         fresh.set_enabled(False)
         self.add_action(fresh)
+        # Likewise only while there's a release or a failed update to tell of, and What's New once
+        # an update has been told: Updates turns them on and off (update.py).
+        update = Gio.SimpleAction.new("update", None)
+        update.connect("activate", self._gated(lambda *_: self.show_update()))
+        update.set_enabled(False)
+        self.add_action(update)
+        notes = Gio.SimpleAction.new("update-notes", None)
+        notes.connect("activate", self._gated(lambda *_: self.updates is not None and self.updates.open_notes()))
+        notes.set_enabled(False)
+        self.add_action(notes)
         if GLib.getenv("NATTER_DEBUG"):
             self._debug_actions()
         # Held until ready: a first launch's command line waits in the queue, not on a main loop
@@ -1034,6 +1058,13 @@ class Natter(Adw.Application):
         self._ready = True
         self._release_start()
         start_mark("ready")
+        if self.updates is not None and not self._quitting:
+            try:
+                # After what waited, so the window a launch asked for is up: what an update left
+                # is told there, and the updater that started this Natter hears it's ready.
+                self.updates.started()
+            except Exception:
+                traceback.print_exc()
 
     def _when_ready(self, run: Callable[[], None], drop: Optional[Callable[[], None]] = None) -> None:
         """Run `run` now if start-up is done, or once it is, after what came before it. Dropped
@@ -1298,6 +1329,110 @@ class Natter(Adw.Application):
         print("natter: restarting, for the microphone and camera", flush=True)
         self.quit_natter()
 
+    # ---- Updates (update.py) ----------------------------------------------------------------
+
+    def show_update(self) -> None:
+        """app.update: the dialog about the release that's out, or about an update that failed
+        (update.dialog_for), in the window, past the passcode. Not while one is under way."""
+        if self._held_while_locked(self.show_update, "update") or not self.present_window():
+            return
+        if self.updates is None or self.updates.working:
+            return
+        alert = dialog_for(self)
+        if alert is not None:
+            alert.present(self.window)
+
+    def update_now(self, warned: bool = False) -> None:
+        """Update in place (the update dialog's Update): the release is got ready while Natter
+        runs (Updates.prepare), then the updater starts and Natter quits, for it to put the new
+        copy in place and start Natter again. Only for get.sh's copy. Not during a call, in any
+        account's page or the call window, ringing or on, which it would end; nor while a page
+        loads or syncs, or a voice message is being recorded. A reply being sent finishes first;
+        replies still being written are lost, which the dialog said (`warned`), or which is asked
+        right before quitting. Past the passcode. Like restart, nothing waits for what holds it
+        off: the banner stays, for later."""
+        updates = self.updates
+        if updates is None or updates.working or not updates.can_update or self._update_wait or self._quitting:
+            return
+        if self._update_held(lambda: self.update_now(warned)):
+            return
+        if self._held_while_locked(lambda: self.update_now(warned), "update") or not self.present_window():
+            return
+        self._update_warned = warned
+        updates.prepare(self._update_prepared)
+
+    def _update_prepared(self, ready: bool) -> None:
+        """The release is ready to install, or it isn't, which Updates has told. The download
+        took a while, and a call may have come meanwhile: the guards are asked again right
+        before quitting, and one that holds keeps what was downloaded for the next Update, as
+        does a No to replies written meanwhile. A call that comes as the updater starts keeps
+        Natter here too, and the updater changes nothing (Updates.stay)."""
+        if not ready or self._quitting:
+            return
+        if self._update_held(lambda: self._update_prepared(True)):
+            if not self._update_wait:  # a reply being sent is waited for, ready as it is
+                self.updates.hold()
+            return
+        if not self._update_warned and unsent(self):
+            self.updates.hold()
+            self._ask_update_replies()
+            return
+        hidden = not (self.window is not None and self.window.get_visible())
+
+        def started(ok: bool) -> None:
+            if not ok:
+                return
+            if in_a_call(self):
+                self.updates.stay()
+                self._say_update_held(f"Update {NAME} once the call ends")
+                return
+            self.quit_natter()  # the updater waits for this Natter to end; it starts the new one
+
+        self.updates.launch(hidden, started)
+
+    def _ask_update_replies(self) -> None:
+        """Replies were written since the update dialog said nothing of them: Update asks before
+        they're lost (update.replies_dialog), in the window, past the passcode."""
+        if self._held_while_locked(self._ask_update_replies, "update") or not self.present_window():
+            return
+        replies_dialog(self).present(self.window)
+
+    def _update_held(self, again: Callable[[], None]) -> bool:
+        """Whether something holds an update off now (update_now's guards), told in a toast, or
+        a notification out of sight. A reply being sent is waited for instead, and `again` runs
+        once it's answered."""
+        if in_a_call(self):
+            title = f"Update {NAME} once the call ends"
+        elif loading(self.accounts, time.monotonic()):
+            title = f"Update {NAME} once WhatsApp has loaded"
+        elif any(account.recording for account in self.accounts):
+            title = f"Update {NAME} once you've stopped recording"
+        elif any(window.sending for window in self.replies.values()) or any(a.replying for a in self.accounts):
+            self._update_wait = GLib.timeout_add(500, self._update_after_reply, again)  # Account answers in time
+            return True
+        else:
+            return False
+        self._say_update_held(title)
+        return True
+
+    def _say_update_held(self, title: str) -> None:
+        if self.window is not None and self.window.get_visible() and not self.locked:
+            self.window.toast(title)
+        else:
+            self.tell("update", title, button=("Update", "app.update", None))
+
+    def _update_after_reply(self, again: Callable[[], None]) -> bool:
+        self._update_wait = 0
+        again()
+        return GLib.SOURCE_REMOVE
+
+    def _updates_changed(self) -> None:
+        """What Updates has to show changed: the banner, the tray menu and Preferences follow."""
+        self._show_banner()
+        self._refresh_tray()
+        if self.preferences is not None:
+            self.preferences.update_status()
+
     def _build(self, hidden: bool = False) -> bool:
         """The window first, then WhatsApp in it. If the window can't be made, Natter quits
         rather than run WhatsApp where nobody can see it."""
@@ -1331,6 +1466,7 @@ class Natter(Adw.Application):
             self.quit()
             return False
         self.window.connect("notify::visible", lambda w, _p: self._on_visible_changed(w.get_visible()))
+        self.updates = Updates(self, changed=self._updates_changed)
         if not self.lock_enabled:
             # The lock was removed by hand (Forgot Passcode?): its state and its count of wrong
             # tries go with it, so a passcode set later starts clean.
@@ -1345,6 +1481,12 @@ class Natter(Adw.Application):
         self._on_window_visible(False)  # started hidden (--background) counts as hidden; showing cancels it
         self._show_unread()
         self._show_banner()  # a pause outlasts quitting: say so from the start
+        if self._ready:
+            # A window made after start-up (a search's start, opened later): _now_ready has been.
+            try:
+                self.updates.started()
+            except Exception:
+                traceback.print_exc()
         return True
 
     def settle_first_run(self, hidden: bool = False) -> None:
@@ -1612,6 +1754,11 @@ class Natter(Adw.Application):
         if isinstance(until, (int, float)) and 0 < until <= time.time():
             self.settings["dnd_until"] = 0  # → _on_setting refreshes the tray and the banner
         self._apply_page_sound()
+        if self.updates is not None:
+            try:
+                self.updates.tick()  # the daily check for a new release, once it's due (update.py)
+            except Exception:  # never the end of this timer
+                traceback.print_exc()
         return GLib.SOURCE_CONTINUE
 
     def _apply_page_sound(self) -> None:
@@ -2255,11 +2402,13 @@ class Natter(Adw.Application):
 
     def _show_banner(self) -> None:
         """The window's banner, the one place for states that last (banner_for): notifications
-        paused, else a restart to make, else media that can't play, until Preferences, where the
-        details are, is opened."""
+        paused, else a restart to make, else an update under way or failed, else media that can't
+        play, until Preferences, where the details are, is opened, else a new release."""
         if self.window is None:
             return
-        shown = banner_for(self.settings["dnd_until"], self._media_banner, time.time(), restart=self.media_lost)
+        shown = banner_for(self.settings["dnd_until"], self._media_banner, time.time(), restart=self.media_lost,
+                           update=self.updates.banner() if self.updates is not None else None)
+        self.banner_shown = shown[0] if shown is not None else ""  # Updates tells a release once its own is up
         if shown is None:
             self.window.hide_banner()
             return
@@ -2884,8 +3033,11 @@ class Natter(Adw.Application):
             blur = self.settings["privacy_blur"]
             items.append(MenuItem("Turn Off Privacy Blur" if blur else "Turn On Privacy Blur",
                                   lambda: self.settings.__setitem__("privacy_blur", not blur)))
+        # A new release that's out, while it's to be told (Updates.menu_item): its dialog.
+        update = self.updates.menu_item() if self.updates is not None else None
         items += [*self._dnd_items(),
                   *([MenuItem(f"Lock {NAME}", self.lock)] if self.lock_enabled and not self.locked else []),
+                  *([MenuItem(update, tray(self.show_update))] if update else []),
                   MenuItem(separator=True),
                   MenuItem(f"Quit {NAME}", self.quit_natter)]
         return items
@@ -3119,6 +3271,9 @@ class Natter(Adw.Application):
             self._show_banner()
         elif key in ("quiet_hours", "quiet_start", "quiet_end"):
             self._apply_page_sound()
+        elif key.startswith("update_"):
+            if self.updates is not None:
+                self.updates.changed()  # the banner, the tray and Preferences, by whatever wrote it
         elif key == "lock_hash":
             self._attempts.succeeded()  # a new or no passcode: wrong tries at the old one don't count
             if not value:
@@ -3297,9 +3452,10 @@ class Natter(Adw.Application):
         audio = [audio_debug_line(account.audio_sizes.last, index, len(accounts))
                  for index, account in enumerate(accounts)]
         codecs = [self._media[0] if self._media else None]
+        updates = self.updates.debug_line() if self.updates is not None else ""
 
         def show() -> None:
-            about.set_debug_info(debug_info(calls, codecs[0], in_sandbox(), devices, audio))
+            about.set_debug_info(debug_info(calls, codecs[0], in_sandbox(), devices, audio, updates))
 
         def checked(missing: list[str], _hint: str) -> None:
             codecs[0] = missing
@@ -3348,6 +3504,14 @@ class Natter(Adw.Application):
             # Only true of this instance, and one started next could neither take it away nor act on
             # its Restart: GLib leaves it up when Natter ends.
             self.withdraw_notification("media-lost")
+            # Likewise a new release's: after an update it would offer what's running by then, and
+            # otherwise the banner and the tray still say it; and an update's outcome, whose What's
+            # New the next Natter doesn't take, or which it tells again. A check or a download
+            # under way ends.
+            for key in ("update", "updated", "update-failed"):
+                self.withdraw_notification(key)
+            if getattr(self, "updates", None) is not None:
+                self.updates.stop()
             # So do the notices of replies that failed out of sight: their words end with this Natter,
             # and their Show Reply would find nothing.
             for window in list(self.replies.values()):

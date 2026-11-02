@@ -25,7 +25,8 @@ runs its `install.sh`, which installs it for you alone. If packages are missing,
 asks before installing them with your package manager (through `sudo`). Then open Natter Den from
 your apps and scan the code from *Linked devices* in WhatsApp on your phone.
 
-- **Update:** run the same command again. It installs the newest release.
+- **Update:** choose *Update* when Natter Den says a new version is out, or run the same command
+  again. Either installs the newest release.
 - **Uninstall:** `~/.local/lib/natter/source/install.sh --uninstall && rm -rf ~/.local/lib/natter`
   (your sessions and settings stay in `~/.local/share/natter`, `~/.config/natter` and
   `~/.cache/natter` until you delete them).
@@ -43,7 +44,8 @@ the Flatpak instead, on GNOME's runtime:
 curl -fsSL https://raw.githubusercontent.com/Officialbabs/natter/master/get.sh | sh -s -- --flatpak
 ```
 
-- **Update:** run the same command again. It builds the newest release.
+- **Update:** run the same command again. It builds the newest release. Natter Den says when a new
+  version is out, and *Details* there shows this command.
 - **Uninstall:** `flatpak uninstall --user io.github.Officialbabs.Natter && rm -rf ~/.local/lib/natter/source ~/.cache/natter-den-flatpak`
   (your data stays in `~/.var/app/io.github.Officialbabs.Natter`).
 
@@ -88,6 +90,10 @@ The Flatpak is experimental: it hasn't been tested yet, calls in it included.
   guard ends and reloads a WhatsApp page that keeps growing ([details](docs/memory.md)).
 - Chats by name for desktop search (`org.gnome.Shell.SearchProvider2`)
   ([details](docs/how-it-works.md#desktop-integration)).
+- Says when a new version is out, in the window, the tray menu and Preferences → General → Updates.
+  Installed with `get.sh`, it updates itself when you choose *Update*: it downloads and checks the
+  new version while it runs, then closes, installs it and opens again, and puts the old one back if
+  anything goes wrong ([how](docs/how-it-works.md#updates)).
 
 Experimental:
 
@@ -184,6 +190,10 @@ run on Ada 26.04 (based on Ubuntu) and on CachyOS (based on Arch) with KDE Plasm
   to WhatsApp by number, size and type, not by name.
 - A notification's id and its Reply and Mute actions carry a random reference, not the chat's
   name.
+- Once a day Natter Den asks GitHub whether a new version is out: one request to `api.github.com`,
+  or to `github.com` when that doesn't answer. It sends nothing else: no cookies, no ids, not even
+  its version. *Check for Updates* in Preferences → General → Updates turns it off
+  ([details](docs/how-it-works.md#updates)).
 
 ## Reporting a problem
 

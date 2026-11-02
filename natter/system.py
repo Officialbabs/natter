@@ -100,6 +100,24 @@ def give_system_bus(launcher) -> None:
         launcher.setenv(SYSTEM_BUS, address)
 
 
+def program_environ(environ=None) -> dict[str, str]:
+    """give_system_bus as a dict: the environment of a program Natter starts (not a WebKit one)
+    without Gio, for one that passes it on itself (the updater, update.py). A copy of `environ`
+    (os.environ by default), with the system bus given back and the camera fix's settings off."""
+    from .gstfix import launch_env
+
+    environ = os.environ if environ is None else environ
+    changed = dict(environ)
+    launch_env(changed, environ)
+    if _system_bus_before is not None:
+        address = _system_bus_before[0]
+        if address is None:
+            changed.pop(SYSTEM_BUS, None)
+        else:
+            changed[SYSTEM_BUS] = address
+    return changed
+
+
 def open_uri(uri: str, window=None) -> None:
     """Open `uri` (a link, or a file's file:// address) in the app the desktop has for it.
 

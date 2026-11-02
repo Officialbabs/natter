@@ -40,6 +40,10 @@ from . import APP_ID, DEFAULT_APP_ID, NAME, OBJECT_PATH
 from .memguard import descends, in_flatpak, web_processes
 
 LOCK_WAIT = 20.0  # seconds a new primary waits for an old one, nameless, to end
+# Seconds it waits for the updater (updater.py, its install.sh 300 s at most), which ends it once
+# a copy is in place, before it starts that one; and what the updater notes in the lock's file.
+UPDATE_WAIT = 330.0
+UPDATING = "updating"
 LOCK_POLL = 0.25
 KILL_WAIT = 10.0  # seconds the lock has to come free once a stale holder is ended
 WATCH_POLL = 3.0  # seconds between the watchdog's looks
@@ -179,6 +183,14 @@ class InstanceLock:
         """The pid the holder wrote, if it did."""
         return self.details().pid
 
+    def updating(self) -> bool:
+        """Whether the holder is the updater, which notes UPDATING after its pid and start time."""
+        try:
+            words = os.pread(self._open(), 256, 0).decode().split()
+        except (OSError, UnicodeDecodeError):
+            return False
+        return words[2:3] == [UPDATING]
+
     def release(self) -> None:
         if self.fd is not None:
             os.close(self.fd)  # the lock goes with it
@@ -208,7 +220,14 @@ def taking(lock: InstanceLock, wait: float = LOCK_WAIT, poll: float = LOCK_POLL,
         log(f"natter: no instance lock ({error.strerror or error}); the bus name alone keeps one {NAME}")
         return Taken(True, "unavailable")
     holder = lock.holder()
-    log(f"natter: another {NAME} ({pid_words(holder)}) still runs without its bus name; waiting for it to end")
+    # The updater, swapping the copy this start was made from: it ends this start once the new copy
+    # is in place, or the old one is back, and starts that one. Waited for as long as that may take.
+    updating = lock.updating()
+    if updating:
+        log(f"natter: {NAME} is being updated ({pid_words(holder)}); waiting for the update to finish")
+        wait = max(wait, UPDATE_WAIT)
+    else:
+        log(f"natter: another {NAME} ({pid_words(holder)}) still runs without its bus name; waiting for it to end")
     deadline = clock() + wait
     while clock() < deadline:
         yield poll
@@ -218,6 +237,11 @@ def taking(lock: InstanceLock, wait: float = LOCK_WAIT, poll: float = LOCK_POLL,
                 return Taken(True, "taken over", holder)
         except OSError:
             break
+        if not updating and lock.updating():  # the one quitting for an update has, and the updater took over
+            updating = True
+            holder = lock.holder()
+            log(f"natter: {NAME} is being updated ({pid_words(holder)}); waiting for the update to finish")
+            deadline = max(deadline, clock() + UPDATE_WAIT)
     ended = False
     if end_holder is not None:
         try:
