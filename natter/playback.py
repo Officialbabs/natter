@@ -6,9 +6,12 @@ Web Audio context as well; or the page may decode sound itself (decodeAudioData,
 AudioDecoder) and play it through a context. Where they can't be heard, the log says how the
 page tried: once a page, how WebKit answers for the formats voice messages come in (with WebKit's
 and GStreamer's versions), which way sound played, decodeAudioData's answer, an Opus AudioDecoder
-supported, configured or failing, a decoded sound started, and a page's own worklet or script
-processor connected (with its context's state a moment on); and each failure, the element's
-error, play() refused, or the context it plays through not running. Each once a page for what it
+supported, configured or failing, a decoded sound started, a page's own worklet or script
+processor connected (with its context's state a moment on), and a voice recorder fed by the
+microphone again (a voice note resumed after a pause: whether Natter rested its context meanwhile,
+and whether that context's clock moves); and
+each failure, the element's error, play() refused, the context it plays through not running, or
+a context Natter rested not resuming. Each once a page for what it
 says. Only kinds, codes, states and error names from fixed lists: never a URL, a name or what
 plays.
 """
@@ -21,7 +24,8 @@ from typing import Optional
 # The bridge's SUPPORT keys, in its order.
 SUPPORT_KEYS = ("ogg-opus", "ogg", "webm-opus", "mp4-opus", "mp4-aac", "mpeg")
 ANSWERS = ("", "maybe", "probably")  # canPlayType's
-WHATS = ("support", "played", "error", "refused", "silent", "decode", "decoder", "started", "processor")
+WHATS = ("support", "played", "error", "refused", "silent", "decode", "decoder", "started", "processor", "resumed",
+         "wake")
 KINDS = ("audio", "video")
 ROUTES = ("element", "webaudio")
 STATES = ("", "running", "suspended", "interrupted", "closed")
@@ -54,6 +58,16 @@ def parse(message: dict) -> Optional[dict]:
             return None
         return {"type": "media", "what": what, "play": {key: play[key] for key in SUPPORT_KEYS},
                 "source": {key: source[key] for key in SUPPORT_KEYS}}
+    if what == "resumed":
+        state, rested, moving = message.get("state"), message.get("rested"), message.get("moving")
+        if state not in STATES or not state or not isinstance(rested, bool) or not isinstance(moving, bool):
+            return None
+        return {"type": "media", "what": what, "state": state, "rested": rested, "moving": moving}
+    if what == "wake":
+        name = message.get("name")
+        if not isinstance(name, str) or not ERROR_NAME.fullmatch(name):
+            return None
+        return {"type": "media", "what": what, "name": name}
     if what in ("decode", "decoder"):
         name = message.get("name")
         if not isinstance(name, str) or not ERROR_NAME.fullmatch(name):
@@ -128,6 +142,15 @@ def line(message: dict, versions: str = "") -> str:
     if what == "processor":
         return (f"media: the page's own player ({PROCESSORS[message['kind']]}) connected; its Web Audio "
                 f"context 1.5 s on: {message['state']}")
+    if what == "resumed":
+        meanwhile = "rested by the idle audio after 10 minutes quiet" if message["rested"] else "kept running"
+        clock = "its clock moving" if message["moving"] else "its clock not moving, so nothing is recorded"
+        return (f"media: a voice recorder fed by the microphone again (a voice note resumed after a pause, or the "
+                f"next one in the same recorder); its Web Audio context ({meanwhile}) 2.5 s on: "
+                f"{message['state']}, {clock}")
+    if what == "wake":
+        return (f"media: a Web Audio context the idle audio rested didn't resume, twice: "
+                f"{message['name'] or 'no error name'}")
     if what == "started":
         return (f"media: a decoded sound started (AudioBufferSourceNode); its Web Audio context 1.5 s on: "
                 f"{message['state']}")

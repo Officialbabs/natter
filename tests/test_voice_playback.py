@@ -279,7 +279,8 @@ class WakeTest(unittest.TestCase):
         self.assertEqual(result, ["suspended", "running", "running", "running", "suspended", 0])
 
     def test_a_recorder_left_connected_lets_its_context_rest(self):
-        # A voice-note recorder's worklet, fed by the microphone, left connected after it stops.
+        # A voice-note recorder's worklet, fed by the microphone, left connected after it stops:
+        # ten minutes on (a paused voice note's hold), its context rests.
         result = run("""
             const context = new window.AudioContext();
             const track = { readyState: "live" };
@@ -292,9 +293,75 @@ class WakeTest(unittest.TestCase):
             const recording = [context.state, audio().sizes.held];
             track.readyState = "ended";
             rest();
-            [recording, context.state, audio().sizes.held];
+            const quiet = [context.state, audio().sizes.held];
+            clock += 600000;
+            rest();
+            [recording, quiet, context.state, audio().sizes.held];
         """)
-        self.assertEqual(result, [["running", 1], "suspended", 0])
+        self.assertEqual(result, [["running", 1], ["running", 1], "suspended", 0])
+
+    def test_a_paused_voice_note_keeps_its_context_running(self):
+        # WhatsApp's recorder: a script processor fed by the microphone. Paused, the microphone
+        # stops (and the processor may be disconnected); resumed, a new stream feeds the same
+        # processor. Resting the context meanwhile would make the resume reopen its output stream.
+        result = run("""
+            const context = new window.AudioContext();
+            const first = { readyState: "live" };
+            const recorder = context.createScriptProcessor(4096, 1, 1);
+            recorder.onaudioprocess = () => {};
+            context.createMediaStreamSource({ getTracks: () => [first] }).connect(recorder);
+            recorder.connect(destination);
+            clock += 40000;
+            first.readyState = "ended";  // paused
+            recorder.disconnect();
+            const states = [];
+            for (let minute = 1; minute <= 9; minute++) {
+              clock += 60000;
+              rest();
+              states.push(context.state);
+            }
+            const second = { readyState: "live" };
+            context.createMediaStreamSource({ getTracks: () => [second] }).connect(recorder);  // resumed
+            recorder.connect(destination);
+            clock += 120000;
+            second.readyState = "ended";  // paused again: its hold starts afresh
+            clock += 60000;
+            rest();
+            [states.every((state) => state === "running"), context.state];
+        """)
+        self.assertEqual(result, [True, "running"])
+
+    def test_a_failed_wake_is_tried_again_then_told(self):
+        context = JavaScriptCore.Context()
+        context.evaluate(FAKES + IDLE + HEARD + """
+            const ctx = new window.AudioContext();
+            rest();
+            let tries = 0;
+            ctx.resume = function () { tries++; return Promise.reject({ name: "InvalidStateError", message: "x" }); };
+            wake(ctx);
+        """, -1)
+        self.assertIsNone(context.get_exception())
+        context.evaluate("runTimers();", -1)  # the second try, a second later
+        self.assertIsNone(context.get_exception())
+        result = json.loads(context.evaluate("JSON.stringify([tries, posted.filter((m) => m.what === 'wake')])", -1).to_string())
+        self.assertEqual(result, [2, [{"type": "media", "what": "wake", "name": "InvalidStateError"}]])
+
+    def test_a_failed_wake_of_a_context_natter_never_rested_is_not_told(self):
+        # One the page suspended itself, or one WebKit hasn't started yet: tried again, not blamed
+        # on the idle audio.
+        context = JavaScriptCore.Context()
+        context.evaluate(FAKES + IDLE + HEARD + """
+            const ctx = new window.AudioContext();
+            ctx.suspend();
+            let tries = 0;
+            ctx.resume = function () { tries++; return Promise.reject({ name: "InvalidStateError", message: "x" }); };
+            wake(ctx);
+        """, -1)
+        self.assertIsNone(context.get_exception())
+        context.evaluate("runTimers();", -1)
+        self.assertIsNone(context.get_exception())
+        result = json.loads(context.evaluate("JSON.stringify([tries, posted.filter((m) => m.what === 'wake')])", -1).to_string())
+        self.assertEqual(result, [2, []])
 
     def test_held_contexts_are_counted(self):
         result = run("""
@@ -999,6 +1066,41 @@ class HeardTest(unittest.TestCase):
         listed = listed[listed.index("[") + 1:listed.index("]")]
         self.assertEqual(tuple(json.loads(f"[{listed}]")), playback.MEDIA_TYPES)
 
+    def test_a_voice_note_resumed_after_a_pause(self):
+        # Told once a page for each answer: whether Natter rested the context meanwhile, its
+        # state a moment on and whether its clock moved.
+        posted = run("""
+            const context = new window.AudioContext();
+            context.currentTime = 0;
+            rest();  // rested before the voice note: not meanwhile
+            const recorder = context.createScriptProcessor(4096, 1, 1);
+            recorder.onaudioprocess = () => {};
+            const first = { readyState: "live" };
+            context.createMediaStreamSource({ getTracks: () => [first] }).connect(recorder);
+            recorder.connect(destination);
+            runTimers();
+            first.readyState = "ended";
+            clock += 30000;
+            rest();  // a short pause: held, not rested
+            const second = { readyState: "live" };
+            context.createMediaStreamSource({ getTracks: () => [second] }).connect(recorder);
+            context.currentTime = 1.5;
+            runTimers();
+            second.readyState = "ended";
+            clock += 30000;
+            rest();
+            clock += 700000;
+            rest();  // a long one: rested
+            const third = { readyState: "live" };
+            context.createMediaStreamSource({ getTracks: () => [third] }).connect(recorder);
+            runTimers();  // its clock stands still
+            posted.filter((message) => message.what === "resumed");
+        """, heard=True)
+        self.assertEqual(posted, [
+            {"type": "media", "what": "resumed", "state": "running", "rested": False, "moving": True},
+            {"type": "media", "what": "resumed", "state": "running", "rested": True, "moving": False},
+        ])
+
     def test_a_page_player_connected(self):
         # Sound decoded in wasm or a worker plays through one of these, with no other line.
         posted = run("""
@@ -1179,6 +1281,14 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(parse_message(error), error)
         refused = {**self.PLAYED, "what": "refused", "name": "NotAllowedError"}
         self.assertEqual(parse_message(refused), refused)
+        resumed = {"type": "media", "what": "resumed", "state": "running", "rested": True, "moving": False}
+        self.assertEqual(parse_message(resumed), resumed)
+        wake = {"type": "media", "what": "wake", "name": "InvalidStateError"}
+        self.assertEqual(parse_message(wake), wake)
+        for change in ({"state": ""}, {"state": "asleep"}, {"rested": "yes"}, {"moving": 1}, {"rested": None}):
+            self.assertIsNone(parse_message({**resumed, **change}), change)
+        for name in ("Not allowed", "x" * 41, 7, None):
+            self.assertIsNone(parse_message({**wake, "name": name}), name)
 
     def test_anything_else_is_dropped(self):
         for change in ({"what": "sang"}, {"kind": "img"}, {"route": "speakers"}, {"state": "asleep"},
@@ -1231,6 +1341,19 @@ class ParseTest(unittest.TestCase):
                          "media: WebCodecs AudioDecoder (opus): isConfigSupported() says no")
         self.assertEqual(playback.line(started), "media: a decoded sound started (AudioBufferSourceNode); its Web "
                                                  "Audio context 1.5 s on: suspended")
+
+    def test_a_voice_note_resumed_and_a_wake_that_failed(self):
+        resumed = {"type": "media", "what": "resumed", "state": "running", "rested": True, "moving": False}
+        self.assertEqual(playback.line(resumed),
+                         "media: a voice recorder fed by the microphone again (a voice note resumed after a pause, "
+                         "or the next one in the same recorder); its Web Audio context (rested by the idle audio "
+                         "after 10 minutes quiet) 2.5 s on: running, its clock not moving, so nothing is recorded")
+        self.assertEqual(playback.line({**resumed, "rested": False, "moving": True}),
+                         "media: a voice recorder fed by the microphone again (a voice note resumed after a pause, "
+                         "or the next one in the same recorder); its Web Audio context (kept running) 2.5 s on: "
+                         "running, its clock moving")
+        self.assertEqual(playback.line({"type": "media", "what": "wake", "name": "InvalidStateError"}),
+                         "media: a Web Audio context the idle audio rested didn't resume, twice: InvalidStateError")
 
     def test_a_page_player(self):
         message = {"type": "media", "what": "processor", "kind": "worklet", "state": "running"}

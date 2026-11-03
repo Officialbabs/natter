@@ -131,11 +131,23 @@
   const started = new Set();  // elements the page started, until they stop: WhatsApp's own `new Audio()`s too
   let lastStart = 0;
   const IDLE_MS = 30000;  // long enough that a burst of message sounds doesn't cycle the pipeline
+  const WAKE_AGAIN_MS = 1000;
+  const lastRested = new WeakMap();  // each context → when Natter last suspended it
+  let onWakeFailed = null;  // set by "Sound that can't be heard", for its log line
 
+  // A resume() that fails is tried once more. For a context Natter rested, a second failure is
+  // told too: the page never suspended that one itself, so it wouldn't find out.
   function wake(context) {
     if (!context) return;
+    const ours = rested.has(context);
     rested.delete(context);
-    if (context.state === "suspended") context.resume().catch(() => {});
+    if (context.state !== "suspended") return;
+    context.resume().catch(() => {
+      setTimeout(() => {
+        if (context.state !== "suspended") return;
+        context.resume().catch((error) => { if (ours && onWakeFailed) onWakeFailed(error); });
+      }, WAKE_AGAIN_MS);
+    });
   }
 
   function eachContext(visit) {
@@ -190,14 +202,19 @@
   // up while it's connected (a script processor only with onaudioprocess set or an audioprocess
   // listener), and connecting one, or giving a script processor its handler, wakes a context
   // Natter suspended, as a start does. One fed only by microphone streams that have all ended (a
-  // recorder left connected) doesn't hold its context. Held weakly: one the page lets go is
-  // collected, and goes from here.
+  // recorder, paused or done) holds its context only RECORDER_HOLD_MS more, connected or not
+  // (processing()). Held weakly: one the page lets go is collected, and goes from here.
   const processors = new Set();  // WeakRefs to those nodes
   const outputs = new WeakMap();  // each → what it's connected to now
   const scripts = new WeakSet();  // which of them are script processors
   const listening = new WeakMap();  // a script processor → its audioprocess listeners
   const fedBy = new WeakMap();  // each → the microphone streams connected into it
+  const quietSince = new WeakMap();  // a recorder → when its microphone streams were first seen ended
+  // A recorder whose microphone stopped (a voice note paused, or done) holds its context this
+  // long: see processing().
+  const RECORDER_HOLD_MS = 10 * 60000;
   let onProcessorConnected = null;  // set by "Sound that can't be heard", for its log line
+  let onRecorderResumed = null;  // the same, for a recorder fed again after a pause
 
   // Something starts to play through a processor: as a start does.
   function processorBusy(node) {
@@ -276,14 +293,21 @@
   }
 
   // A microphone source connected into a processor: a recorder's. Once all such streams have
-  // ended, the processor no longer holds its context.
+  // ended, the processor holds its context only a while (processing()). One fed again after
+  // that is a voice note resumed after a pause, or the next one recorded into the same recorder.
   function feedFrom(source, stream) {
     if (!source || typeof source.connect !== "function" || !stream) return;
     const connect = source.connect;
     source.connect = function (destination, ...rest) {
       const result = connect.call(this, destination, ...rest);
       const feeds = destination && fedBy.get(destination);
-      if (feeds) feeds.add(stream);
+      if (feeds && !feeds.has(stream)) {
+        const again = feeds.size > 0 && [...feeds].every(ended);
+        const quiet = quietSince.get(destination);
+        feeds.add(stream);
+        quietSince.delete(destination);
+        if (again && onRecorderResumed) onRecorderResumed(destination, quiet);
+      }
       return result;
     };
   }
@@ -292,17 +316,27 @@
     try { return !stream.getTracks().some((track) => track.readyState === "live"); } catch (_) { return false; }
   };
 
-  // The contexts a connected processor holds up now.
+  // The contexts a connected processor holds up now. A recorder whose microphone streams have all
+  // ended holds its own for RECORDER_HOLD_MS from then, connected or not: paused, WhatsApp records
+  // on into the same context, and one Natter rested meanwhile would open its output stream again
+  // right as the microphone opens again (when that's a Bluetooth headset, as it switches to its
+  // headset profile); an output stream that fails to open then stops the context's clock, and the
+  // recording with it. So a paused voice note's context runs on as it would without Natter.
   function processing() {
     const busy = new Set();
+    const now = performance.now();
     for (const ref of processors) {
       const node = ref.deref();
       if (!node || !node.context || node.context.state === "closed") { processors.delete(ref); continue; }
+      const feeds = fedBy.get(node);
+      if (feeds && feeds.size && [...feeds].every(ended)) {  // a recorder, stopped
+        if (!quietSince.has(node)) quietSince.set(node, now);
+        if (now - quietSince.get(node) < RECORDER_HOLD_MS) busy.add(node.context);
+        continue;
+      }
       const out = outputs.get(node);
       if (!out || !out.size) continue;
       if (scripts.has(node) && typeof node.onaudioprocess !== "function" && !listening.get(node).size) continue;
-      const feeds = fedBy.get(node);
-      if (feeds && feeds.size && [...feeds].every(ended)) continue;  // a recorder, done
       busy.add(node.context);
     }
     return busy;
@@ -314,6 +348,7 @@
     eachContext((context) => {
       if (context.state === "running" && !callContexts.has(context) && !busy.has(context)) {
         rested.add(context);
+        lastRested.set(context, performance.now());
         context.suspend().catch(() => {});
       }
     });
@@ -559,7 +594,7 @@
     const live = liveStreams();
     const media = mediaPlaying();  // after it, elements holds only what it keeps
     const playingNow = playingStarted();
-    const held = processing().size;  // contexts a connected worklet or script processor keeps up
+    const held = processing().size;  // contexts processing() holds up: a connected worklet or script processor, or a recorder lately stopped
     return { contexts: states, sources: playing, streams: live, media, elements: elements.size,
              idle: Math.round(performance.now() - lastStart),
              rtc: window.__natterRtc ? window.__natterRtc.counts() : null,
@@ -1199,9 +1234,11 @@
   // through a context, and the context's state); decodeAudioData resolved or rejected; an Opus
   // AudioDecoder supported, configured or failing; a decoded sound started, and its context's
   // state then; a page's own worklet or script processor connected, and its context's state
-  // then; and each failure: the element's error (MediaError's code), play() refused (the
-  // error's name, not its message) or the context it plays through not running a moment after
-  // it started. Each line once a page for what it says, so repeats don't use up the page's
+  // then; a recorder fed by the microphone again (a voice note resumed after a pause), whether
+  // Natter rested its context meanwhile, and its state and clock then; and each failure: the
+  // element's error (MediaError's code), play() refused (the error's name, not its message), the
+  // context it plays through not running a moment after it started, or a context Natter rested
+  // not resuming. Each line once a page for what it says, so repeats don't use up the page's
   // MEDIA_LINES. Kinds, codes, states and error names only, never a URL, a name or what plays.
   {
     const MEDIA_LINES = 12;
@@ -1393,6 +1430,28 @@
         const state = String(context.state);
         tellMedia({ what: "processor", kind, state }, `processor ${kind} ${state}`);
       }, 1500);
+    };
+
+    // A recorder fed by the microphone again (a voice note resumed after a pause, or the next one
+    // recorded into the same recorder): whether Natter rested its context meanwhile, and after a
+    // wake's second try could have brought it back, its state and whether its clock moves (it
+    // doesn't when its output stream failed to open: then nothing is recorded). Kinds only.
+    onRecorderResumed = (node, quiet) => {
+      const context = node.context;
+      if (!context) return;
+      const since = lastRested.get(context);
+      const restedThen = since !== undefined && quiet !== undefined && since >= quiet;
+      const before = Number(context.currentTime) || 0;
+      setTimeout(() => {
+        const state = String(context.state);
+        const moving = (Number(context.currentTime) || 0) - before > 0.5;
+        tellMedia({ what: "resumed", state, rested: restedThen, moving },
+                  `resumed ${state} ${restedThen} ${moving}`);
+      }, WAKE_AGAIN_MS + 1500);
+    };
+    onWakeFailed = (error) => {
+      const name = errorName(error);
+      tellMedia({ what: "wake", name }, `wake ${name}`);
     };
 
     // WebCodecs' AudioDecoder, for Opus only: supported, configured, or its error's name.

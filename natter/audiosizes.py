@@ -4,9 +4,9 @@ troubleshooting text.
 The bridge keeps sets of the page's AudioContexts (and of those it suspended, and those carrying
 a call), of the media elements played through them, of the sources still playing and of the
 microphone streams feeding them, and a map of the notifications it showed; and how many contexts
-a connected worklet or script processor keeps from being suspended ("held"), and of the elements
-the page started that haven't stopped ("started"). Each is pruned as what
-is in it ends, so each should stay small; one that doesn't is a leak. That shows here the way a
+a connected worklet or script processor, or a voice recorder whose microphone stopped in the last
+10 minutes, keeps from being suspended ("held"), and of the elements the page started that haven't
+stopped ("started"). Each is pruned as what is in it ends, so each should stay small; one that doesn't is a leak. That shows here the way a
 selector WhatsApp dropped shows in the canary's line: a line once the chat list is up, then only
 when a size passes its limit or keeps growing check after check, never a line every check. Only
 counts: no names, no URLs, nothing of what the sets hold.

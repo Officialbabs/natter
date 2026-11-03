@@ -172,31 +172,41 @@ choice) and says so in the log, once a stream:
 voice messages may play through either) is muted by the sound server, …`.
 
 The bridge's idle audio (see [Memory](memory.md#idle-audio)) wakes a context it suspended before
-anything plays through it: a sound started, an element played (also one made a source of the
-context by `createMediaElementSource` or `new MediaElementAudioSourceNode`), and any worklet or
-script processor made or connected, which is how a page decoding sound itself would play it.
-While such a worklet (not a call's) is connected, or a script processor with `onaudioprocess` set
-or an `audioprocess` listener, the context isn't suspended, so a long note isn't cut off; a
-context with neither still rests, and so does one whose processor is fed only by microphone
-streams that have ended (a recorder left connected). The log's and About's audio sets say how many
-contexts are held up this way (`held`), and how many elements the page started are still playing
-(`started`).
+anything plays through it: a sound started, an element played (also one made a source of the context
+by `createMediaElementSource` or `new MediaElementAudioSourceNode`), and any worklet or script
+processor made or connected, which is how a page decoding sound itself would play it. A wake that
+fails is tried again a second later, and the log says when that fails too. While such a worklet (not
+a call's) is connected, or a script processor with `onaudioprocess` set or an `audioprocess`
+listener, the context isn't suspended, so a long note isn't cut off; a context with neither still
+rests. A voice message's recorder (a processor fed by the microphone) whose microphone has stopped
+holds its context 10 minutes more, connected or not: a paused voice message records on into the same
+context, and one rested meanwhile would open its output stream again just as the microphone opens
+again (with Bluetooth headphones, as they switch to their headset profile); a stream that fails to
+open then stops the context's clock, and the recording with it. Without Natter Den the context would
+run on, as it now does. After the 10 minutes it rests (a recorder left connected). So the hold comes
+after a voice message sent or deleted too, as the bridge can't tell them from a paused one. The
+log's and About's audio sets say how many contexts are held up this way (`held`), and how many
+elements the page started are still playing (`started`).
 
-The log's lines are there to tell these candidates apart, a few a page, each once for what it
-says: at the page's first sound, WebKit's and GStreamer's versions and how WebKit answers
-`canPlayType` and `MediaSource.isTypeSupported` for the formats voice messages come in; each way
-sound played (from the element itself, or through a Web Audio context, with its state, and the
-kind of source); `decodeAudioData` resolved or rejected (the error's name); an Opus WebCodecs
-`AudioDecoder` supported or not, configured, or failing (the error's name); a decoded sound
-started, and its context's state a moment later; the page's own worklet or script processor
-connected, and its context's state a moment later; and each failure: the element's error
-(`MediaError`'s code), `play()` refused (the error's name), or the context an element plays
-through still not running 1.5 s after it started. A muted `music` stream beside `played` lines
-points at the sound server; `MediaError` or `decodeAudioData` failures at WebKit or GStreamer; a
-context left suspended at the idle audio. No sound lines at all while voice messages are tried
-rules out `<audio>` and decoding on the page's main thread only: sound decoded in a worker and
-played some other way leaves none. Only kinds, codes, states and error names, never an address or a name
-(`natter/playback.py`). `tools/report.sh` adds the GStreamer elements a voice message plays
+The log's lines are there to tell these candidates apart, a few a page, each once for what it says:
+at the page's first sound, WebKit's and GStreamer's versions and how WebKit answers `canPlayType`
+and `MediaSource.isTypeSupported` for the formats voice messages come in; each way sound played
+(from the element itself, or through a Web Audio context, with its state, and the kind of source);
+`decodeAudioData` resolved or rejected (the error's name); an Opus WebCodecs `AudioDecoder`
+supported or not, configured, or failing (the error's name); a decoded sound started, and its
+context's state a moment later; the page's own worklet or script processor connected, and its
+context's state a moment later; a voice recorder fed by the microphone again (a voice message
+resumed after a pause, or the next one recorded into the same recorder), with whether the idle audio
+had rested its context meanwhile, and 2.5 s on (after a failed wake's second try) its state and
+whether its clock moves (it stands still when its output stream couldn't open, and then nothing is
+recorded); and each failure: the element's error (`MediaError`'s code), `play()` refused (the
+error's name), the context an element plays through still not running 1.5 s after it started, or a
+context the idle audio rested not resuming, twice (the error's name). A muted `music` stream beside
+`played` lines points at the sound server; `MediaError` or `decodeAudioData` failures at WebKit or
+GStreamer; a context left suspended at the idle audio. No sound lines at all while voice messages
+are tried rules out `<audio>` and decoding on the page's main thread only: sound decoded in a worker
+and played some other way leaves none. Only kinds, codes, states and error names, never an address
+or a name (`natter/playback.py`). `tools/report.sh` adds the GStreamer elements a voice message plays
 through and the sinks' ranks, a test voice message made and played into `fakesink`, the outputs by
 number and kind, Natter Den's sound streams (mute, volume, role), and what WirePlumber remembers
 for them (role or app, mute, volume and the kind of output); with `--watch`, the streams each time
