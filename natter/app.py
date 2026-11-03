@@ -188,13 +188,11 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>The media player a voice message leaves in the desktop's media controls goes once nothing plays.</p>"
+RELEASE_NOTES = ("<p>A voice message paused and resumed records on.</p>"
                  "<ul>"
-                 "<li>After a voice message, tone or ringtone ends, its player leaves the desktop's media controls within 2 seconds</li>"
-                 "<li>One paused in the window keeps its player 2 minutes, to carry on from those controls; one paused from outside, from those controls or by another app, 30 minutes</li>"
-                 "<li>Nothing goes while anything else plays, a microphone is on or a call is: it waits for the end</li>"
-                 "<li>A sound that failed to load no longer counts as playing, so the page's audio rests as it should</li>"
-                 "<li>The log's audio sets count the sounds still playing</li>"
+                 "<li>A paused voice message keeps its recording's sound running for up to 10 minutes, so resuming it no longer has to start it again just as the microphone (and Bluetooth headphones) come back on: a start that failed then froze the recording</li>"
+                 "<li>A sound rested to save power that fails to wake is tried again, and the log says so if it fails twice</li>"
+                 "<li>The log says, for a voice message recorded again after a pause, whether its recording runs</li>"
                  "</ul>")
 
 

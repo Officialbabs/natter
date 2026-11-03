@@ -81,6 +81,16 @@
   </content_rating>
 
   <releases>
+    <release version="0.1.12" date="2026-11-03">
+      <description>
+        <p>A voice message paused and resumed records on.</p>
+        <ul>
+          <li>A paused voice message keeps its recording's sound running for up to 10 minutes, so resuming it no longer has to start it again just as the microphone (and Bluetooth headphones) come back on: a start that failed then froze the recording</li>
+          <li>A sound rested to save power that fails to wake is tried again, and the log says so if it fails twice</li>
+          <li>The log says, for a voice message recorded again after a pause, whether its recording runs</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.11" date="2026-11-02">
       <description>
         <p>The media player a voice message leaves in the desktop's media controls goes once nothing plays.</p>
