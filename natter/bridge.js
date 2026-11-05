@@ -563,7 +563,13 @@
     const play = HTMLMediaElement.prototype.play;
     HTMLMediaElement.prototype.play = function (...args) {
       lastStart = performance.now();
-      eachContext((context) => { if (rested.has(context)) wake(context); });  // only what Natter suspended
+      // An element played through a context (createMediaElementSource) needs that one running
+      // first; one played from the element itself (WhatsApp's voice messages) needs none. Waking
+      // every context Natter rested held the page while each opened its sound stream again,
+      // just as the element opened its own, and a voice message resumed after a pause could then
+      // stay stopped, its time standing still.
+      const via = routed.get(this);
+      if (via && rested.has(via)) wake(via);
       watchStopping(this);
       const result = play.apply(this, args);
       if (!this.paused) began(this);

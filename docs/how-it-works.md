@@ -172,21 +172,24 @@ choice) and says so in the log, once a stream:
 voice messages may play through either) is muted by the sound server, …`.
 
 The bridge's idle audio (see [Memory](memory.md#idle-audio)) wakes a context it suspended before
-anything plays through it: a sound started, an element played (also one made a source of the context
-by `createMediaElementSource` or `new MediaElementAudioSourceNode`), and any worklet or script
-processor made or connected, which is how a page decoding sound itself would play it. A wake that
-fails is tried again a second later, and the log says when that fails too. While such a worklet (not
-a call's) is connected, or a script processor with `onaudioprocess` set or an `audioprocess`
-listener, the context isn't suspended, so a long note isn't cut off; a context with neither still
-rests. A voice message's recorder (a processor fed by the microphone) whose microphone has stopped
-holds its context 10 minutes more, connected or not: a paused voice message records on into the same
-context, and one rested meanwhile would open its output stream again just as the microphone opens
-again (with Bluetooth headphones, as they switch to their headset profile); a stream that fails to
-open then stops the context's clock, and the recording with it. Without Natter Den the context would
-run on, as it now does. After the 10 minutes it rests (a recorder left connected). So the hold comes
-after a voice message sent or deleted too, as the bridge can't tell them from a paused one. The
-log's and About's audio sets say how many contexts are held up this way (`held`), and how many
-elements the page started are still playing (`started`).
+anything plays through it: a sound started, an element played through it (one made a source of the
+context by `createMediaElementSource` or `new MediaElementAudioSourceNode`), and any worklet or
+script processor made or connected, which is how a page decoding sound itself would play it. An
+element that plays by itself, as WhatsApp's voice messages do, wakes none: waking every context
+first held the page while each opened its sound stream again, one more connection to the sound
+server each time, before the voice message could start. A wake that fails is tried again a second
+later, and the log says when that fails too. While such a worklet (not a call's) is connected, or a
+script processor with `onaudioprocess` set or an `audioprocess` listener, the context isn't
+suspended, so a long note isn't cut off; a context with neither still rests. A voice message's
+recorder (a processor fed by the microphone) whose microphone has stopped holds its context 10
+minutes more, connected or not: a paused voice message records on into the same context, and one
+rested meanwhile would open its output stream again just as the microphone opens again (with
+Bluetooth headphones, as they switch to their headset profile); a stream that fails to open then
+stops the context's clock, and the recording with it. Without Natter Den the context would run on,
+as it now does. After the 10 minutes it rests (a recorder left connected). So the hold comes after a
+voice message sent or deleted too, as the bridge can't tell them from a paused one. The log's and
+About's audio sets say how many contexts are held up this way (`held`), and how many elements the
+page started are still playing (`started`).
 
 The log's lines are there to tell these candidates apart, a few a page, each once for what it says:
 at the page's first sound, WebKit's and GStreamer's versions and how WebKit answers `canPlayType`

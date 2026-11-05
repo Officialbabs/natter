@@ -168,6 +168,25 @@ class WakeTest(unittest.TestCase):
         """)
         self.assertEqual(result, ["running", "suspended"])
 
+    def test_an_element_played_by_itself_wakes_no_context(self):
+        # WhatsApp's voice messages play from the element itself: they need no context, and waking
+        # the ones Natter rested held the page as each opened its sound stream again, just as the
+        # element opened its own. One played through a context wakes that one.
+        result = run("""
+            const context = new window.AudioContext();
+            const other = new window.AudioContext();
+            rest();
+            const note = new window.HTMLAudioElement();
+            note.play();
+            const alone = [context.state, other.state];
+            const routedOne = new window.HTMLAudioElement();
+            context.createMediaElementSource(routedOne);
+            rest();
+            routedOne.play();
+            [alone, context.state, other.state];
+        """)
+        self.assertEqual(result, [["suspended", "suspended"], "running", "suspended"])
+
     def test_it_wakes_again_at_each_play(self):
         result = run("""
             const context = new window.AudioContext();
