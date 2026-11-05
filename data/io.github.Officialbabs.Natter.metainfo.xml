@@ -81,6 +81,15 @@
   </content_rating>
 
   <releases>
+    <release version="0.1.13" date="2026-11-05">
+      <description>
+        <p>Voice messages start at once.</p>
+        <ul>
+          <li>A voice message starts at once: playing one no longer wakes the page's other rested sounds first, which held the page while each opened its sound again</li>
+          <li>One fewer connection to the sound server each time a voice message plays</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.12" date="2026-11-03">
       <description>
         <p>A voice message paused and resumed records on.</p>

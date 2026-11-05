@@ -188,11 +188,10 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>A voice message paused and resumed records on.</p>"
+RELEASE_NOTES = ("<p>Voice messages start at once.</p>"
                  "<ul>"
-                 "<li>A paused voice message keeps its recording's sound running for up to 10 minutes, so resuming it no longer has to start it again just as the microphone (and Bluetooth headphones) come back on: a start that failed then froze the recording</li>"
-                 "<li>A sound rested to save power that fails to wake is tried again, and the log says so if it fails twice</li>"
-                 "<li>The log says, for a voice message recorded again after a pause, whether its recording runs</li>"
+                 "<li>A voice message starts at once: playing one no longer wakes the page's other rested sounds first, which held the page while each opened its sound again</li>"
+                 "<li>One fewer connection to the sound server each time a voice message plays</li>"
                  "</ul>")
 
 
