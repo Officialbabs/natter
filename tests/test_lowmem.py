@@ -3,6 +3,7 @@ cache goes and nothing else of WhatsApp's, Natter's own caches go only at a crit
 each level is answered once in 30 s, and the log says what came back."""
 
 import contextlib
+import os
 import inspect
 import io
 import unittest
@@ -207,6 +208,64 @@ class LowMemoryTest(unittest.TestCase):
 
     def test_trim_runs_here(self):
         lowmem.trim()  # glibc's malloc_trim, or nothing where there's none
+
+
+class Bus:
+    """A session bus stand-in: remembers the subscription and lets the test say the signal."""
+
+    def __init__(self):
+        self.subscribed = []
+        self.unsubscribed = []
+
+    def signal_subscribe(self, sender, interface, member, path, arg0, flags, callback):
+        self.subscribed.append((sender, interface, member, path))
+        self.callback = callback
+        return 7
+
+    def signal_unsubscribe(self, subscription):
+        self.unsubscribed.append(subscription)
+
+
+class PortalMonitorTest(unittest.TestCase):
+    """Natter hides the system bus GLib's own monitor listens on, so it hears the portal's."""
+
+    def test_the_portals_warning_becomes_the_signal_with_its_level(self):
+        bus = Bus()
+        monitor = lowmem.PortalMonitor(bus)
+        self.assertEqual(bus.subscribed, [("org.freedesktop.portal.Desktop", "org.freedesktop.portal.MemoryMonitor",
+                                           "LowMemoryWarning", "/org/freedesktop/portal/desktop")])
+        heard = []
+        monitor.connect("low-memory-warning", lambda _monitor, level: heard.append(level))
+        bus.callback(None, ":1.5", "/org/freedesktop/portal/desktop", "org.freedesktop.portal.MemoryMonitor",
+                     "LowMemoryWarning", GLib.Variant("(y)", (100,)))
+        self.assertEqual(heard, [100])
+
+    def test_low_memory_answers_it_and_lets_go_on_stop(self):
+        bus, clock = Bus(), Clock()
+        manager = Manager()
+        low = LowMemory(lambda: [manager], sizes=lambda: {}, clock=clock)
+        low.start(lowmem.PortalMonitor(bus))
+        with contextlib.redirect_stdout(io.StringIO()):
+            bus.callback(None, ":1.5", "/", "", "", GLib.Variant("(y)", (50,)))
+        self.assertEqual(len(manager.calls), 1)
+        low.stop()
+        self.assertEqual(bus.unsubscribed, [7])
+
+    def test_the_portal_is_used_while_the_system_bus_is_hidden(self):
+        from natter import system
+        saved = os.environ.get(system.SYSTEM_BUS)
+        try:
+            os.environ[system.SYSTEM_BUS] = system.NO_SYSTEM_BUS
+            monitor = lowmem.default_monitor()
+            self.assertIsInstance(monitor, lowmem.PortalMonitor)
+            monitor.close()
+            os.environ.pop(system.SYSTEM_BUS)
+            self.assertNotIsInstance(lowmem.default_monitor(), lowmem.PortalMonitor)
+        finally:
+            if saved is None:
+                os.environ.pop(system.SYSTEM_BUS, None)
+            else:
+                os.environ[system.SYSTEM_BUS] = saved
 
 
 class WiringTest(unittest.TestCase):

@@ -12,6 +12,10 @@ free pages back to the kernel. Never a reload, and never the web process's end: 
 
 A monitor may say the same for as long as memory stays short, every few seconds: each level is
 answered once in AGAIN, and a clear still under way isn't asked for again meanwhile.
+
+GLib's own monitor listens on the system bus, which Natter hides from itself (system.py). The
+desktop portal passes the same warnings on over the session bus, so while the system bus is
+hidden, PortalMonitor listens there instead.
 """
 
 from __future__ import annotations
@@ -25,10 +29,11 @@ from typing import Callable, Optional
 import gi
 
 gi.require_version("WebKit", "6.0")
-from gi.repository import Gio, GLib, WebKit
+from gi.repository import Gio, GLib, GObject, WebKit
 
 from . import NAME
 from .memguard import held, page_sizes
+from .system import NO_SYSTEM_BUS, SYSTEM_BUS
 
 AGAIN = 30.0  # seconds before the same level is answered again
 CRITICAL = int(Gio.MemoryMonitorWarningLevel.CRITICAL)
@@ -56,6 +61,37 @@ def trim() -> None:
         pass
 
 
+class PortalMonitor(GObject.Object):
+    """The desktop portal's memory warnings (org.freedesktop.portal.MemoryMonitor, on the session
+    bus), as a GObject with Gio.MemoryMonitor's low-memory-warning signal."""
+
+    __gsignals__ = {
+        "low-memory-warning": (GObject.SignalFlags.RUN_LAST, None, (int,)),
+    }
+
+    def __init__(self, bus: Optional[Gio.DBusConnection] = None) -> None:
+        super().__init__()
+        self._bus = bus or Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self._subscription = self._bus.signal_subscribe(
+            "org.freedesktop.portal.Desktop", "org.freedesktop.portal.MemoryMonitor", "LowMemoryWarning",
+            "/org/freedesktop/portal/desktop", None, Gio.DBusSignalFlags.NONE, self._heard)
+
+    def _heard(self, _bus, _sender, _path, _interface, _signal, parameters) -> None:
+        self.emit("low-memory-warning", parameters.unpack()[0])
+
+    def close(self) -> None:
+        if self._subscription:
+            self._bus.signal_unsubscribe(self._subscription)
+            self._subscription = 0
+
+
+def default_monitor() -> GObject.Object:
+    """GLib's monitor, or the portal's while Natter has hidden the system bus from itself."""
+    if os.environ.get(SYSTEM_BUS) == NO_SYSTEM_BUS:
+        return PortalMonitor()
+    return Gio.MemoryMonitor.dup_default()
+
+
 class LowMemory:
     """Answers the warnings: `managers()` gives the pages' WebsiteDataManagers as they are now,
     `own()` drops Natter's own caches and says what went (critical only). `sizes()` (the pages,
@@ -73,16 +109,18 @@ class LowMemory:
         self.clock = clock
         self._answered: dict[int, float] = {}  # level -> when it was last answered
         self._clearing: Optional[float] = None  # when the clear under way began
-        self._monitor: Optional[Gio.MemoryMonitor] = None
+        self._monitor: Optional[GObject.Object] = None
         self._handler = 0
 
-    def start(self, monitor: Optional[Gio.MemoryMonitor] = None) -> None:
-        self._monitor = monitor or Gio.MemoryMonitor.dup_default()
+    def start(self, monitor: Optional[GObject.Object] = None) -> None:
+        self._monitor = monitor or default_monitor()
         self._handler = self._monitor.connect("low-memory-warning", lambda _monitor, level: self.warned(level))
 
     def stop(self) -> None:
         if self._monitor is not None and self._handler:
             self._monitor.disconnect(self._handler)
+        if isinstance(self._monitor, PortalMonitor):
+            self._monitor.close()
         self._monitor, self._handler = None, 0
 
     def warned(self, level) -> bool:
