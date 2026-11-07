@@ -33,6 +33,7 @@ from .distro import os_release
 from .gstfix import debug_line as camera_fix_line
 from .links import chat_link, page_link
 from .loan import out_of_sight
+from .lowmem import LowMemory
 from .launcher import Badge, chat_key, exec_quote, set_menu_chats
 from .mediapause import Bus as PlayerBus, VoicePause
 from .memguard import (KILL_MEMORY, OOM_SCORE_ADJ, MiB, MemoryGuard, in_flatpak, kill as kill_web_process,
@@ -684,6 +685,7 @@ class Natter(Adw.Application):
         # its oom_kills have been seen, and when each of those no page has claimed yet was
         # (ended_for_memory).
         self.memory_guard: Optional[MemoryGuard] = None
+        self.low_memory: Optional[LowMemory] = None  # the system's memory monitor's warnings (_start_services)
         self._memory_events: dict[str, int] = {}
         self._oom_kills = 0
         self._oom_unclaimed: list[float] = []
@@ -1039,7 +1041,22 @@ class Natter(Adw.Application):
         self._last_look = time.monotonic()
         GLib.timeout_add_seconds(NETWORK_CHECK_EARLY, self._check_network_process)
         Gio.NetworkMonitor.get_default().connect("network-changed", self._on_network)
+        # When the system's memory monitor says the computer is short of memory, the pages' memory
+        # caches go, and at a critical warning Natter's own too (lowmem.py). Last: a monitor that
+        # can't be had stops nothing else.
+        self.low_memory = LowMemory(self._page_data_managers, own=self._drop_own_caches)
+        self.low_memory.start()
         then()
+
+    def _page_data_managers(self) -> list:
+        """The website data of each account's page that's still Natter's (not removed or quit)."""
+        return [account.session.get_website_data_manager() for account in self.accounts if not account.removed]
+
+    def _drop_own_caches(self) -> str:
+        """What Natter keeps and can make again, dropped (a critical warning, lowmem.py): the chats'
+        pictures for notifications. In words, for the log."""
+        count = self.notifier.forget_pictures()
+        return f"{count} chat picture{'s' if count != 1 else ''}" if count else ""
 
     def _now_ready(self) -> None:
         """The steps are done: what waited runs, oldest first, each once. What it queues in turn
@@ -3522,6 +3539,8 @@ class Natter(Adw.Application):
                 if self.window.get_visible():
                     self.window.remember_size()
             self.reclaimer.stop()
+            if getattr(self, "low_memory", None) is not None:
+                self.low_memory.stop()
             self.call_sound.stop()
             self.audio_follower.stop()
             if self.ada_style is not None:

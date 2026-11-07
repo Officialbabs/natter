@@ -372,6 +372,13 @@ class Notifier:
             if not shown.closed:
                 self._deliver(shown)
 
+    def forget_pictures(self) -> int:
+        """Drop the chats' pictures Natter keeps (lowmem.py, when the computer is short of memory);
+        how many went. A bubble up keeps its own, and a later message fetches its chat's again."""
+        count = len(self.avatars)
+        self.avatars.clear()
+        return count
+
     def target(self, shown: Shown) -> ReplyTarget:
         """A copy of what the reply window needs of `shown`."""
         cached = self.avatars.get((shown.account, shown.chat))

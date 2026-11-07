@@ -165,6 +165,18 @@ ending one WhatsApp still uses breaks it. A fresh page ends them all.
 A close request to a hidden window, or SIGTERM, quits Natter Den rather than sending it to the
 tray, so a desktop closing apps to make room gets the memory back.
 
+## Low-memory warnings
+
+When the system's memory monitor (GLib's `GMemoryMonitor`) warns that the computer is short of
+memory, Natter Den clears each page's memory cache: what WebKit keeps decoded in the web process,
+which it reads again from its disk cache when the page needs it. Nothing else of WhatsApp's goes
+(cookies, storage, service workers and the disk cache stay), so the account stays linked. At a
+critical warning it also drops the chats' pictures it keeps for notifications, collects Python's
+garbage and hands malloc's free memory back. Each level is answered at most once every 30 s, as a
+monitor repeats itself while memory stays short; it never reloads a page or ends one. The log says
+what came back: `natter: memory: the system's memory monitor warns (low): cleared the memory
+cache of 1 page; they held N → M MB (K MB back)`.
+
 ## Spare processes
 
 Process swapping and the back/forward cache are off (one site, no history). With calls in the page,
