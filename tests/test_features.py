@@ -168,44 +168,23 @@ class AudioFollowerTest(unittest.TestCase):
         self.assertEqual([s["index"] for s in page_streams(streams, "Natter")], [1])
 
     def test_pactl_is_tied_to_natter(self):
-        from natter import system
+        from natter.system import tied
 
-        saved = system._env_default_signal
-        try:
-            system._env_default_signal = True
-            self.assertEqual(system.tied(["pactl", "subscribe"], which=lambda name: "/usr/bin/" + name),
-                             ["setpriv", "--pdeathsig", "TERM", "env", "--default-signal=PIPE", "pactl", "subscribe"])
-            self.assertEqual(system.tied(["pactl", "subscribe"], which=lambda name: None), ["pactl", "subscribe"])
-            system._env_default_signal = False
-            self.assertEqual(system.tied(["pactl"], which=lambda name: "/usr/bin/" + name),
-                             ["setpriv", "--pdeathsig", "TERM", "pactl"])
-        finally:
-            system._env_default_signal = saved
+        self.assertEqual(tied(["pactl", "subscribe"], which=lambda name: "/usr/bin/" + name),
+                         ["setpriv", "--pdeathsig", "TERM", "pactl", "subscribe"])
+        self.assertEqual(tied(["pactl", "subscribe"], which=lambda name: None), ["pactl", "subscribe"])
 
-    @unittest.skipUnless(shutil.which("setpriv") and shutil.which("env"), "setpriv and env")
-    def test_a_tied_program_hears_sigpipe_and_ends_with_its_parent(self):
-        """Live: SIGPIPE is ignored here (Python's own) and back at its default in the program; and
-        a program whose parent goes is ended."""
+    @unittest.skipUnless(shutil.which("setpriv"), "setpriv")
+    def test_a_tied_program_is_ended_with_natter(self):
+        """Live: the program itself reads its parent-death signal (prctl PR_GET_PDEATHSIG)."""
         import signal
         import subprocess
         import sys
-        import time
         from natter.system import tied
 
-        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
-        status = subprocess.run(tied(["grep", "SigIgn", "/proc/self/status"]), capture_output=True,
-                                text=True, restore_signals=False).stdout
-        self.assertFalse(int(status.split()[1], 16) & (1 << (signal.SIGPIPE - 1)))
-        parent = subprocess.run(
-            [sys.executable, "-c",
-             "import subprocess, sys; p = subprocess.Popen(sys.argv[1:]); print(p.pid, flush=True)",
-             *tied(["sleep", "30"])], capture_output=True, text=True)
-        child = int(parent.stdout.split()[0])
-        for _ in range(50):
-            if not os.path.exists(f"/proc/{child}"):
-                break
-            time.sleep(0.1)
-        self.assertFalse(os.path.exists(f"/proc/{child}"), "the program outlived its parent")
+        ask = "import ctypes; v = ctypes.c_int(); ctypes.CDLL(None).prctl(2, ctypes.byref(v)); print(v.value)"
+        out = subprocess.run(tied([sys.executable, "-c", ask]), capture_output=True, text=True).stdout
+        self.assertEqual(int(out), signal.SIGTERM)
 
 
 class ReloadingTest(unittest.TestCase):
