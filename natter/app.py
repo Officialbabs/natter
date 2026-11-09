@@ -189,10 +189,12 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>Voice messages start at once.</p>"
+RELEASE_NOTES = ("<p>Memory goes back when the computer runs short.</p>"
                  "<ul>"
-                 "<li>A voice message starts at once: playing one no longer wakes the page's other rested sounds first, which held the page while each opened its sound again</li>"
-                 "<li>One fewer connection to the sound server each time a voice message plays</li>"
+                 "<li>When the system warns that memory is short, each account's page lets go of what WebKit keeps decoded in memory; you stay signed in and your chats stay</li>"
+                 "<li>At a critical warning, the chat pictures kept for notifications go too, and freed memory goes back to the system</li>"
+                 "<li>The warning arrives through the desktop portal</li>"
+                 "<li>The process that follows your sound output now ends with the app, even after a crash, so it can't pile up as a connection to the sound server</li>"
                  "</ul>")
 
 
