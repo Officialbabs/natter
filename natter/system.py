@@ -118,6 +118,36 @@ def program_environ(environ=None) -> dict[str, str]:
     return changed
 
 
+def tied(argv: list[str], which: Callable[[str], Optional[str]] = shutil.which) -> list[str]:
+    """`argv`, run so it can't outlive Natter: ended when Natter goes (setpriv --pdeathsig), and
+    with SIGPIPE back at its default (env --default-signal), since Python ignores it and passes
+    that on, so a program writing to a reader that's gone is ended too instead of running on as
+    an orphan. Each only where the tool is there and takes it; both exec, so the program keeps
+    the pid Natter knows."""
+    prefix = []
+    if which("setpriv"):
+        prefix += ["setpriv", "--pdeathsig", "TERM"]
+    if which("env") and _env_resets_signals():
+        prefix += ["env", "--default-signal=PIPE"]
+    return prefix + argv
+
+
+_env_default_signal: Optional[bool] = None
+
+
+def _env_resets_signals() -> bool:
+    """Whether this env takes --default-signal (GNU coreutils 8.31 and later, uutils), asked once."""
+    global _env_default_signal
+    if _env_default_signal is None:
+        try:
+            _env_default_signal = subprocess.run(["env", "--default-signal=PIPE", "true"],
+                                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                                 timeout=5).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _env_default_signal = False
+    return _env_default_signal
+
+
 def open_uri(uri: str, window=None) -> None:
     """Open `uri` (a link, or a file's file:// address) in the app the desktop has for it.
 
@@ -980,7 +1010,7 @@ class AudioFollower:
             return False
         try:
             launcher = Gio.SubprocessLauncher.new(Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
-            self._process = launcher.spawnv([self.pactl, "subscribe"])
+            self._process = launcher.spawnv(tied([self.pactl, "subscribe"]))  # never an orphan
         except GLib.Error:
             return False
         self._read(Gio.DataInputStream.new(self._process.get_stdout_pipe()))
