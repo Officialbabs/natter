@@ -458,7 +458,8 @@ class MemoryGuard:
         self._ended: set[int] = set()  # pids sent SIGKILL that haven't gone yet (a big one takes a while)
         self._call_seen: Optional[float] = None  # when calling() last said yes
         self._kills: list[tuple[float, int]] = []  # (time, pid), not yet claimed
-        self._sizes: Optional[tuple[float, dict[int, int]]] = None  # (when, what each page held) at the last look
+        # (when, what each page held, its GPU buffers) at the last look
+        self._sizes: Optional[tuple[float, dict[int, int], dict[int, int]]] = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -514,7 +515,7 @@ class MemoryGuard:
         for gone in set(self._pages) - pids:
             del self._pages[gone]
         self._ended &= pids
-        ended, sizes = [], {}
+        ended, sizes, gpus = [], {}, {}
         for pid in sorted(pids - self._ended):
             size = held(pid, self.proc)
             if size is None:
@@ -524,7 +525,7 @@ class MemoryGuard:
             if page is None:
                 page = self._pages[pid] = _Page(size)
                 self._raise_oom_score(pid)
-            gpu = self._gpu(pid, page)
+            gpu = gpus[pid] = self._gpu(pid, page)
             total = size + gpu  # what the unit is charged for it, weighed against the ceiling
             weighed = size + max(0, gpu - GPU_ROOM)  # what the limits weigh (GPU_COUNTED)
             page.looks.append((now, size))  # the growth rate: its own memory alone
@@ -558,19 +559,27 @@ class MemoryGuard:
             except Exception:  # what it says about one page mustn't keep it from the others
                 pass
         with self._lock:
-            self._sizes = (now, {pid: size for pid, size in sizes.items() if pid not in ended})
+            self._sizes = (now, {pid: size for pid, size in sizes.items() if pid not in ended},
+                           {pid: gpu for pid, gpu in gpus.items() if pid not in ended})
         return ended
 
     def recent_sizes(self, now: Optional[float] = None) -> Optional[dict[int, int]]:
         """What each page held at the guard's last look (held, by pid), if that was within three
         polls; else None. Natter's main loop asks this rather than reading every page's status
         itself: during a call it has the call's packets to pass on (rtc.py)."""
+        last = self._recent(now)
+        return None if last is None else dict(last[1])
+
+    def recent_gpu(self, now: Optional[float] = None) -> Optional[dict[int, int]]:
+        """Each page's GPU buffers at the guard's last look (gem_held, by pid), as recent_sizes."""
+        last = self._recent(now)
+        return None if last is None else dict(last[2] if len(last) > 2 else {})
+
+    def _recent(self, now: Optional[float]) -> Optional[tuple[float, dict[int, int], dict[int, int]]]:
         now = time.monotonic() if now is None else now
         with self._lock:
             last = self._sizes
-        if last is None or now - last[0] > 3 * self.poll:
-            return None
-        return dict(last[1])
+        return None if last is None or now - last[0] > 3 * self.poll else last
 
     def _gpu(self, pid: int, page: _Page) -> int:
         """The page's GPU buffers now (gem_held): from the DRM files found at the last full look

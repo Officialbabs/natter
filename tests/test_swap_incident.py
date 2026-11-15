@@ -16,7 +16,7 @@ from unittest import mock
 
 from natter.app import (FRESH_AGAIN, GROWN_FLOOR, GROWN_FOR, GROWN_NOTICE, GROWN_SHARE, HIDDEN_BEFORE_FRESH,
                         HIDDEN_BEFORE_RECLAIM, IDLE_AFTER_LOAD, IDLE_LEAST, IDLE_MOST, IDLE_WITHIN, MEMORY_LIMIT,
-                        NOT_IDLE, QUIET_BEFORE_FRESH, SETTLE_BEFORE_RECLAIM)
+                        NOT_IDLE, QUIET_BEFORE_FRESH, SETTLE_BEFORE_RECLAIM, WHOLE_FLOOR)
 
 MEMINFO = "MemTotal: 15000000 kB\nMemAvailable: 9000000 kB\nSwapTotal: {total} kB\nSwapFree: {free} kB\n"
 GiB = 1024 ** 3
@@ -480,6 +480,7 @@ class World:
 
         self.module, self.clock = app_module, Clock()
         self.pages = {name: 1200 * MiB for name in accounts}
+        self.gpu = {}  # each page's GPU buffers (app.py page_gpu), by account name; none unless set
         self.pids = {name: 4000 + i for i, name in enumerate(accounts)}  # each page's web process
         self.spare = None  # WebKit's blank spare process, when there is one: (pid, bytes)
         self.tight, self.swapped, self.held = False, 0, None
@@ -522,6 +523,8 @@ class World:
                         mock.patch.object(app_module, "page_sizes",
                                           lambda: {self.pids[name]: size for name, size in self.pages.items()}
                                           | (dict([self.spare]) if self.spare else {})),
+                        mock.patch.object(app_module, "page_gpu",
+                                          lambda: {self.pids[name]: size for name, size in self.gpu.items()}),
                         mock.patch.object(app_module, "footprint", lambda: sum(self.pages.values()) + 300 * MiB),
                         mock.patch.object(app_module, "own_swap", lambda: self.swapped),
                         mock.patch.object(app_module, "memory_tight", lambda: self.tight),
@@ -811,6 +814,65 @@ class HiddenFreshPageTest(unittest.TestCase):
             world.account().replying = 0
             world.app._reclaim()
             self.assertEqual(world.app.reclaimer.started, 1)
+            self.assertEqual(world.fresh(), 0)
+
+
+class WholePageTest(unittest.TestCase):
+    """A hidden page under its own growth ceiling whose GPU buffers take it past WHOLE_FLOOR
+    gets a fresh one too, under the same GROWN_FOR and gates (app.py _fresh_pages_for_memory).
+    On 15 Nov 2026 a page held 1.7 GB of its own and 1.35 GB of GPU buffers, and three days
+    went by without a fresh page while Natter reached 6.1 GB."""
+
+    def test_a_page_past_the_floor_with_its_gpu_buffers_gets_one(self):
+        with World() as world:
+            world.pages["Main"] = 1800 * MiB  # under GROWN_FLOOR on its own
+            world.gpu["Main"] = 2000 * MiB
+            world.hide()
+            world.run(GROWN_FOR // 60 - 1)
+            self.assertEqual(world.fresh(), 0)  # not before GROWN_FOR
+            world.run(2)
+            self.assertEqual(world.fresh(), 1)
+            said = world.out.getvalue()
+            self.assertIn("a page grew to 3800 MB with its GPU buffers while hidden, past 3584 MB", said)
+            self.assertIn("natter: page: reloaded because it grew to 3800 MB with its GPU buffers while hidden "
+                          "(floor 3584 MB)", said)
+
+    def test_an_idle_page_with_its_gpu_buffers_is_left_alone(self):
+        # An idle page holds up to about 3 GB with its GPU buffers: under the floor.
+        with World() as world:
+            world.pages["Main"] = 1700 * MiB
+            world.gpu["Main"] = 1350 * MiB
+            world.hide()
+            world.run(8 * 60)
+            self.assertEqual(world.fresh(), 0)
+            self.assertEqual(WHOLE_FLOOR, 3584)
+
+    def test_a_short_jump_in_gpu_buffers_is_no_reason(self):
+        # A fullscreen video or a resize makes them jump; the page has to stay past the floor.
+        with World() as world:
+            world.pages["Main"] = 1800 * MiB
+            world.hide()
+            for _ in range(8):
+                world.gpu["Main"] = 2400 * MiB
+                world.run(10)
+                world.gpu["Main"] = 900 * MiB
+                world.run(10)
+            self.assertEqual(world.fresh(), 0)
+
+    def test_never_while_shown(self):
+        with World() as world:
+            world.pages["Main"] = 1800 * MiB
+            world.gpu["Main"] = 3000 * MiB
+            world.show()
+            world.run(4 * 60)
+            self.assertEqual(world.fresh(), 0)
+
+    def test_gpu_buffers_alone_never_count_without_a_page(self):
+        with World() as world:
+            world.pages["Main"] = 1800 * MiB
+            world.gpu = {}
+            world.hide()
+            world.run(4 * 60)
             self.assertEqual(world.fresh(), 0)
 
 

@@ -36,8 +36,9 @@ from .loan import out_of_sight
 from .lowmem import LowMemory
 from .launcher import Badge, chat_key, exec_quote, set_menu_chats
 from .mediapause import Bus as PlayerBus, VoicePause
-from .memguard import (KILL_MEMORY, OOM_SCORE_ADJ, MiB, MemoryGuard, in_flatpak, kill as kill_web_process,
-                       mem_total, page_ceiling, page_limit, page_limits, page_sizes, web_processes)
+from .memguard import (KILL_MEMORY, OOM_SCORE_ADJ, MiB, MemoryGuard, gem_held, in_flatpak,
+                       kill as kill_web_process, mem_total, page_ceiling, page_limit, page_limits, page_sizes,
+                       web_processes)
 from .instance import (STILL_RUNNING, InstanceLock, NameWatchdog, bus_id, end_stale, end_webkit, lock_path,
                        notice as instance_notice, owner_now, primary_line, take_later as take_instance,
                        UNKNOWN as OWNER_UNKNOWN)
@@ -130,6 +131,12 @@ CALL_GROWTH = 512  # MB a call has to leave behind (what the pages grew since it
 GROWN_FLOOR = 2048  # MB
 GROWN_SHARE = 1.5
 GROWN_FOR = 30 * 60  # seconds past the ceiling, hidden, before a fresh page
+# The page with its GPU buffers (memguard GPU_COUNTED: shmem, charged to Natter and swapped like
+# the rest), which the ceiling above leaves out, past this counts as grown too. On 15 Nov 2026 a
+# page held 1.7 GB of its own, just under GROWN_FLOOR all along, and 1.35 GB of GPU buffers: 4.3
+# GB for Natter after 5.5 hours, 6.1 GB the day before, with no fresh page in three days. An idle
+# page holds up to about 3 GB with them (1.0-1.4 GB and 0.4-1.6 GB), so the line is above that.
+WHOLE_FLOOR = 3584  # MB
 IDLE_AFTER_LOAD = 10 * 60  # seconds after a load before the idle size is measured
 IDLE_WITHIN = 60 * 60  # and no later than this after its process came: by then it may have grown
 # What an idle page holds, within these. Under IDLE_LEAST is no page: WebKit's blank spare process
@@ -271,6 +278,17 @@ def held_by_page(guard: Optional[MemoryGuard] = None) -> dict[int, int]:
     when it has lately, so the main loop doesn't read every page's status itself."""
     recent = guard.recent_sizes() if isinstance(guard, MemoryGuard) else None
     return page_sizes() if recent is None else recent
+
+
+def page_gpu() -> dict[int, int]:
+    """Each of Natter's pages' GPU buffers (memguard.gem_held), by pid, read now."""
+    return {page: gem_held(page) for page in page_sizes()}
+
+
+def gpu_by_page(guard: Optional[MemoryGuard] = None) -> dict[int, int]:
+    """Each page's GPU buffers (page_gpu): as the guard's thread last read them when it has lately."""
+    recent = guard.recent_gpu() if isinstance(guard, MemoryGuard) else None
+    return page_gpu() if recent is None else recent
 
 
 def pages_held(guard: Optional[MemoryGuard] = None) -> int:
@@ -2712,13 +2730,18 @@ class Natter(Adw.Application):
         now, pages = time.monotonic(), held_by_page(self.memory_guard)
         biggest, total = max(pages.values(), default=0), sum(pages.values())
         over = {pid: size for pid, size in pages.items() if size > self._growth_ceiling(pid)}
+        # A page under its own ceiling but past WHOLE_FLOOR with its GPU buffers is grown too.
+        gpu = gpu_by_page(self.memory_guard)
+        whole = {pid: size + gpu[pid] for pid, size in pages.items()
+                 if pid not in over and gpu.get(pid) and size + gpu[pid] > WHOLE_FLOOR * MiB}
+        over |= whole
         grown = max(over, key=over.get) if over else None  # the biggest page past its own ceiling
         if grown is not None:
             self._grown_since = now if self._grown_since is None else self._grown_since
         else:
             self._grown_since = None
         wanted = []  # (account, (what kind of reason, its words)), in the order they'd go
-        reason = self._memory_reason(biggest, now, grown, over.get(grown, 0))
+        reason = self._memory_reason(biggest, now, grown, over.get(grown, 0), grown in whole)
         if reason:
             wanted += [(account, reason) for account in sorted(self.accounts, key=lambda a: a.loaded_at)]
         for account, (began, ended) in list(self._after_call.items()):
@@ -2739,7 +2762,10 @@ class Natter(Adw.Application):
             if not wait:
                 print(f"natter: a fresh page for {account.name}: {why} ({NAME} holds {footprint() >> 20} MB, "
                       f"{own_swap() >> 20} MB of it in swap)", flush=True)
-                if kind == "grown":
+                if kind == "grown" and grown in whole:
+                    print(f"natter: page: reloaded because it grew to {over[grown] >> 20} MB with its GPU buffers "
+                          f"while hidden (floor {WHOLE_FLOOR} MB)", flush=True)
+                elif kind == "grown":
                     measured = self._idle.get(grown)
                     if measured == NOT_IDLE:
                         idle = f"not idle at its first quiet look, floor {GROWN_FLOOR} MB"
@@ -2761,14 +2787,14 @@ class Natter(Adw.Application):
         return False
 
     def _memory_reason(self, biggest: int, now: float, grown: Optional[int] = None,
-                       grown_size: int = 0) -> Optional[tuple[str, str]]:
+                       grown_size: int = 0, with_gpu: bool = False) -> Optional[tuple[str, str]]:
         """Why the pages need a fresh one, for the biggest of them holding `biggest` bytes:
         (what kind of reason, its words), or None when they don't. A page past the guard's own
         limit for one (memguard.py); the whole computer short of memory (memory_tight: little
         available and swap past the Reclaimer's share) with a page holding more than WebKit's
         limit for one; or a page (`grown`, a web process holding `grown_size`) past its growth
-        ceiling (_growth_ceiling), with some page kept past its own, hidden, for GROWN_FOR
-        (_grown_since). Never what's in swap alone, and never what Natter's own Reclaimer put
+        ceiling (_growth_ceiling), or past WHOLE_FLOOR with its GPU buffers (`with_gpu`), with some
+        page kept past its own, hidden, for GROWN_FOR (_grown_since). Never what's in swap alone, and never what Natter's own Reclaimer put
         there: it does that while hidden, by design."""
         limit = self.memory_guard.limit if self.memory_guard is not None else page_limit(mem_total())
         if biggest > limit:
@@ -2777,6 +2803,9 @@ class Natter(Adw.Application):
         if biggest > webkit * MiB and memory_tight():
             return "short", f"the computer is short of memory, and a page holds {biggest >> 20} MB"
         if grown is not None and self._grown_since is not None and now - self._grown_since >= GROWN_FOR:
+            if with_gpu:
+                return "grown", (f"a page grew to {grown_size >> 20} MB with its GPU buffers while hidden, past "
+                                 f"{WHOLE_FLOOR} MB for {(now - self._grown_since) / 60:.0f} min")
             return "grown", (f"a page grew to {grown_size >> 20} MB while hidden, past "
                              f"{self._growth_ceiling(grown) >> 20} MB for {(now - self._grown_since) / 60:.0f} min")
         return None
