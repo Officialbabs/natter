@@ -196,12 +196,10 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>Memory goes back when the computer runs short.</p>"
+RELEASE_NOTES = ("<p>A hidden window keeps its memory in check.</p>"
                  "<ul>"
-                 "<li>When the system warns that memory is short, each account's page lets go of what WebKit keeps decoded in memory; you stay signed in and your chats stay</li>"
-                 "<li>At a critical warning, the chat pictures kept for notifications go too, and freed memory goes back to the system</li>"
-                 "<li>The warning arrives through the desktop portal</li>"
-                 "<li>The process that follows your sound output now ends with the app, even after a crash, so it can't pile up as a connection to the sound server</li>"
+                 "<li>While the window is hidden, a WhatsApp page that has grown to 3.5 GB together with its GPU buffers, and stays there for half an hour, now gets a fresh page; before, only the page's own memory counted, and it could grow for days</li>"
+                 "<li>The memory guard's measure of a page's GPU buffers is now used for that</li>"
                  "</ul>")
 
 

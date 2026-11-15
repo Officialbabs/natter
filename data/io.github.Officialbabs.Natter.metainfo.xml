@@ -81,6 +81,15 @@
   </content_rating>
 
   <releases>
+    <release version="0.1.15" date="2026-11-15">
+      <description>
+        <p>A hidden window keeps its memory in check.</p>
+        <ul>
+          <li>While the window is hidden, a WhatsApp page that has grown to 3.5 GB together with its GPU buffers, and stays there for half an hour, now gets a fresh page; before, only the page's own memory counted, and it could grow for days</li>
+          <li>The memory guard's measure of a page's GPU buffers is now used for that</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.14" date="2026-11-09">
       <description>
         <p>Memory goes back when the computer runs short.</p>
