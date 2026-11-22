@@ -196,10 +196,11 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>A hidden window keeps its memory in check.</p>"
+RELEASE_NOTES = ("<p>Voice notes record cleanly and play again after a pause.</p>"
                  "<ul>"
-                 "<li>While the window is hidden, a WhatsApp page that has grown to 3.5 GB together with its GPU buffers, and stays there for half an hour, now gets a fresh page; before, only the page's own memory counted, and it could grow for days</li>"
-                 "<li>The memory guard's measure of a page's GPU buffers is now used for that</li>"
+                 "<li>A voice note no longer cracks while you record it when WhatsApp is busy: the microphone's sound is now gathered away from the page, so a busy moment only delays it</li>"
+                 "<li>A voice note you pause and play again no longer stays silent</li>"
+                 "<li>The log now notes how each voice recording and status video went, so a break can be traced</li>"
                  "</ul>")
 
 

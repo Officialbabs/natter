@@ -81,6 +81,16 @@
   </content_rating>
 
   <releases>
+    <release version="0.1.16" date="2026-11-22">
+      <description>
+        <p>Voice notes record cleanly and play again after a pause.</p>
+        <ul>
+          <li>A voice note no longer cracks while you record it when WhatsApp is busy: the microphone's sound is now gathered away from the page, so a busy moment only delays it</li>
+          <li>A voice note you pause and play again no longer stays silent</li>
+          <li>The log now notes how each voice recording and status video went, so a break can be traced</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.15" date="2026-11-15">
       <description>
         <p>A hidden window keeps its memory in check.</p>
