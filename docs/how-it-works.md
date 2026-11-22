@@ -166,6 +166,22 @@ them through `<audio>`, or decodes them itself and plays them through Web Audio,
 a change rolled out to some accounts), or Natter's idle audio on a path not yet seen. Silent voice
 messages are reported in a Chromium-based client too.
 
+One cause is known: WebKitGTK 2.52.6 can drop a `play()` that comes while an element is still
+settling a seek it was given before its data came. WhatsApp plays a voice message again after a
+pause just that way (a new source, the place it paused at, then `play()`), and the message stood
+still and silent until its slider was moved: the element says it plays, has its data and no error,
+and its time doesn't move. In a lab of that order every try stalled, with Natter Den's scripts or
+without. So the bridge looks at each `play()` of that kind (away from the start, while the element
+still loads or seeks) once it has settled, a second on (or each second while it still settles, up
+to five times). One still standing then is asked to play again, which starts it; one that still
+doesn't move a second later has its place nudged by a thousandth of a second, a real seek, which
+starts it too. A live stream (a call's sound) is left alone, and a later `play()` ends the look.
+The log says how it went, once a page for each kind of element and outcome, and only when it went
+somewhere (a pause or a new source in between says nothing):
+`natter: <account>: media: an <audio> (audio/ogg), from the element itself said it played while
+its time stood still; WebKit dropped the play(); play() again started it`. One that neither starts
+is held by something else, and its line says so.
+
 Natter Den leaves a stream the sound server opened muted or at 0% as it is (it may be your
 choice) and says so in the log, once a stream:
 `natter: sound: a sound stream of the page with media.role music (<audio>, perhaps Web Audio too:
@@ -203,8 +219,9 @@ resumed after a pause, or the next one recorded into the same recorder), with wh
 had rested its context meanwhile, and 2.5 s on (after a failed wake's second try) its state and
 whether its clock moves (it stands still when its output stream couldn't open, and then nothing is
 recorded); and each failure: the element's error (`MediaError`'s code), `play()` refused (the
-error's name), the context an element plays through still not running 1.5 s after it started, or a
-context the idle audio rested not resuming, twice (the error's name). A muted `music` stream beside
+error's name), the context an element plays through still not running 1.5 s after it started, an
+element whose `play()` WebKit dropped (and what started it again), or a context the idle audio
+rested not resuming, twice (the error's name). A muted `music` stream beside
 `played` lines points at the sound server; `MediaError` or `decodeAudioData` failures at WebKit or
 GStreamer; a context left suspended at the idle audio. No sound lines at all while voice messages
 are tried rules out `<audio>` and decoding on the page's main thread only: sound decoded in a worker
@@ -214,6 +231,155 @@ through and the sinks' ranks, a test voice message made and played into `fakesin
 number and kind, Natter Den's sound streams (mute, volume, role), and what WirePlumber remembers
 for them (role or app, mute, volume and the kind of output); with `--watch`, the streams each time
 they change.
+
+Videos have lines of their own, for statuses that play as if short of bandwidth. A status plays
+from a blob of its whole file, decrypted before it starts, so the network is out of it; what's
+left is WebKit's GStreamer player and the page. So for each `<video>` that plays (not a call's
+stream) the bridge measures a spell of playback, from when it starts playing (or a seek has
+settled) until it pauses, ends, fails, seeks or takes a new source, or 20 s of it (the next spell
+goes on from there): the media seconds it played in how many seconds; how often it waited for data
+(`waiting`, until it plays again) and for how long, and how often it said `stalled`; the frames it
+presented (`requestVideoFrameCallback`), with the stretches without one over 100 ms (between
+frames, and after the last until the spell ends) and the longest, while it plays and doesn't wait;
+the frames WebKit dropped of all that reached its sink (`getVideoPlaybackQuality`, added up as it
+goes, since GStreamer counts from 0 again after a pause, a seek or a loop); and how late a light
+timer on the page's main thread ran meanwhile (every 100 ms, only while a video plays). WebKit
+counts a frame when its sink hands it on, not when it is on screen, so frames counted at once are
+taken as shown one by one only when the page's main thread was held meanwhile; otherwise the
+picture stood still, a gap. Waits point at its data coming too slowly; gaps or dropped frames
+without waits at frames not drawn in time; a late main thread at the page holding things up. A
+hidden page draws no frames and runs its timers late, so its spells aren't told. Without hardware
+acceleration WebKit calls back no frames, and the lines say they weren't counted. Measuring isn't
+free: while a frame callback is asked for, WebKit runs the page's rendering update at the
+display's rate, so at most 5 spells of one element's source are measured (1 of a video that
+loops). The log has a page's first spell, to compare with, then only rough ones (a wait or a
+stall, a gap or a late main thread over 150 ms, two frames or more and over 5% of them dropped,
+or more than 400 ms of its media behind the clock, which is how a slow playback clock shows: no
+wait, and its time running behind), 16 a page and 2 for one element's source, apart from the
+sound's lines:
+`natter: <account>: media: an <video> (video/mp4) 720x1280 played 12.3 s in 14.1 s: waited 3 times
+(1.6 s), stalled twice; 350 frames, 4 gaps over 100 ms (longest 640 ms), dropped 12 of 360; the
+page's main thread up to 420 ms late`. Only counts, durations and the video's size (to tens of
+pixels), never an address or a name.
+
+Voice notes have lines of their own too, for recordings that break up. WhatsApp records through a
+script processor fed by the microphone. WebKitGTK 2.52 fills one of its two buffers on the audio
+thread, a chunk at a time (4096 frames, say: 85 ms at 48 kHz), and hands each full one to the page
+in an `audioprocess` event on the main thread, copying it out for the page only as that event runs.
+An event that runs more than a chunk after its chunk filled copies out a buffer the audio thread is
+already filling again: the page gets part or all of a later chunk's sound in place of its own, so
+that much of the voice note is lost and a later bit of it comes twice (and while an event runs on
+the buffer the audio thread is on, the audio thread skips what it would write: that sound is lost
+too). Every chunk is still handed over, the late ones in a burst, so their count doesn't show it. An
+event's `playbackTime` is the context's clock as it runs, not where its chunk was: less a chunk for
+each chunk before it, it's the same for each that ran as soon as its chunk filled, later by as much
+as one ran late, and later for good by what the audio thread skipped before its chunk filled (its
+clock runs on as it skips). A late one is followed by less late ones in its burst, down to one on
+time, while a skip moves all the chunks after it on alike, so each is held against the earliest of
+it and those in the two seconds after it (a burst at the very start is seen from those after it,
+and the skips drop out of it), and the sound skipped is how much later the last chunk sits than the
+earliest from the first on. So for each recording, from its first chunk after a microphone feeds
+the recorder until the microphone stops, the recorder is disconnected, its context closes, or 10
+minutes, the bridge notes beside the page's own handler (listening through `EventTarget`'s own
+`addEventListener`, so neither the page nor the idle audio counts it): the chunks, their size and
+the context's sample rate (and the microphone's, where WebKit says it); the seconds they hold, the
+seconds they took (to the last look that found the microphone still on, where that's later: a
+clock that stops for good hands over no chunk after it) and the seconds on the context's clock
+meanwhile; the sound the audio thread skipped; the longest gap between two (or since the last,
+while the microphone was still on); those handed over more than a chunk late, and the sound lost
+that way; how late the page's main thread was; the microphone muted, unmuted or ended other than by
+the page; and the context suspended (and how often by the idle audio). It never reads the sound or
+changes what the page gets, and a timer looks for the end once a second while a recording runs, not
+at all otherwise. The log has a page's first recording, to compare with, then only rough ones (a
+chunk handed over late; a chunk's worth skipped or more; a gap between two of two chunks and 128
+frames or more, as a main thread held long enough to hand one over late makes; the context's clock
+behind by more than two chunks and 1%; the microphone muted or ended; the context suspended; or no
+chunk at all with the microphone seen on a second or more after it began), 6 a page, apart from the
+other lines:
+`natter: <account>: media: a voice recording 39.2 s in 40.1 s (40.0 s on its context's clock, of
+which the audio thread skipped 0.8 s): 459 chunks of 4096 at 48000 Hz (microphone 48000 Hz), 12
+handed over more than a chunk late (1.0 s of its sound lost), longest gap 420 ms; the page's main
+thread up to 380 ms late; the microphone muted once; its context never suspended; measured until
+the microphone stopped`. Chunks handed over late point at the page's main thread (or the memory it
+waits for); sound skipped at the page's handler running long; a clock behind or a long gap with
+none late at the audio thread or its output; mutes at the microphone. Sound the microphone hands
+WebKit too late for its turn gets silence in its place and comes after it, late, which only the
+recording itself shows. Only counts, durations and rates.
+
+So WhatsApp's recorder is kept away from the main thread where it can be. When the page asks for a
+script processor, the bridge makes an `AudioWorkletNode` of its own dressed as one (to the page it is
+a `ScriptProcessorNode`, with its `bufferSize`, channels, `onaudioprocess` and `audioprocess`
+listeners): its processor gathers each chunk on the audio thread and posts it whole to the main
+thread, where the page gets it in an `audioprocess` event like WebKit's, its sound in buffers of its
+own. A main thread running late hands chunks over late, but whole and in order. In the lab (WebKitGTK
+2.52.6, a sample-exact test signal recorded the way WhatsApp records), with the page's main thread
+held 150 ms every second, WebKit's script processor lost 0.24 s of a 20 s recording and repeated as
+much (300 ms every 2 s: 1.3 s), and the worklet lost and repeated nothing. What the page writes into
+an event's `outputBuffer` plays two chunks after its chunk began, as with WebKit's (silence where it
+comes back later than that), and the event's `playbackTime` says when. The node is processed only
+while its output leads somewhere, as WebKit's is (an unconnected `AudioWorkletNode` would be
+processed regardless, so it's connected into an idle `GainNode` of Natter Den's meanwhile), and the
+idle audio counts it as a script processor.
+
+A worklet's module loads into each context on its own, asynchronously: it's done about 10 ms after
+the context first runs. A page that asks for the microphone as it makes its context gets
+`getUserMedia`'s answer at about that moment, and in the lab always just before the module, so a
+script processor made on that answer, in the same task as its context, or in a context made after
+`getUserMedia` would be WebKit's own; that covers a voice note recorded into a fresh context. And
+the module can't simply load into a context that is playing: as the first worklet processor
+registers in one, WebKit stops and starts that context's sound output again (in the lab 14 to 75 ms
+after it started; a recording's lands just after its microphone opens, and with Bluetooth headphones
+switching to their headset profile then, an output that fails to open stops the context's clock and
+the recording with it). So the bridge makes a context ahead, a spare: as the page starts it makes
+one as `new AudioContext()` would and suspends it before it ever runs (WebKit opens no output for it
+then, and the module registering restarts none), and loads the module into it. The page's next
+`new AudioContext()` with no options, WebKit's own rate asked for (44100 Hz in WebKitGTK), or only a
+`latencyHint` (WebKitGTK makes the same context for each) is that spare, its module loaded, and it
+starts a moment later as a new context would (unless the page suspends or closes it first); the next
+spare is made as it's handed over. Besides spares, the module loads only into a context the idle
+audio has rested, once suspended, and not while a `getUserMedia` call of the page's is unanswered or
+a track from one is live; a context resumed before its turn to load waits for its next rest. A
+page's `getUserMedia` reaches WebKit at once, inside the page's call (so a request that follows a
+click still counts as the click's), but the answer the page gets waits for modules loading at that
+moment (250 ms at most; a spare is made then if none is at hand), so a context it makes or records
+into once the microphone opens has its module. In the lab (WebKitGTK 2.52.6, with the page sitting a
+second before recording, as after a click on record) every order got the worklet: `getUserMedia`
+then the context and the processor at once, the context then `getUserMedia`, a context and processor
+in one task, a context made long before, a new context for each of two notes, and one context
+reused; with the main thread held 150 ms every second, WhatsApp's order (the context made on
+`getUserMedia`'s answer, no pause before the processor) lost and repeated nothing, where WebKit's
+own lost and repeated about 0.2 s of each 20 s recording; and no context's output was stopped and
+started again. A call's context made with no options is a spare too, so the call's own worklets
+register in it with no restart of its output either (one made at another rate restarts once as they
+register, as it would without Natter Den). Modules load one context at a time (WebKitGTK 2.52.6
+hangs the page's main thread for good when a dozen or so modules load from `blob:` URLs at once),
+from a `blob:` URL, or a `data:` one where WhatsApp's Content-Security-Policy refuses that. A kind
+the policy refuses (a `SecurityError`) isn't tried again in that page, so a policy that reports
+refusals hears of each kind at most once; nor is one that has failed to load 3 times. Any other
+failure fails only that context's load (a spare is closed, and the next one made as the page next
+makes a context or asks for the microphone). With both kinds given up no spares are made. A script
+processor is WebKit's own, as before, for as long as the page keeps it, when its context has no
+module: made while no spare was ready (as the page loads, before the first spare's module has, or a
+second context right after the first), or made with other options (another sample rate), until the
+idle audio has rested it (WhatsApp's long-lived context, from its next recording on); also in a
+context where neither kind may load, beyond 16 open contexts with the module (spares count), or of a
+shape the worklet doesn't take (no input or output channels, or WebKit's own pick of buffer size).
+Each context with the module renders through a worklet thread: about 2 MB and a thread each, the
+spare too, and in the lab a running context took about 1.3% of a core more, and recording through
+the worklet about 3% more than through WebKit's own (a suspended context, as a spare is, takes
+nothing). The log says once a page which kind the page got, and why: `natter: <account>: media: a
+script processor (a voice recorder, say) made as Natter Den's worklet recorder; its module loaded
+(from a blob: URL)`, or `… made as WebKit's own; its context was made while no spare context with
+Natter Den's worklet recorder's module was ready, and hasn't rested since` (or with options a spare
+doesn't have, the module still loading, its load failed or refused, with the error's name, and so
+on); a fresh context the page records into at once shows as the first of those. And should the page
+resume a rested context while its module loads, so that WebKit likely restarted its output after
+all: `natter: <account>: media: Natter Den's worklet recorder's module loaded into a context the
+page resumed meanwhile, so WebKit likely stopped and started that context's sound output (from a
+blob: URL)`. A recording through the worklet says so (`a voice recording (through Natter Den's
+worklet recorder) …`), and its chunks handed over more than a chunk late are
+`late, but whole (nothing lost)`: its events' `playbackTime` stays where each chunk was, so how late
+each came is the context's clock past its chunk's end.
 
 ### Pausing other audio
 

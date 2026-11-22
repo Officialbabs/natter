@@ -121,7 +121,8 @@
   // what's live now (a sound not yet ended, a microphone track still on), not a tally that a
   // missed event would leave stuck.
 
-  // Contexts are held weakly: one WhatsApp drops without close() can still be collected.
+  // Contexts are held weakly, so a closed one the page lets go can be collected (WebKit 2.52 keeps an
+  // open one alive however the page drops it).
   const contexts = new Set();  // WeakRefs to AudioContexts
   const rested = new WeakSet();  // contexts Natter suspended (the only ones its play() wakes)
   const sources = new Set();  // started source nodes that haven't ended
@@ -215,6 +216,20 @@
   const RECORDER_HOLD_MS = 10 * 60000;
   let onProcessorConnected = null;  // set by "Sound that can't be heard", for its log line
   let onRecorderResumed = null;  // the same, for a recorder fed again after a pause
+  let onRecorderFed = null;  // the same, for how each recording into a script processor went
+  let onRecorderPath = null;  // the same, for which kind of script processor the page got, and why
+  // Natter's worklet recorder ("A recorder a late main thread can't break"): { spare(args),
+  // fresh(context, args), rested(context), make(context, args) }; the script processors it made; the
+  // audio tracks the page's getUserMedia handed it, until they end; and WebKit's AudioWorkletNode for
+  // it, as it was before the idle audio wrapped it (below).
+  let recorderShim = null;
+  const shims = new WeakSet();
+  const microphoneTracks = new Set();
+  const nativeWorkletNode = window.AudioWorkletNode;
+  // Makes a context as the page's `new AudioContext()` would, but not the page's (yet): the worklet
+  // recorder's spares. Set below, once the idle audio has its own AudioContext.
+  let spareContext = null;
+  const starting = new WeakSet();  // spares just handed to the page, until they start (or it suspends or closes one)
 
   // Something starts to play through a processor: as a start does.
   function processorBusy(node) {
@@ -307,6 +322,7 @@
         feeds.add(stream);
         quietSince.delete(destination);
         if (again && onRecorderResumed) onRecorderResumed(destination, quiet);
+        if (onRecorderFed && scripts.has(destination)) onRecorderFed(destination, stream);
       }
       return result;
     };
@@ -342,26 +358,77 @@
     return busy;
   }
 
+  // A context rested here, once suspended, may take the worklet recorder's module (recorderShim.rested):
+  // only then, as WebKit restarts a playing context's sound output for it. One that couldn't then (a
+  // microphone on) may at a later look.
   function rest() {
     if (performance.now() - lastStart < IDLE_MS || playingSources() || liveStreams() || mediaPlaying() || calling()) return;
     const busy = processing();
+    const loadRested = (context) => {
+      if (!recorderShim) return;
+      try { recorderShim.rested(context); } catch (_) { /* WebKit's own script processors there, as before */ }
+    };
     eachContext((context) => {
       if (context.state === "running" && !callContexts.has(context) && !busy.has(context)) {
         rested.add(context);
         lastRested.set(context, performance.now());
-        context.suspend().catch(() => {});
-      }
+        context.suspend().then(() => loadRested(context), () => {});
+      } else if (context.state === "suspended" && rested.has(context)) loadRested(context);
     });
   }
 
   const Context = window.AudioContext || window.webkitAudioContext;
   if (Context) {
+    function adopt(context) {
+      const ref = new WeakRef(context);
+      contexts.add(ref);
+      context.addEventListener("statechange", () => { if (context.state === "closed") contexts.delete(ref); });
+    }
+    // A spare handed over starts as WebKit's own new context does: in a task of its own after the
+    // page's (WebKit's constructor posts one), so what the page does to it first in its microtasks
+    // (suspend() or close() it) comes first, and it doesn't start then. The task is a MessageChannel's,
+    // made now, before the page's scripts run: a hidden page holds timers back, not these.
+    const handedOver = [];  // spares handed over, until that task
+    const startHandedOver = () => handedOver.splice(0).forEach((spare) => {
+      if (starting.delete(spare)) wake(spare);
+    });
+    let startTask = () => setTimeout(startHandedOver, 0);  // where there's no MessageChannel
+    try {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = startHandedOver;
+      startTask = channel.port2.postMessage.bind(channel.port2, null);
+    } catch (_) { /* a timer's task, then */ }
     const Tracked = class extends Context {
+      // A new context like a spare the worklet recorder has ready (its module loaded) is that spare
+      // (recorderShim.spare): it starts as a new one would, a moment on, unless the page suspends or
+      // closes it first. Any other is WebKit's new one, as before (recorderShim.fresh). Not for a
+      // page's own subclass: its contexts are its own.
       constructor(...args) {
+        let spare = null;
+        if (recorderShim && new.target === Tracked) {
+          try { spare = recorderShim.spare(args); } catch (_) { spare = null; }
+        }
+        if (spare) {
+          adopt(spare);
+          starting.add(spare);
+          handedOver.push(spare);
+          startTask();
+          return spare;
+        }
         super(...args);
-        const ref = new WeakRef(this);
-        contexts.add(ref);
-        this.addEventListener("statechange", () => { if (this.state === "closed") contexts.delete(ref); });
+        adopt(this);
+        if (recorderShim) {
+          try { recorderShim.fresh(this, args); } catch (_) { /* WebKit's own script processors, as before */ }
+        }
+      }
+      suspend(...args) {
+        starting.delete(this);
+        return super.suspend(...args);
+      }
+      // A closing context stays as it was until it has closed: resumed meanwhile, it would open its output.
+      close(...args) {
+        starting.delete(this);
+        return super.close(...args);
       }
       createMediaStreamSource(stream) {
         streams.add(stream);
@@ -388,19 +455,25 @@
     // Sound a page decodes itself (a wasm decoder) plays through a script processor or a worklet,
     // which have no start() to watch: making one wakes a context Natter suspended, as a start
     // does, and so does connecting it (trackProcessor); while it's connected rest() leaves its
-    // context be (processing()).
+    // context be (processing()). Natter's worklet recorder (recorderShim) counts as one, as WebKit's.
     const scriptProcessor = Context.prototype.createScriptProcessor;
     if (typeof scriptProcessor === "function") {
       Tracked.prototype.createScriptProcessor = function (...args) {
         lastStart = performance.now();
         wake(this);
-        const node = scriptProcessor.apply(this, args);
+        let made = { why: "none" };
+        if (recorderShim) {
+          try { made = recorderShim.make(this, args); } catch (_) { made = { why: "failed" }; }
+        }
+        const node = made.node || scriptProcessor.apply(this, args);
         trackProcessor(node, true);
+        if (onRecorderPath) onRecorderPath(made.node ? "worklet" : "native", made.why, made.kind || "", made.name || "");
         return node;
       };
     }
     window.AudioContext = Tracked;
     if (window.webkitAudioContext) window.webkitAudioContext = Tracked;
+    spareContext = () => Reflect.construct(Context, [], Tracked);
     const Worklet = window.AudioWorkletNode;
     if (Worklet) {
       window.AudioWorkletNode = class AudioWorkletNode extends Worklet {
@@ -1060,6 +1133,492 @@
     }
   }, true);
 
+  // ---- A recorder a late main thread can't break ------------------------------------------
+  // WhatsApp records a voice note through a script processor, and WebKitGTK 2.52's copies each
+  // chunk out for the page only as that chunk's audioprocess event runs on the main thread: an event
+  // run more than a chunk late copies a buffer the audio thread is already filling again, so the
+  // page gets later sound in its place (lost, and heard twice: a crack), and while the two take turns
+  // on a buffer the audio thread skips a slice. So where it can, createScriptProcessor makes an
+  // AudioWorkletNode dressed as a script processor (recorderNode): its processor (recorderProcessor)
+  // gathers each chunk on the audio thread and posts it whole to the main thread, where the page gets
+  // it in an audioprocess event shaped like WebKit's. A late main thread gets its chunks late, but
+  // whole and in order. What the page writes into an event's outputBuffer is posted back and plays
+  // two chunks after its chunk began, as with WebKit's (silence where it comes back too late). The
+  // node is processed only while its output leads somewhere, as WebKit's: unconnected, an
+  // AudioWorkletNode would be processed regardless, so it's connected into an idle GainNode of
+  // Natter's meanwhile.
+  // A worklet's module loads per context, asynchronously (it's done about 10 ms after the context
+  // first runs), and a page records into a context it made a moment before, or in the same task: so
+  // Natter makes a context ahead (a spare, spareContext), suspended before it ever runs, and loads the
+  // module into it; the page's next `new AudioContext()` like it (WebKit's own rate, or that rate
+  // asked for) is that spare, and the next spare is made as it's handed over. The module loads only
+  // into a context that isn't playing: the first worklet processor registered in a playing one makes
+  // WebKit stop and start its sound output again (BaseAudioContext::workletIsReady), right as a
+  // microphone opens when it's a recording's. So besides spares, only a context the idle audio rested
+  // takes it (rested), once suspended, and none while the page's getUserMedia is unanswered or a track
+  // from it is live. A page's getUserMedia asks WebKit at once, in the page's call (a request that
+  // follows a click counts as the click's only then), but the page gets the answer once modules
+  // loading then have (SPARE_HOLD_MOST_MS at most), so a context made or recorded into once the
+  // microphone opens has it. Modules load from a blob: URL, or a data: one where WhatsApp's
+  // Content-Security-Policy refuses that (a kind refused, a SecurityError, isn't tried again in the
+  // page, so a policy that reports refusals hears of each at most once; any other failure fails only
+  // that context's load, until that kind has failed RECORDER_FAILS_MOST times in the page). A script
+  // processor made in a context with no module (made while no spare was ready, or with other
+  // options, until it has rested; or its load failed), or where neither kind may load, or of a shape
+  // the worklet doesn't take, is WebKit's own, as before, for as long as the page keeps it; the log
+  // says once a page which it was, and why (onRecorderPath). The idle audio (above) asks it for each
+  // context made, each it rested and each script processor asked for (recorderShim), and counts what
+  // it makes as a script processor; without it, they're WebKit's own.
+  {
+    const Context = window.AudioContext || window.webkitAudioContext;  // the idle audio's: WebKit's createGain
+    if (Context && nativeWorkletNode && window.EventTarget) {
+      const RECORDER_PROCESSOR = "natter-script-processor";  // never a call's ("voip-…")
+      const RECORDER_SIZES = [256, 512, 1024, 2048, 4096, 8192, 16384];  // WebKit's, but 0 (its own pick)
+      const RECORDER_CHANNELS_MOST = 32;
+      const RECORDER_CONTEXTS_MOST = 16;  // contexts open at once with the module: each runs a worklet thread
+      // The worklet's processor, as its module's source (it runs in the worklet, so it uses nothing
+      // here). It gathers `size` frames, posts them with the context's frame at the first, and plays
+      // what the page wrote for the chunk two before the one it gathers, at the same place in it.
+      function recorderProcessor(name) {
+        registerProcessor(name, class extends AudioWorkletProcessor {
+          constructor(options) {
+            super();
+            const given = options.processorOptions;
+            this.size = given.size;
+            this.channels = given.channels;
+            this.filled = 0;  // frames of the chunk being gathered
+            this.first = 0;  // the context's frame its first frame came at
+            this.count = 0;  // chunks posted
+            this.chunk = this.fresh();
+            this.written = new Map();  // chunk: what the page wrote for it, until it has played
+            this.port.onmessage = (event) => {
+              const data = event.data;
+              if (data && data.n >= this.count - 2 && Array.isArray(data.output)) this.written.set(data.n, data.output);
+            };
+          }
+          fresh() {
+            const chunk = [];
+            for (let c = 0; c < this.channels; c++) chunk.push(new Float32Array(this.size));
+            return chunk;
+          }
+          process(inputs, outputs) {
+            const input = inputs[0] || [];  // no channels while nothing is connected in: silence
+            const output = outputs[0] || [];
+            const frames = output.length ? output[0].length : 128;
+            if (!this.filled) this.first = currentFrame;
+            for (let c = 0; c < this.channels; c++) if (input[c]) this.chunk[c].set(input[c], this.filled);
+            const written = this.written.get(this.count - 2);
+            if (written) {
+              for (let c = 0; c < output.length; c++) {
+                if (written[c]) output[c].set(written[c].subarray(this.filled, this.filled + frames));
+              }
+            }
+            this.filled += frames;
+            if (this.filled >= this.size) {
+              this.port.postMessage({ n: this.count, frame: this.first, input: this.chunk },
+                                    this.chunk.map((channel) => channel.buffer));
+              this.written.delete(this.count - 2);
+              this.count++;
+              this.filled = 0;
+              this.chunk = this.fresh();
+            }
+            return true;  // false would end it for good
+          }
+        });
+      }
+      const RECORDER_MODULE = `(${recorderProcessor})(${JSON.stringify(RECORDER_PROCESSOR)});\n`;
+      // Taken now, before the page's scripts run (the AudioWorkletNode before the idle audio wrapped it).
+      const NativeWorklet = nativeWorkletNode;
+      const NativeProcessor = window.ScriptProcessorNode;
+      const NativeBuffer = window.AudioBuffer;
+      const ProcessingEvent = window.AudioProcessingEvent;
+      const createGain = Context.prototype.createGain;
+      const Targets = window.EventTarget && window.EventTarget.prototype;
+      const rawListen = Targets && Targets.addEventListener;
+      const rawUnlisten = Targets && Targets.removeEventListener;
+      const rawDispatch = Targets && Targets.dispatchEvent;
+      const objectURL = window.URL && window.URL.createObjectURL;  // (blob: modules can't load without)
+      const revokeURL = window.URL && window.URL.revokeObjectURL;
+      const recorderModules = new WeakMap();  // each context → { state, kind, … } of its module
+      const withModule = new Set();  // WeakRefs to the contexts loading or holding it
+      const refusedKinds = new Map();  // a kind of module URL refused in this page → the error's name
+      const RECORDER_FAILS_MOST = 3;  // failures of a kind in a page that give it up, as a refusal does
+      const failures = new Map();  // each kind of module URL → its loads that failed in this page
+      const waiting = [];  // [context, its audioWorklet, its entry], waiting for its turn to load
+      let loadingNow = false;
+      const settling = [];  // held getUserMedia calls' resolves: called once nothing loads
+      const SPARE_HOLD_MOST_MS = 250;  // the longest the page's getUserMedia waits for modules loading
+      const LATENCIES = ["interactive", "balanced", "playback"];  // AudioContextLatencyCategory
+      let spare = null;  // the context made ahead (spareContext), its module loading or loaded
+      let spareRate = 0;  // its sampleRate: WebKit's own pick, as a new AudioContext() has it
+      let noSpares = "";  // why none can be had, for good: "none" (no AudioWorklet) or "refused" (both kinds)
+      let asking = 0;  // the page's getUserMedia calls not yet answered
+      const parked = new WeakMap();  // each context → Natter's idle GainNode
+      let constructible = typeof ProcessingEvent === "function";
+      const nameOf = (error) => {
+        try {
+          const name = error && error.name;
+          return typeof name === "string" && /^[A-Za-z]{1,40}$/.test(name) ? name : "";
+        } catch (_) { return ""; }
+      };
+      if (!("audioWorklet" in Context.prototype)) noSpares = "none";
+      if (typeof objectURL !== "function") refusedKinds.set("blob", "");
+
+      // Tracks that ended go at each getUserMedia call, as one says so ("ended", which stop() doesn't
+      // fire), and as a rested context is looked at for its module: an ended track held here keeps
+      // WebKit's capturer behind it. So at most the last call's stay held, until the next.
+      const dropEnded = () => microphoneTracks.forEach((track) => {
+        if (track.readyState !== "live") microphoneTracks.delete(track);
+      });
+      const microphoneOn = () => {
+        dropEnded();
+        return asking > 0 || microphoneTracks.size > 0;
+      };
+      // A context of the page's may take the module only while Natter has it rested and suspended, and
+      // no microphone is opening or on: resumed as it registers, its output would stop and start again.
+      const restful = (context) => rested.has(context) && context.state === "suspended" && !microphoneOn();
+
+      const unlist = (context) => withModule.forEach((ref) => {
+        const other = ref.deref();
+        if (!other || other === context || other.state === "closed") withModule.delete(ref);
+      });
+
+      // An entry's state: "fresh" (a context of the page's with no module yet: made while no spare was
+      // ready, or `unlike` one; it loads once rested), "none" (no AudioWorklet here), "many"
+      // (RECORDER_CONTEXTS_MOST already), "loading", "ready", "unloaded" (its load failed, with the
+      // error's name: it loads again once rested), "refused" (both kinds) or "closed" (the context,
+      // before it loaded). One context loads at a time, in turn: WebKitGTK 2.52 hangs the page's main
+      // thread for good when a dozen or so worklet modules load from blob: URLs at once (one after
+      // another they don't).
+      function loadInto(context, entry) {
+        let worklet = null;
+        try { worklet = context.audioWorklet; } catch (_) { /* none */ }
+        if (!worklet || typeof worklet.addModule !== "function") {
+          entry.state = "none";
+          return;
+        }
+        unlist(null);
+        if (withModule.size >= RECORDER_CONTEXTS_MOST) {
+          entry.state = "many";
+          return;
+        }
+        withModule.add(new WeakRef(context));
+        entry.state = "loading";
+        waiting.push([context, worklet, entry]);
+        loadNext();
+      }
+
+      function loadNext() {
+        if (loadingNow) return;
+        const next = waiting.shift();
+        if (!next) {
+          settling.splice(0).forEach((resolve) => resolve());
+          return;
+        }
+        const [context, worklet, entry] = next;
+        const done = (state, kind = "", name = "") => {
+          entry.state = state;
+          entry.kind = kind;
+          entry.name = name;
+          if (state !== "ready") unlist(context);
+          if (entry.spare) spareSettled(context, entry);
+          loadingNow = false;
+          loadNext();
+        };
+        loadingNow = true;
+        const attempt = () => {
+          if (context.state === "closed") return done("closed");
+          // Resumed, or a microphone on, before its turn: next time it rests.
+          if (!entry.spare && !restful(context)) return done("fresh");
+          const kind = ["blob", "data"].find((one) => !refusedKinds.has(one));
+          if (!kind) return done("refused");
+          let url = "";
+          // The page's policy refusing that kind is a SecurityError (WebKit's Worklet::addModule checks
+          // the Content-Security-Policy first): it isn't tried again in the page, and the next kind is
+          // tried now. Anything else (AbortError for a network error or a load cancelled, as for a
+          // cross-origin one; TypeError, …) fails only this context's load, until that kind has failed
+          // RECORDER_FAILS_MOST times in the page.
+          const failed = (error) => {
+            if (url && kind === "blob") revokeURL.call(URL, url);
+            if (context.state === "closed") return done("closed");
+            const name = nameOf(error);
+            const count = (failures.get(kind) || 0) + 1;
+            failures.set(kind, count);
+            if (name !== "SecurityError" && count < RECORDER_FAILS_MOST) return done("unloaded", "", name);
+            refusedKinds.set(kind, name);
+            return attempt();
+          };
+          try {
+            url = kind === "blob" ? objectURL.call(URL, new Blob([RECORDER_MODULE], { type: "text/javascript" }))
+              : `data:text/javascript,${encodeURIComponent(RECORDER_MODULE)}`;
+            worklet.addModule(url).then(() => {
+              if (kind === "blob") revokeURL.call(URL, url);
+              // Closed meanwhile (closing a context doesn't stop its worklet's thread: the load still ends).
+              if (context.state === "closed") return done("closed");
+              // Resumed while it loaded: its output was likely restarted as the module registered.
+              if (!entry.spare && context.state === "running" && onRecorderPath) onRecorderPath("worklet", "restarted", kind, "");
+              return done("ready", kind);
+            }, failed);
+          } catch (error) { failed(error); }
+          return undefined;
+        };
+        attempt();
+      }
+
+      // A spare: made suspended, before it ever runs (WebKit then opens no output for it, and the
+      // module registering restarts none), and the module loaded into it at once. A spare whose module
+      // doesn't load is closed, and the next made as the page next makes a context or asks for the
+      // microphone; where none ever can load (no AudioWorklet, both kinds refused), no more are made,
+      // and at RECORDER_CONTEXTS_MOST none until the page makes a context again.
+      function makeSpare() {
+        dropStale();
+        if (spare || noSpares || !spareContext) return;
+        unlist(null);
+        if (withModule.size >= RECORDER_CONTEXTS_MOST) return;
+        let context;
+        try {
+          context = spareContext();
+          context.suspend().catch(() => {});
+        } catch (_) {
+          return;  // tried again as the page makes a context, or asks for the microphone
+        }
+        spare = context;
+        spareRate = context.sampleRate;
+        const entry = { state: "loading", kind: "", spare: true };
+        recorderModules.set(context, entry);
+        loadInto(context, entry);
+        if (entry.state !== "loading") spareSettled(context, entry);
+      }
+
+      function spareSettled(context, entry) {
+        if (entry.state === "ready" || spare !== context) return;
+        spare = null;
+        if (entry.state === "none" || entry.state === "refused") noSpares = entry.state;
+        try { context.close().catch(() => {}); } catch (_) { /* gone */ }
+      }
+
+      // A spare no longer suspended (closed, or interrupted) can't be the page's new context: it's let
+      // go (closed, if it isn't) for another to be made.
+      function dropStale() {
+        if (!spare || spare.state === "suspended") return;
+        const stale = spare;
+        spare = null;
+        if (stale.state === "closed") return;
+        try { stale.close().catch(() => {}); } catch (_) { /* gone */ }
+      }
+
+      // Whether `new AudioContext(...args)` makes a context like a spare: no options, or WebKit's own
+      // rate asked for, and any latencyHint (WebKitGTK 2.52 makes the same context for each); nothing else.
+      function like(args) {
+        const options = args[0];
+        if (options === undefined || options === null) return true;
+        if (typeof options !== "object") return false;
+        try {
+          if (Object.keys(options).some((key) => key !== "sampleRate" && key !== "latencyHint")) return false;
+          const { sampleRate, latencyHint } = options;
+          return (sampleRate === undefined || (typeof sampleRate === "number" && Math.fround(sampleRate) === spareRate))
+            && (latencyHint === undefined || LATENCIES.includes(latencyHint)
+                || (typeof latencyHint === "number" && Number.isFinite(latencyHint)));
+        } catch (_) { return false; }
+      }
+
+      // The page's `new AudioContext(...args)`: the spare, if its module has loaded and it's like that
+      // one (the next is made at once), or null for WebKit's new one.
+      function takeSpare(args) {
+        dropStale();
+        const context = spare;
+        const entry = context && recorderModules.get(context);
+        if (!entry || entry.state !== "ready" || !like(args)) {
+          makeSpare();
+          return null;
+        }
+        spare = null;
+        makeSpare();
+        return context;
+      }
+
+      // WebKit's new context for the page: no module, until it rests.
+      function freshContext(context, args) {
+        recorderModules.set(context, { state: "fresh", kind: "", unlike: spareRate > 0 && !like(args) });
+      }
+
+      // A context the idle audio has just rested (suspended): its module loads now, if it may.
+      function restedContext(context) {
+        const entry = recorderModules.get(context);
+        if (!entry || noSpares || !["fresh", "many", "unloaded"].includes(entry.state) || !restful(context)) return;
+        loadInto(context, entry);
+      }
+
+      // The page's getUserMedia gets its answer once the modules loading now have (SPARE_HOLD_MOST_MS at
+      // most; a spare is made now if none is at hand); its calls unanswered and the audio tracks they
+      // hand over, until they end, keep modules from loading into the page's contexts.
+      function settled() {
+        makeSpare();
+        if (!loadingNow && !waiting.length) return null;
+        return new Promise((resolve) => {
+          settling.push(resolve);
+          setTimeout(resolve, SPARE_HOLD_MOST_MS);
+        });
+      }
+      const devices = window.navigator && window.navigator.mediaDevices;
+      if (devices && typeof devices.getUserMedia === "function") {
+        const open = devices.getUserMedia;
+        devices.getUserMedia = function getUserMedia(...args) {
+          dropEnded();
+          asking++;
+          let asked;
+          try {
+            // WebKit's is asked now, in the page's call: only then does a request that follows a click
+            // count as the click's (MediaDevices::getUserMedia looks as it's called), and WebKit refuses
+            // one that doesn't, unasked, once Natter has refused one. Only the answer waits.
+            const opened = open.apply(this, args);
+            const held = settled();
+            asked = held ? Promise.all([opened, held]).then(([stream]) => stream) : opened;
+          } catch (error) {
+            asking--;
+            throw error;
+          }
+          return Promise.resolve(asked).then((stream) => {
+            asking--;
+            try {
+              for (const track of stream.getAudioTracks()) {
+                if (track.readyState !== "live") continue;
+                microphoneTracks.add(track);
+                rawListen.call(track, "ended", () => microphoneTracks.delete(track));
+              }
+            } catch (_) { /* the stream is the page's all the same */ }
+            return stream;
+          }, (error) => {
+            asking--;
+            throw error;
+          });
+        };
+      }
+
+      // The worklet as a script processor for createScriptProcessor(args), where it can be: { node }
+      // with its module's kind, or why not (a state above, "shape" or "failed", with the error's name).
+      // A context with no module yet tells why ("fresh", or "options" where it isn't like a spare;
+      // "unloaded", with the error's name), but where none ever can have one, that.
+      function recorderNode(context, args) {
+        const entry = recorderModules.get(context) || { state: "none" };
+        const state = (entry.state === "fresh" || entry.state === "unloaded") && noSpares ? noSpares : entry.state;
+        if (state === "refused") return { why: "refused", name: refusedKinds.get("data") || "" };
+        if (state === "fresh" && entry.unlike) return { why: "options" };
+        if (state === "unloaded") return { why: "unloaded", name: entry.name };
+        if (state !== "ready") return { why: state };
+        const given = (i, otherwise) => (args[i] === undefined ? otherwise : Number(args[i]));  // WebIDL's defaults
+        const [size, inputs, outputs] = [given(0, 0), given(1, 2), given(2, 2)];
+        const channels = (n) => Number.isInteger(n) && n >= 1 && n <= RECORDER_CHANNELS_MOST;
+        if (!RECORDER_SIZES.includes(size) || !channels(inputs) || !channels(outputs)) return { why: "shape" };
+        let node;
+        try {
+          node = new NativeWorklet(context, RECORDER_PROCESSOR, {
+            numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [outputs], channelCount: inputs,
+            channelCountMode: "explicit", channelInterpretation: "speakers", processorOptions: { size, channels: inputs },
+          });
+        } catch (error) {
+          return { why: "failed", name: nameOf(error) };
+        }
+        dress(node, context, size, inputs, outputs);
+        return { node, why: "ready", kind: entry.kind };
+      }
+
+      // An audioprocess event as WebKit's (an AudioProcessingEvent), or one like it where that can't
+      // be made.
+      function processingEvent(playbackTime, inputBuffer, outputBuffer) {
+        if (constructible) {
+          try {
+            return new ProcessingEvent("audioprocess", { playbackTime, inputBuffer, outputBuffer });
+          } catch (_) { constructible = false; }
+        }
+        const event = new Event("audioprocess");
+        for (const [key, value] of Object.entries({ playbackTime, inputBuffer, outputBuffer })) {
+          Object.defineProperty(event, key, { value, enumerable: true });
+        }
+        return event;
+      }
+
+      const audioBuffer = (context, numberOfChannels, length, sampleRate) => (typeof NativeBuffer === "function"
+        ? new NativeBuffer({ numberOfChannels, length, sampleRate })
+        : context.createBuffer(numberOfChannels, length, sampleRate));
+
+      // The worklet node made to look and act like WebKit's script processor: one, by its prototype;
+      // bufferSize; onaudioprocess, an event handler as WebKit's (a listener of its own, where it was
+      // first set); each chunk handed over in an audioprocess event, and what the page wrote back.
+      function dress(node, context, size, inputs, outputs) {
+        const port = node.port;
+        const connect = node.connect;
+        const disconnect = node.disconnect;
+        shims.add(node);
+        if (NativeProcessor && NativeProcessor.prototype) {
+          try { Object.setPrototypeOf(node, NativeProcessor.prototype); } catch (_) { /* stays a worklet to look at */ }
+        }
+        Object.defineProperty(node, "bufferSize", { configurable: true, enumerable: true, get: () => size });
+        let handler = null;
+        let relay = null;
+        Object.defineProperty(node, "onaudioprocess", {
+          configurable: true, enumerable: true,
+          get() { return handler; },
+          set(value) {
+            handler = typeof value === "function" ? value : null;
+            if (handler && !relay) {
+              relay = function (event) { if (handler) return handler.call(this, event); return undefined; };
+              rawListen.call(node, "audioprocess", relay);
+            } else if (!handler && relay) {
+              rawUnlisten.call(node, "audioprocess", relay);
+              relay = null;
+            }
+          },
+        });
+        // Its output always leads somewhere: into Natter's idle GainNode while the page's leads nowhere.
+        const park = () => {
+          try {
+            if (!parked.has(context)) parked.set(context, createGain.call(context));
+            connect.call(node, parked.get(context));
+          } catch (_) { /* a closed context: nothing is processed anyway */ }
+        };
+        node.disconnect = function (...args) {
+          const result = disconnect.apply(this, args);
+          if (!args.length || typeof args[0] === "number") park();  // every connection cut
+          return result;
+        };
+        park();
+        port.onmessage = (message) => {
+          const data = message.data;
+          if (!data || !Array.isArray(data.input) || !Number.isFinite(data.frame)) return;
+          const rate = context.sampleRate;
+          const inputBuffer = audioBuffer(context, inputs, size, rate);
+          for (let c = 0; c < inputs; c++) if (data.input[c]) inputBuffer.copyToChannel(data.input[c], c);
+          const outputBuffer = audioBuffer(context, outputs, size, rate);
+          // When what the page writes plays, as WebKit's says: two chunks after its chunk began.
+          rawDispatch.call(node, processingEvent((data.frame + 2 * size) / rate, inputBuffer, outputBuffer));
+          try {
+            const output = [];
+            for (let c = 0; c < outputs; c++) {
+              const channel = new Float32Array(size);
+              outputBuffer.copyFromChannel(channel, c);
+              output.push(channel);
+            }
+            port.postMessage({ n: data.n, output }, output.map((channel) => channel.buffer));
+          } catch (_) { /* the page took its outputBuffer's data away: silence */ }
+        };
+        // An error in the processor ends it (WebKit's node then plays silence and posts nothing).
+        rawListen.call(node, "processorerror", () => {
+          if (onRecorderPath) onRecorderPath("worklet", "broke", recorderModules.get(context).kind, "");
+        });
+        rawListen.call(context, "statechange", function closed() {
+          if (context.state !== "closed") return;
+          port.onmessage = null;
+          try { port.close(); } catch (_) { /* gone */ }
+          rawUnlisten.call(context, "statechange", closed);
+        });
+      }
+
+      recorderShim = { spare: takeSpare, fresh: freshContext, rested: restedContext, make: recorderNode };
+      makeSpare();  // the first, now, before the page's scripts run
+    }
+  }
+
   // ---- A voice message being recorded -------------------------------------------------------
   // A microphone on outside a call is a voice message being recorded (replies wait for it too).
   // Natter pauses other apps' sound meanwhile (mediapause.py), so the page says when one starts
@@ -1246,6 +1805,8 @@
   // context it plays through not running a moment after it started, or a context Natter rested
   // not resuming. Each line once a page for what it says, so repeats don't use up the page's
   // MEDIA_LINES. Kinds, codes, states and error names only, never a URL, a name or what plays.
+  // How a <video> played, and how a voice note recorded, have lines of their own, each counted apart
+  // (watchVideo, watchRecording, below).
   {
     const MEDIA_LINES = 12;
     const MEDIA_TYPES_KEPT = 64;
@@ -1306,10 +1867,11 @@
       return { "blob:": "blob", "https:": "https", "data:": "data", "file:": "file" }[scheme] || "other";
     }
 
+    const isVideo = (element) => Boolean(window.HTMLVideoElement) && element instanceof window.HTMLVideoElement;
     function about(element) {
       const context = routed.get(element);
       return {
-        kind: window.HTMLVideoElement && element instanceof window.HTMLVideoElement ? "video" : "audio",
+        kind: isVideo(element) ? "video" : "audio",
         route: context ? "webaudio" : "element",
         source: sourceOf(element),
         state: context ? String(context.state) : "",
@@ -1351,13 +1913,330 @@
           }
         }, 1500);
       });
+      if (isVideo(element)) watchVideo(element);
     }
+
+    // WebKitGTK 2.52.6 can drop a play() that comes while the element is still settling a seek it
+    // was given before its data came: the element then says it plays, has its data and no error,
+    // and its time stands still until something asks it to play again. WhatsApp does just that
+    // when a voice message is played again after a pause (a new source, the place it paused at,
+    // then play()), and the message went silent until the person moved its slider (a lab of that
+    // order stalled every time, Natter's scripts or not). So a play() of that kind (away from the
+    // start, while the element still loads or seeks) is looked at once it has settled: STALL_MS on,
+    // or again each STALL_MS while it still settles, up to SETTLE_LOOKS (SETTLED_MS more once it has,
+    // as a pipeline only just settled takes a moment to start). One still standing then is
+    // asked to play() again, which starts it; if it still doesn't move, its place is nudged (a real
+    // seek, which starts it too). A live stream (a call's sound, srcObject) is left alone, and any
+    // later play() ends the look. The log says how it went, once a page for each kind of element
+    // and outcome, and only when it went somewhere: a pause or a new source in between says nothing.
+    const STALL_MS = 1000;
+    const SETTLE_LOOKS = 5;
+    const SETTLED_MS = 250;
+    const HAVE_FUTURE_DATA = 3;
+    const playRound = new WeakMap();  // each element → its latest play()'s count: a later play() ends an earlier look
+    const timeOf = (element) => Number(element.currentTime) || 0;
+    const going = (element) => !element.srcObject && !element.paused && !element.ended && !element.error;
+    const settled = (element) => !element.seeking && element.readyState >= HAVE_FUTURE_DATA;
+    // Says it plays, has its data, and its time hasn't left `from`.
+    const standing = (element, from) => going(element) && settled(element) && Math.abs(timeOf(element) - from) < 0.01;
+    // Played on by itself: its time past `from`, or played to its end.
+    const movedOn = (element, from) => !element.error
+      && (element.ended || (going(element) && settled(element) && timeOf(element) - from >= 0.05));
+
+    function watchStart(element, from, round) {
+      const ours = () => playRound.get(element) === round;
+      const told = (then) => {
+        const now = about(element);
+        tellMedia({ what: "stalled", then, ...now }, keyOf("stalled", then, now));
+      };
+      let looks = 0;
+      let waited = false;
+      const look = () => {
+        if (!ours() || !going(element)) return;
+        if (!settled(element)) {  // still loading or settling its seek: look again in a while
+          waited = true;
+          if (++looks < SETTLE_LOOKS) setTimeout(look, STALL_MS);
+          return;
+        }
+        if (waited) {  // only just settled: a moment for it to start
+          waited = false;
+          setTimeout(look, SETTLED_MS);
+          return;
+        }
+        if (!standing(element, from)) return;
+        const again = play.call(element);  // not through this wrapper: no look of its own
+        if (again && typeof again.catch === "function") again.catch(() => {});
+        setTimeout(() => {
+          if (!ours()) return;
+          if (!standing(element, from)) {
+            if (movedOn(element, from)) told("play");
+            return;
+          }
+          element.currentTime = from + 0.001;
+          setTimeout(() => {
+            if (!ours()) return;
+            if (standing(element, from + 0.001)) told("still");
+            else if (movedOn(element, from + 0.001)) told("seek");
+          }, STALL_MS);
+        }, STALL_MS);
+      };
+      setTimeout(look, STALL_MS);
+    }
+
+    // Videos that play as if short of data: a status plays from a blob of its whole file, so the
+    // network is out of it. For each <video> that plays (not a call's stream), a spell of its
+    // playback is measured, from "playing" (or a seek settled) until it pauses, ends, fails, seeks
+    // or takes a new source, or VIDEO_SPELL_MS of it (and the next spell starts there, going on
+    // from it): the media seconds it played in how many seconds; each wait for data ("waiting",
+    // until it plays again) and how long it took, and each "stalled"; the frames it presented
+    // (requestVideoFrameCallback) and the stretches without one over VIDEO_GAP_MS (between frames,
+    // and from its last to the spell's end), while it plays and doesn't wait (a wait is counted as
+    // one, not as a gap); the frames WebKit dropped of all that reached its sink
+    // (getVideoPlaybackQuality); and how late a light timer on the page's main thread ran
+    // meanwhile, every VIDEO_TICK_MS while a video plays and not at all otherwise. Waits say its
+    // data came too slowly; gaps or drops without them, its frames weren't drawn in time; a late
+    // main thread, the page held things up. A hidden page draws no frames and runs its timers
+    // late, so its spells are dropped, and those still playing start again when it shows. The log
+    // has a page's first spell (to compare with), then only rough ones (a wait or a stall, a gap or
+    // a late main thread over VIDEO_ROUGH_MS, two frames or more dropped and over
+    // VIDEO_DROPPED_SHARE of them, or more than VIDEO_LOST_MS of its media behind the clock, which
+    // is how a slow playback clock shows: no wait, and its time running behind; a looping one's
+    // media time is only roughly known, so not for that): VIDEO_LINES a page, apart from MEDIA_LINES so videos can't
+    // crowd the sound's lines out, and VIDEO_LINES_EACH for one element's one source. Once they
+    // are used up nothing is measured. Measuring isn't free: while a frame callback is asked for,
+    // WebKit runs the page's rendering update at the display's rate. So at most VIDEO_SPELLS_EACH
+    // spells of one element's one source are measured, told or not (a whole status), and of one
+    // that loops only its first (its later rounds only repeat it). It never changes how a video
+    // plays. Kinds, counts, durations and sizes only.
+    const VIDEO_LINES = 16;
+    const VIDEO_LINES_EACH = 2;
+    const VIDEO_SPELLS_EACH = 5;
+    const VIDEO_SPELL_MS = 20000;
+    const VIDEO_TICK_MS = 100;
+    const VIDEO_GAP_MS = 100;
+    const VIDEO_ROUGH_MS = 150;
+    const VIDEO_LOST_MS = 400;  // a smooth start loses well under 100 ms
+    const VIDEO_DROPPED_SHARE = 0.05;
+    const VIDEO_MOST = 3600000;  // no number sent is larger (playback.py takes none that is)
+    const spells = new Map();  // each <video> playing now → its spell
+    const videoCounts = new WeakMap();  // each <video> → its source last measured, its spells measured and lines told
+    let videoLines = 0;
+    let videoTimer = 0;
+    let lastTick = 0;
+    let heldAt = -Infinity;  // when a tick last ran more than VIDEO_GAP_MS late
+    // A frame of the page's videos was called back. WebKit without hardware acceleration calls
+    // back none, so until one has, a spell without frames isn't rough for that.
+    let framesSeen = false;
+    const counted = (value) => Math.min(Math.max(Math.round(value), 0), VIDEO_MOST);
+    const sizeOf = (value) => Math.min(Math.round((Number(value) || 0) / 10) * 10, VIDEO_MOST);  // to tens of pixels
+    const srcOf = (element) => String(element.currentSrc || element.src || "");  // kept here, never sent
+    // Whether the page's main thread was held since `since`: a tick ran late meanwhile, or one is
+    // overdue now.
+    const heldSince = (since) => heldAt > since || performance.now() - lastTick - VIDEO_TICK_MS > VIDEO_GAP_MS;
+    // The frames GStreamer's sink dropped and showed since it last started counting, as WebKit
+    // reads them (its totalVideoFrames is those shown), or null where WebKit doesn't count them.
+    const qualityOf = (element) => {
+      try {
+        const quality = element.getVideoPlaybackQuality();
+        return [Number(quality.droppedVideoFrames) || 0, Number(quality.totalVideoFrames) || 0];
+      } catch (_) { return null; }
+    };
+
+    function watchVideo(element) {
+      element.addEventListener("playing", () => {
+        const spell = spells.get(element);
+        if (!spell) begin(element);
+        else if (spell.waitingSince !== null) {  // its wait is over: a frame is due from now
+          const now = performance.now();
+          spell.waited += now - spell.waitingSince;
+          spell.waitingSince = null;
+          spell.frameAt = now;
+        }
+      });
+      element.addEventListener("waiting", () => {
+        const spell = spells.get(element);
+        if (!spell || spell.waitingSince !== null) return;
+        spell.waits++;
+        spell.waitingSince = performance.now();
+        spell.frameAt = null;  // no gap while it waits: the wait is told as a wait
+      });
+      element.addEventListener("stalled", () => {
+        const spell = spells.get(element);
+        if (spell) spell.stalls++;
+      });
+      for (const type of ["pause", "ended", "emptied", "error"]) element.addEventListener(type, () => end(element));
+      // A seek ends a spell, its time at the last look (one that loops seeks back to its start
+      // each time round, which isn't one), and the next starts once it has settled: at "seeked",
+      // or at "playing" when it waits for data first.
+      element.addEventListener("seeking", () => { if (!element.loop) end(element, "seek"); });
+      element.addEventListener("seeked", () => { if (going(element) && settled(element)) begin(element); });
+      if (going(element) && settled(element)) begin(element);  // playing already (autoplay)
+    }
+
+    // `before`: the spell that ran out just now (VIDEO_SPELL_MS of it), which this one goes on from.
+    function begin(element, before = null) {
+      if (spells.has(element) || videoLines >= VIDEO_LINES || document.hidden || !going(element)) return;
+      const src = srcOf(element);
+      let counts = videoCounts.get(element);
+      if (!counts || counts.src !== src) counts = { src, spells: 0, lines: 0 };
+      if (counts.lines >= VIDEO_LINES_EACH || counts.spells >= (element.loop ? 1 : VIDEO_SPELLS_EACH)) return;
+      counts.spells++;
+      videoCounts.set(element, counts);
+      const now = performance.now();
+      const quality = qualityOf(element);
+      const spell = {
+        began: now, counts, about: about(element), loop: Boolean(element.loop),
+        width: sizeOf(element.videoWidth), height: sizeOf(element.videoHeight),
+        at: timeOf(element), played: 0, waits: 0, waited: 0, waitingSince: null, stalls: 0, late: 0,
+        // frameAt: since when no frame has come (null while it waits); seen: the last look's counts
+        frames: null, gaps: 0, longest: 0, frameAt: now, presented: null, callback: 0,
+        quality: quality && [0, 0], seen: quality,
+      };
+      if (before) {
+        // A wait running across is split between the two (any wait is rough); a stretch without a
+        // frame goes on whole (a gap is rough by its length).
+        spell.presented = before.presented;
+        if (before.waitingSince !== null) Object.assign(spell, { waits: 1, waitingSince: now, frameAt: null });
+        else spell.frameAt = before.frameAt;
+      }
+      spells.set(element, spell);
+      if (typeof element.requestVideoFrameCallback === "function") {
+        spell.frames = 0;
+        const next = (when, metadata) => {
+          if (spells.get(element) !== spell) return;
+          framesSeen = true;
+          const at = Number.isFinite(when) ? when : performance.now();
+          const presented = metadata && Number.isFinite(metadata.presentedFrames) ? metadata.presentedFrames : null;
+          // Frames counted since the last call. WebKit counts one when its sink hands it on, not
+          // when it is on screen, so several counted at once were shown one by one only if the
+          // page's main thread was held meanwhile (it called back late), and then the gap is
+          // shared between them. Otherwise the picture itself stood still: a gap.
+          const count = presented !== null && spell.presented !== null ? Math.max(1, presented - spell.presented) : 1;
+          spell.presented = presented;
+          spell.frames += count;
+          if (spell.frameAt !== null) stretch(spell, (at - spell.frameAt) / (heldSince(spell.frameAt) ? count : 1));
+          spell.frameAt = spell.waitingSince === null ? at : null;
+          spell.callback = element.requestVideoFrameCallback(next);
+        };
+        spell.callback = element.requestVideoFrameCallback(next);
+      }
+      if (!videoTimer) {
+        lastTick = now;
+        videoTimer = setInterval(tick, VIDEO_TICK_MS);
+      }
+    }
+
+    // `ms` without a frame: a gap if over VIDEO_GAP_MS.
+    function stretch(spell, ms) {
+      if (ms > VIDEO_GAP_MS) spell.gaps++;
+      spell.longest = Math.max(spell.longest, ms);
+    }
+
+    // The media seconds played since the last look: its time moved on, or (one that loops) went
+    // back to its start and on from there.
+    function sample(element, spell) {
+      const time = timeOf(element);
+      spell.played += time >= spell.at ? time - spell.at : spell.loop ? time : 0;
+      spell.at = time;
+    }
+
+    // The frames dropped and shown since the last look, added to the spell's. The sink counts from
+    // 0 again after a pause, a seek or a loop, and a new source brings a new player counting from
+    // 0, while WebKit keeps each count until the new one is past 0: one that went down started
+    // again, and all of it is new. WebKit's counts stop at "pause", "ended" or a new source, so a
+    // look then adds nothing, and the spell loses at most the frames since the last tick.
+    function tally(element, spell) {
+      const quality = spell.seen && qualityOf(element);
+      if (!quality) return;
+      for (const i of [0, 1]) spell.quality[i] += quality[i] >= spell.seen[i] ? quality[i] - spell.seen[i] : quality[i];
+      spell.seen = quality;
+    }
+
+    function tick() {
+      const now = performance.now();
+      const late = now - lastTick - VIDEO_TICK_MS;
+      lastTick = now;
+      if (late > VIDEO_GAP_MS) heldAt = now;
+      for (const [element, spell] of [...spells]) {
+        spell.late = Math.max(spell.late, late);
+        sample(element, spell);
+        tally(element, spell);
+        if (now - spell.began < VIDEO_SPELL_MS) continue;
+        end(element, "onward");
+        begin(element, spell);  // it plays on: its next spell starts now
+      }
+    }
+
+    // `how`: "hidden" drops the spell (a hidden page's); "seek" leaves its time where the last look
+    // saw it (a seek has moved it); "onward" leaves the stretch since its last frame to the next
+    // spell (this one ran out, and it plays on).
+    function end(element, how = "") {
+      const spell = spells.get(element);
+      if (!spell) return;
+      const now = performance.now();
+      if (how !== "seek") sample(element, spell);
+      tally(element, spell);
+      spell.late = Math.max(spell.late, now - lastTick - VIDEO_TICK_MS);  // its timer due meanwhile
+      // The stretch since its last frame (or since it started, or its wait ended), unless the
+      // main thread was held across it: then its frames may have been shown and not called back,
+      // and it's told as late.
+      if (spell.frames !== null && spell.waitingSince === null && how !== "onward" && !heldSince(spell.frameAt)) {
+        stretch(spell, now - spell.frameAt);
+      }
+      spells.delete(element);
+      if (spell.callback && typeof element.cancelVideoFrameCallback === "function") {
+        element.cancelVideoFrameCallback(spell.callback);
+      }
+      if (!spells.size) {
+        clearInterval(videoTimer);
+        videoTimer = 0;
+      }
+      if (how === "hidden" || videoLines >= VIDEO_LINES) return;
+      if (spell.waitingSince !== null) spell.waited += now - spell.waitingSince;
+      const dropped = spell.quality ? counted(spell.quality[0]) : null;
+      const total = spell.quality ? counted(spell.quality[0] + spell.quality[1]) : null;
+      const frames = spell.frames === null ? null : counted(spell.frames);
+      const longest = frames === null ? null : counted(spell.longest);
+      const late = counted(spell.late);
+      const lasted = counted(now - spell.began);
+      const played = counted(spell.played * 1000);
+      const rough = spell.waits > 0 || spell.stalls > 0 || late > VIDEO_ROUGH_MS
+        || (longest !== null && longest > VIDEO_ROUGH_MS && framesSeen)
+        || (dropped !== null && dropped >= 2 && dropped > total * VIDEO_DROPPED_SHARE)
+        || (!spell.loop && lasted - played > VIDEO_LOST_MS);
+      if (videoLines > 0 && !rough) return;
+      spell.counts.lines++;
+      videoLines++;
+      post({
+        type: "media", what: "video", ...spell.about, loop: spell.loop, width: spell.width, height: spell.height,
+        played, lasted,
+        waits: counted(spell.waits), waited: counted(spell.waited), stalls: counted(spell.stalls),
+        frames, gaps: frames === null ? null : counted(spell.gaps), longest, dropped, total, late,
+      });
+    }
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        for (const element of [...spells.keys()]) end(element, "hidden");
+      } else {
+        // One still waiting or seeking starts its spell at "playing" or "seeked": one begun now
+        // would take its wait for playing.
+        for (const element of started) {
+          if (isVideo(element) && watchedMedia.has(element) && settled(element)) begin(element);
+        }
+      }
+    });
 
     const play = HTMLMediaElement.prototype.play;
     HTMLMediaElement.prototype.play = function (...args) {
       if (!toldOnce.has("support")) tellMedia(support(), "support");
       watchMedia(this);
+      const from = timeOf(this);
+      const settling = from > 0 && (this.seeking || this.readyState < HAVE_FUTURE_DATA);
       const result = play.apply(this, args);
+      const round = (playRound.get(this) || 0) + 1;
+      playRound.set(this, round);
+      if (settling) watchStart(this, from, round);
       if (result && typeof result.then === "function") {
         result.then(null, (error) => {
           const name = errorName(error);
@@ -1455,6 +2334,257 @@
                   `resumed ${state} ${restedThen} ${moving}`);
       }, WAKE_AGAIN_MS + 1500);
     };
+    // How each voice note recorded. WhatsApp records through a script processor fed by the
+    // microphone (a recorder). WebKitGTK 2.52 fills one of its two buffers on the audio thread, a
+    // chunk (bufferSize frames) at a time, and hands each full one to the page in an audioprocess
+    // event on the main thread, copying it out for the page only as the event runs, while the audio
+    // thread fills the other. An event that runs more than a chunk after its chunk filled copies out
+    // a buffer that is being filled again: the page gets part or all of a later chunk's sound in place
+    // of its own, so that much of the recording is lost and a later bit of it comes twice (and while
+    // an event runs on the buffer the audio thread is on, the audio thread skips what it would write:
+    // that sound is lost too). Every chunk is still handed over, the late ones in a burst, so their
+    // count doesn't show it. An event's playbackTime is the context's clock as it runs (plus a
+    // chunk), not where its chunk was: less a chunk for each chunk before it, it's the same for each
+    // that ran as soon as its chunk filled, later by as much as one ran late, and later for good by
+    // what the audio thread skipped before its chunk filled (its clock runs on as it skips). A late
+    // one is followed by less late ones in its burst, down to one on time, while a skip moves all
+    // the chunks after it on alike. So each is held against the earliest of it and those
+    // RECORDING_AFTER_MS after it, once they have come (a burst at the very start is seen from those
+    // after it, and the skips drop out of it), and the sound skipped is how much later the last
+    // chunk sits than the earliest from the first on (with any lateness of the last, less than a
+    // chunk as it ends a burst).
+    // Natter's worklet recorder (recorderNode, in the idle audio) hands chunks over whole however
+    // late: each event's playbackTime is where its chunk was, so the offsets stay put (but for sound
+    // not gathered: the worklet not processed meanwhile), and how late each came is the context's
+    // clock as it runs, past its chunk's end. Its chunks handed over more than a chunk late are late
+    // but whole: nothing is lost.
+    // A recording runs from its first chunk after a microphone feeds the recorder until the
+    // microphone stops, the recorder is disconnected, its context closes, or RECORDING_MOST_MS
+    // on. For each: its chunks, their size and the context's sample rate (and the microphone's,
+    // where WebKit says it); the seconds they hold, the seconds they took (to the last look that
+    // found the microphone still on, where that's later: a clock that stops for good hands over no
+    // chunk after it), and the seconds on the context's clock meanwhile; the sound the audio thread
+    // skipped; the longest wait between two (or since the last, while the microphone was still on);
+    // those handed over more than a chunk late, and the sound lost that way; how late the worst ran
+    // (the page's main thread was as late); the microphone muted, unmuted or ended (other than by
+    // the page: its stop() fires nothing); and the context suspended (and how often by the idle
+    // audio). Natter's own listeners go through EventTarget's addEventListener as it was before the
+    // page's scripts ran, so neither the page nor the idle audio (listening) counts them, and they
+    // only note a few numbers: the page's handler gets each event as it would without them, and the
+    // sound is never read. A timer looks for the end every RECORDING_LOOK_MS while a recording runs,
+    // and not at all otherwise. The log has a page's first recording (to compare with), then only
+    // rough ones (a chunk handed over late; a chunk's worth skipped or more; a wait between two of
+    // two chunks and a QUANTUM or more, as a main thread held long enough to hand one over late
+    // makes; the context's clock behind by more than two chunks and 1%; the microphone muted or
+    // ended; the context suspended; or no chunk at all with the microphone seen on at a look
+    // RECORDING_EMPTY_MS or more after it began): RECORDING_LINES a page, apart from the others.
+    // Once they are used up nothing is measured. Counts, durations and rates only.
+    const RECORDING_LINES = 6;
+    const RECORDING_LOOK_MS = 1000;
+    const RECORDING_MOST_MS = 10 * 60000;
+    const RECORDING_EMPTY_MS = 1000;
+    const RECORDING_AFTER_MS = 2000;
+    const RECORDING_AFTER_MOST = 512;  // chunks after, for the smallest chunks
+    const QUANTUM = 128;  // frames: WebKit's audio thread writes a chunk this many at a time
+    const RECORDING_SIZES = [128, 256, 512, 1024, 2048, 4096, 8192, 16384];  // bufferSize's (WebKit's at least 128)
+    const RATE_LEAST = 1000;  // sample rates told are within these (playback.py takes no other)
+    const RATE_MOST = 768000;
+    const Events = window.EventTarget && window.EventTarget.prototype;
+    const listen = Events && Events.addEventListener;
+    const unlisten = Events && Events.removeEventListener;
+    const recordings = new Map();  // each recorder recording now → its recording
+    let recordingLines = 0;
+    let recordingTimer = 0;
+    const rateOf = (value) => {
+      const rate = Math.round(Number(value));
+      return rate >= RATE_LEAST && rate <= RATE_MOST ? rate : null;
+    };
+    // Whether any of a recording's microphone tracks is still on (no iterator: this runs each chunk).
+    const onAir = (recording) => {
+      for (let i = 0; i < recording.tracks.length; i++) if (recording.tracks[i].readyState === "live") return true;
+      return false;
+    };
+
+    // Natter's own listener, taken off when the recording ends.
+    function hear(recording, target, type, listener) {
+      if (!target || typeof target.addEventListener !== "function") return;
+      try {
+        listen.call(target, type, listener);
+        recording.heard.push([target, type, listener]);
+      } catch (_) { /* not an EventTarget: not heard */ }
+    }
+
+    function hearTrack(recording, track) {
+      recording.tracks.push(track);
+      hear(recording, track, "mute", () => recording.muted++);
+      hear(recording, track, "unmute", () => recording.unmuted++);
+      hear(recording, track, "ended", () => recording.ended++);
+    }
+
+    function watchRecording(node, stream) {
+      if (typeof listen !== "function" || typeof unlisten !== "function") return;
+      let tracks;
+      try { tracks = [...stream.getTracks()]; } catch (_) { return; }
+      const current = recordings.get(node);
+      if (current && onAir(current)) {  // one more microphone into the recording under way
+        for (const track of tracks) if (!current.tracks.includes(track)) hearTrack(current, track);
+        return;
+      }
+      // One whose microphones have stopped, its end not seen yet (no chunk or look since): this is
+      // the next one.
+      if (current) finish(current, "stopped");
+      const context = node.context;
+      const rate = context ? rateOf(context.sampleRate) : null;
+      const size = Number(node.bufferSize);
+      if (recordingLines >= RECORDING_LINES || !rate || !RECORDING_SIZES.includes(size) || !tracks.length) return;
+      let microphone = null;
+      for (const track of tracks) {
+        try { microphone = microphone || rateOf(track.getSettings().sampleRate); } catch (_) { /* not said */ }
+      }
+      const chunk = size / rate;
+      const after = Math.min(Math.ceil(RECORDING_AFTER_MS / 1000 / chunk), RECORDING_AFTER_MOST);
+      const began = performance.now();
+      const recording = {
+        node, context, tracks: [], size, rate, microphone, chunk, began, path: shims.has(node) ? "worklet" : "native",
+        // first, last: the first and last chunk's playbackTime; firstAt, lastAt: when they ran;
+        // onAt: the last look that found the microphone on and the recorder still recording;
+        // offsets: the latest chunks' playbackTime less a chunk for each before it, those still to
+        // be judged and those after them; base: the earliest of the first chunk's and those after it
+        chunks: 0, first: 0, last: 0, firstAt: 0, lastAt: 0, onAt: began, after, offsets: new Float64Array(after + 1),
+        base: 0, longest: 0, late: 0, behind: 0, lost: 0, muted: 0, unmuted: 0, ended: 0, suspended: 0, rested: 0,
+        heard: [],
+      };
+      recordings.set(node, recording);
+      for (const track of tracks) hearTrack(recording, track);
+      hear(recording, node, "audioprocess", (event) => handedOver(recording, event));
+      hear(recording, context, "statechange", () => {
+        const state = context.state;
+        if (state === "closed") finish(recording, "closed");
+        else if (state === "suspended" || state === "interrupted") {
+          recording.suspended++;
+          if (rested.has(context)) recording.rested++;
+        }
+      });
+      if (!recordingTimer) recordingTimer = setInterval(lookAtRecordings, RECORDING_LOOK_MS);
+    }
+
+    // A chunk handed to the page. Each chunk: a few numbers, nothing kept.
+    function handedOver(recording, event) {
+      const now = performance.now();
+      if (!onAir(recording) || now - recording.began >= RECORDING_MOST_MS) {
+        finish(recording, onAir(recording) ? "long" : "stopped");
+        return;
+      }
+      const time = Number(event.playbackTime) || 0;
+      const count = recording.chunks;
+      const offsets = recording.offsets;
+      offsets[count % offsets.length] = time - count * recording.chunk;
+      if (recording.path === "worklet") {
+        const late = (Number(recording.context.currentTime) || 0) - (time - recording.chunk);
+        recording.late = Math.max(recording.late, late);
+        if (late >= recording.chunk + QUANTUM / recording.rate) recording.behind++;  // late, but whole
+      }
+      if (count) {
+        recording.longest = Math.max(recording.longest, now - recording.lastAt);
+      } else {
+        recording.first = time;
+        recording.firstAt = now;
+      }
+      if (count >= recording.after) judge(recording, count - recording.after, count);
+      recording.chunks++;
+      recording.last = time;
+      recording.lastAt = now;
+    }
+
+    // How late chunk `k` was handed over: past the earliest of it and those after it, up to chunk
+    // `newest`. A chunk and a QUANTUM late or more, its buffer was being filled again: what was
+    // written into it by then, a chunk at most, is lost. (Natter's worklet's chunks: only where
+    // the offsets start from, for the sound not gathered; how late each came is measured as it comes.)
+    function judge(recording, k, newest) {
+      const offsets = recording.offsets;
+      let earliest = Infinity;
+      for (let i = k; i <= newest; i++) earliest = Math.min(earliest, offsets[i % offsets.length]);
+      if (!k) recording.base = earliest;
+      if (recording.path === "worklet") return;
+      const late = offsets[k % offsets.length] - earliest;
+      const chunk = recording.chunk;
+      recording.late = Math.max(recording.late, late);
+      if (late >= chunk + QUANTUM / recording.rate) {
+        recording.behind++;
+        recording.lost += Math.min(late - chunk, chunk);
+      }
+    }
+
+    // Each recording's end, or while it runs on, the wait since its last chunk (a clock that stops
+    // for good hands over none after it) and that its microphone was on.
+    function lookAtRecordings() {
+      const now = performance.now();
+      for (const recording of [...recordings.values()]) {
+        const out = outputs.get(recording.node);
+        if (recording.context.state === "closed") finish(recording, "closed");
+        else if (!onAir(recording)) finish(recording, "stopped");
+        else if (recording.chunks && !(out && out.size)) finish(recording, "disconnected");
+        else {
+          if (recording.chunks) recording.longest = Math.max(recording.longest, now - recording.lastAt);
+          recording.onAt = now;
+          if (now - recording.began >= RECORDING_MOST_MS) finish(recording, "long");
+        }
+      }
+    }
+
+    // `end`: what ended it: "stopped" (its microphone), "disconnected" (the recorder), "closed" (its
+    // context) or "long" (RECORDING_MOST_MS of it).
+    function finish(recording, end) {
+      if (recordings.get(recording.node) !== recording) return;
+      recordings.delete(recording.node);
+      for (const [target, type, listener] of recording.heard) {
+        try { unlisten.call(target, type, listener); } catch (_) { /* gone with it */ }
+      }
+      if (!recordings.size) {
+        clearInterval(recordingTimer);
+        recordingTimer = 0;
+      }
+      const chunks = recording.chunks;
+      for (let k = Math.max(0, chunks - recording.after); k < chunks; k++) judge(recording, k, chunks - 1);
+      const chunk = recording.chunk * 1000;
+      // From the first chunk to the last one's end, or to the last look that found the microphone
+      // on where that's later; with no chunk, from the start to then (or to now, while it's on).
+      const lasted = chunks ? Math.max(recording.lastAt + chunk, recording.onAt) - recording.firstAt
+        : (onAir(recording) ? performance.now() : recording.onAt) - recording.began;
+      const clock = chunks ? (recording.last - recording.first) * 1000 + chunk : 0;
+      const offsets = recording.offsets;
+      const skipped = chunks ? (offsets[(chunks - 1) % offsets.length] - recording.base) * 1000 : 0;
+      if (recordingLines >= RECORDING_LINES || (!chunks && lasted < RECORDING_EMPTY_MS)) return;
+      const rough = !chunks || recording.behind > 0 || skipped >= chunk
+        || recording.longest >= 2 * chunk + QUANTUM / recording.rate * 1000
+        || lasted - clock > 2 * chunk + lasted / 100 || recording.muted > 0 || recording.ended > 0
+        || recording.suspended > 0;
+      if (recordingLines > 0 && !rough) return;
+      recordingLines++;
+      post({
+        type: "media", what: "recording", path: recording.path, size: recording.size, rate: recording.rate,
+        microphone: recording.microphone,
+        chunks: counted(chunks), recorded: counted(chunks * chunk), clock: counted(clock), lasted: counted(lasted),
+        longest: counted(recording.longest), late: counted(recording.late * 1000), behind: counted(recording.behind),
+        lost: counted(recording.lost * 1000), skipped: counted(skipped), muted: counted(recording.muted),
+        unmuted: counted(recording.unmuted),
+        ended: counted(recording.ended), suspended: counted(recording.suspended), rested: counted(recording.rested),
+        end,
+      });
+    }
+    onRecorderFed = watchRecording;
+
+    // Which script processor the page got, Natter's worklet recorder or WebKit's own, and why, once a
+    // page for each: the worklet's module loaded (and from which kind of URL), its context made while no
+    // spare was ready or with other options (and not rested since), still loading, failed to load into
+    // it (the error's name), refused (both kinds, by the page's policy or after failing again and again;
+    // the last error's name), no AudioWorklet here, too many contexts with it, a shape it doesn't take,
+    // or its node failed to be made (the error's name); or the worklet broke; and the module loaded
+    // into a rested context the page resumed meanwhile ("restarted": its output likely was).
+    onRecorderPath = (path, why, module, name) => {
+      tellMedia({ what: "recorder", path, why, module, name }, `recorder ${path} ${why} ${module} ${name}`);
+    };
+
     onWakeFailed = (error) => {
       const name = errorName(error);
       tellMedia({ what: "wake", name }, `wake ${name}`);
