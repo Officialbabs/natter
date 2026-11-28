@@ -211,7 +211,11 @@ FEATURES_OFF = ("ProcessSwapOnCrossSiteNavigation", "UsesBackForwardCache", "Spe
                 # WhatsApp's service worker passes every download through itself, and in WebKitGTK
                 # some arrive damaged: emoji sprite sheets drew as slivers, blanks and magnified
                 # squares. Without it they draw whole; it's only there for offline caching.
-                "ServiceWorkers")
+                "ServiceWorkers",
+                # WhatsApp Web doesn't use 3D WebGL, and retaining old scroll tile cohorts or
+                # GPU-backed 2D canvas surfaces inflates Intel i915 shmem buffers by hundreds of MB.
+                "TemporaryTileCohortRetention", "WebGL", "WebGLDraftExtensions",
+                "CanvasUsesAcceleratedDrawing")
 
 
 # NATTER_FEATURES_ON / NATTER_FEATURES_OFF (comma-separated identifiers) are for experiments.
@@ -802,6 +806,9 @@ class Account(GObject.Object):
              enable_encrypted_media=False,
              enable_back_forward_navigation_gestures=False,
              enable_page_cache=False,
+             enable_webgl=False,
+             enable_dns_prefetching=False,
+             enable_offline_web_application_cache=False,
              enable_smooth_scrolling=True,
              enable_spatial_navigation=False,
              enable_write_console_messages_to_stdout=bool(GLib.getenv("NATTER_DEBUG")),

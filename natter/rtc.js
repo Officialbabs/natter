@@ -1130,6 +1130,20 @@
     install("VideoEncoder", VideoEncoder);
   }
 
+  // ---- Concurrency cap ------------------------------------------------------------------------
+  // WhatsApp sizes its WebAssembly worker pool from navigator.hardwareConcurrency: on a 12-thread
+  // laptop it starts 24 workers at page load (even before any call), inflating memory and threads.
+  // Capping to 4 keeps E2EE, voice messages and calls smooth while cutting idle worker overhead.
+  try {
+    if (typeof navigator.hardwareConcurrency === "number" && navigator.hardwareConcurrency > 4) {
+      Object.defineProperty(Navigator.prototype, "hardwareConcurrency", {
+        get() { return 4; },
+        configurable: true,
+        enumerable: true,
+      });
+    }
+  } catch {}
+
   // ---- Workers ----------------------------------------------------------------------------------
   // Only counted: how many the page starts, and how many of those are alive. One is ended by
   // terminate(), or once its Worker is collected (WebKit then ends its thread). One that closes

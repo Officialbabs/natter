@@ -37,6 +37,11 @@ from .system import NO_SYSTEM_BUS, SYSTEM_BUS
 
 AGAIN = 30.0  # seconds before the same level is answered again
 CRITICAL = int(Gio.MemoryMonitorWarningLevel.CRITICAL)
+ADA_LEVELS = {
+    "moderate": int(Gio.MemoryMonitorWarningLevel.LOW),
+    "low": int(Gio.MemoryMonitorWarningLevel.MEDIUM),
+    "critical": CRITICAL,
+}
 
 
 def level_name(level: int) -> str:
@@ -92,6 +97,29 @@ def default_monitor() -> GObject.Object:
     return Gio.MemoryMonitor.dup_default()
 
 
+class AdaMemoryMonitor:
+    """Ada's early memory level on the session bus (org.ada.MemoryLevel Changed(s)): lets Natter
+    trim caches calmly on moderate/low/critical before the kernel hits swap."""
+
+    def __init__(self, on_level: Callable[[int], None], bus: Optional[Gio.DBusConnection] = None) -> None:
+        self._on_level = on_level
+        self._bus = bus or Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self._subscription = self._bus.signal_subscribe(
+            "org.ada.MemoryLevel", "org.ada.MemoryLevel", "Changed",
+            "/org/ada/MemoryLevel", None, Gio.DBusSignalFlags.NONE, self._heard)
+
+    def _heard(self, _bus, _sender, _path, _interface, _signal, parameters) -> None:
+        name = str(parameters.unpack()[0]).lower()
+        mapped = ADA_LEVELS.get(name)
+        if mapped is not None:
+            self._on_level(mapped)
+
+    def close(self) -> None:
+        if self._subscription:
+            self._bus.signal_unsubscribe(self._subscription)
+            self._subscription = 0
+
+
 class LowMemory:
     """Answers the warnings: `managers()` gives the pages' WebsiteDataManagers as they are now,
     `own()` drops Natter's own caches and says what went (critical only). `sizes()` (the pages,
@@ -111,17 +139,51 @@ class LowMemory:
         self._clearing: Optional[float] = None  # when the clear under way began
         self._monitor: Optional[GObject.Object] = None
         self._handler = 0
+        self._ada_monitor: Optional[AdaMemoryMonitor] = None
 
     def start(self, monitor: Optional[GObject.Object] = None) -> None:
         self._monitor = monitor or default_monitor()
         self._handler = self._monitor.connect("low-memory-warning", lambda _monitor, level: self.warned(level))
+        if monitor is None:
+            try:
+                self._ada_monitor = AdaMemoryMonitor(self.warned)
+            except Exception:
+                self._ada_monitor = None
 
     def stop(self) -> None:
         if self._monitor is not None and self._handler:
             self._monitor.disconnect(self._handler)
         if isinstance(self._monitor, PortalMonitor):
             self._monitor.close()
-        self._monitor, self._handler = None, 0
+        if self._ada_monitor is not None:
+            self._ada_monitor.close()
+        self._monitor, self._handler, self._ada_monitor = None, 0, None
+
+    def clear_hidden(self) -> bool:
+        """Clear decoded MEMORY_CACHE and trim Python/malloc when the window is hidden. Never
+        touches cookies, IndexedDB, local storage or the disk cache."""
+        now = self.clock()
+        self.trim()
+        if self._clearing is not None and now - self._clearing < AGAIN:
+            return False
+        managers = list(self.managers())
+        if not managers:
+            return False
+        self._clearing = now
+        waiting = [len(managers)]
+
+        def cleared(manager, result) -> None:
+            try:
+                manager.clear_finish(result)
+            except GLib.Error:
+                pass
+            waiting[0] -= 1
+            if not waiting[0]:
+                self._clearing = None
+
+        for manager in managers:
+            manager.clear(WebKit.WebsiteDataTypes.MEMORY_CACHE, 0, None, cleared)
+        return True
 
     def warned(self, level) -> bool:
         """A warning at `level`: the caches go, unless this level was answered within AGAIN.

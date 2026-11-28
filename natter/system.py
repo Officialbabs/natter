@@ -68,6 +68,51 @@ SYSTEM_BUS = "DBUS_SYSTEM_BUS_ADDRESS"
 NO_SYSTEM_BUS = "unix:path=/dev/null/natter-has-no-system-bus"
 _system_bus_before: Optional[tuple[Optional[str]]] = None  # (the address it had,) once hidden
 
+# WebKit / JavaScriptCore / Skia memory defaults for Natter's web processes:
+# - JSC_forceMiniVMMode: tighter GC heap growth (~29% smaller RssAnon in A/B lab, same feel)
+# - JSC_freeRetiredWasmCode: release retired WebAssembly JIT code (WhatsApp E2EE / call engine)
+# - JSC compiler/GC thread caps + MALLOC_ARENA_MAX=2: fewer idle threads and allocator arenas
+# - WEBKIT_SKIA_ENABLE_CPU_RENDERING: keeps hardware compositing/video on, while stopping Skia's
+#   GPU resource cache from accumulating ~0.8-1.1 GB of non-purgeable i915 shmem buffers
+# Set NATTER_MEMORY_TUNE=0 to skip all of these, or override any variable individually.
+MEMORY_TUNE_SWITCH = "NATTER_MEMORY_TUNE"
+WEBKIT_MEMORY_ENV: dict[str, str] = {
+    "JSC_forceMiniVMMode": "1",
+    "JSC_freeRetiredWasmCode": "1",
+    "JSC_numberOfDFGCompilerThreads": "1",
+    "JSC_numberOfFTLCompilerThreads": "1",
+    "JSC_numberOfGCMarkers": "2",
+    "MALLOC_ARENA_MAX": "2",
+    "WEBKIT_SKIA_ENABLE_CPU_RENDERING": "1",
+    "WEBKIT_SKIA_CPU_PAINTING_THREADS": "2",
+}
+_webkit_memory_added: set[str] = set()
+
+
+def tune_webkit_memory(environ=None) -> dict[str, str]:
+    """Apply WebKit/JSC/Skia memory defaults before any web process starts. Never overrides
+    variables the caller already set, and does nothing when NATTER_MEMORY_TUNE=0."""
+    environ = os.environ if environ is None else environ
+    if environ.get(MEMORY_TUNE_SWITCH) == "0":
+        return {}
+    added: dict[str, str] = {}
+    for key, value in WEBKIT_MEMORY_ENV.items():
+        if key not in environ:
+            environ[key] = value
+            added[key] = value
+            if environ is os.environ:
+                _webkit_memory_added.add(key)
+    return added
+
+
+def restore_webkit_memory_env(target) -> None:
+    """Strip WebKit memory env vars Natter added itself from external programs Natter launches."""
+    for key in tuple(_webkit_memory_added):
+        if isinstance(target, dict):
+            target.pop(key, None)
+        else:
+            target.unsetenv(key)
+
 
 def hide_system_bus(environ=None, sandboxed: Optional[bool] = None) -> bool:
     """Hide the system bus from Natter and what it starts. Call it before anything connects to
@@ -89,6 +134,7 @@ def give_system_bus(launcher) -> None:
     from .gstfix import launch_env
 
     launch_env(launcher)
+    restore_webkit_memory_env(launcher)
     if _system_bus_before is None:
         return
     address = _system_bus_before[0]
@@ -109,6 +155,7 @@ def program_environ(environ=None) -> dict[str, str]:
     environ = os.environ if environ is None else environ
     changed = dict(environ)
     launch_env(changed, environ)
+    restore_webkit_memory_env(changed)
     if _system_bus_before is not None:
         address = _system_bus_before[0]
         if address is None:

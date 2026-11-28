@@ -24,6 +24,27 @@ shows only as the unit's `shmem`. The guard (below) counts them, read from the p
 `fdinfo`, as they are charged to Natter Den's unit and swapped like the rest; the log's step lines
 and `tools/compare-memory.py` report them.
 
+## WebKit, JSC and Skia memory defaults
+
+Before WebKit starts any web process, Natter Den sets tighter runtime defaults (`natter/system.py`,
+`tune_webkit_memory`; set `NATTER_MEMORY_TUNE=0` to disable, or override any variable individually):
+
+- **JavaScriptCore & allocator:** `JSC_forceMiniVMMode=1` (tighter heap growth; ~29% smaller
+  anonymous heap in lab tests at virtually the same speed), `JSC_freeRetiredWasmCode=1`,
+  compiler/GC thread caps (`JSC_numberOfDFGCompilerThreads=1`, `JSC_numberOfFTLCompilerThreads=1`,
+  `JSC_numberOfGCMarkers=2`), and `MALLOC_ARENA_MAX=2`.
+- **Skia CPU tile painting:** `WEBKIT_SKIA_ENABLE_CPU_RENDERING=1` and
+  `WEBKIT_SKIA_CPU_PAINTING_THREADS=2`, plus disabling unused `TemporaryTileCohortRetention`,
+  `CanvasUsesAcceleratedDrawing`, `WebGL`, `WebGLDraftExtensions`, DNS prefetching and the legacy
+  offline application cache (`natter/account.py`). Hardware compositing and video playback stay
+  enabled while preventing Skia's GPU resource cache from accumulating gigabytes of non-purgeable
+  Intel `i915` `shmem` buffers.
+- **Worker pool cap:** `natter/rtc.js` caps `navigator.hardwareConcurrency` at 4 so WhatsApp's
+  WebAssembly worker pool doesn't spawn 20+ workers at page load on high-core CPUs while keeping
+  E2EE, voice messages and calls smooth.
+- **External apps clean:** every variable Natter Den adds itself is stripped again in
+  `give_system_bus()` / `program_environ()` before launching links or external programs.
+
 ## Idle audio
 
 WhatsApp keeps a Web Audio context open, and in WebKitGTK an open context keeps a GStreamer pipeline

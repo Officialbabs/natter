@@ -49,7 +49,8 @@ from .settings import AUTOSTART, CACHE, CONFIG, DATA, Chat, ChatIndex, Settings,
 from .system import (AudioFollower, CallSound, LoopMeter, Reclaimer, footprint, give_system_bus, in_own_scope,
                      in_sandbox, limit_own_scope, limit_own_scope_async, media_report, memory_events,
                      memory_tight, move_to_own_scope_async,
-                     network_processes, open_uri, own_swap, pages_end_alone, request_background, unit_charge)
+                     network_processes, open_uri, own_swap, pages_end_alone, request_background,
+                     tune_webkit_memory, unit_charge)
 from .tray import MenuItem, Tray, tray_host_available
 from .update import Updates, dialog_for, in_a_call, loading, replies_dialog, unsent
 
@@ -1214,6 +1215,9 @@ class Natter(Adw.Application):
         return Adw.Application.do_dbus_register(self, connection, object_path)
 
     def _make_web_context(self, then: Optional[Callable[[], None]] = None) -> None:
+        # Apply tighter JSC/Skia/malloc memory defaults for WebKit's processes before any start
+        # (system.py; stripped again from external apps Natter opens; NATTER_MEMORY_TUNE=0 disables).
+        tune_webkit_memory()
         if self.calls_in_page:
             # WhatsApp's call engine runs threads that share memory (SharedArrayBuffer). WebKitGTK
             # marks WhatsApp's page cross-origin isolated, which is what makes sharing safe, but
@@ -2697,6 +2701,9 @@ class Natter(Adw.Application):
         # pushed out under it. What the Reclaimer puts in swap is never a reason for a fresh page.
         # With swap full already the Reclaimer doesn't start (system.py): nothing to say each time.
         if not self._fresh_pages_for_memory() and not self._reclaim_wait(time.monotonic()):
+            low = getattr(self, "low_memory", None)
+            if low is not None:
+                low.clear_hidden()
             self.reclaimer.start()
         self._reclaim_timer = GLib.timeout_add_seconds(RECLAIM_AGAIN, self._reclaim)
         return GLib.SOURCE_REMOVE
