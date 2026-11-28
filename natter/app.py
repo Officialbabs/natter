@@ -197,11 +197,12 @@ MEDIA_STOPPED = {"microphone": "Microphone turned off. WhatsApp can't hear you",
 WEBSITE = "https://github.com/Officialbabs/natter"
 # The About dialog's "What's New", for VERSION: the newest <release> in the metainfo says the same,
 # in the markup the dialog takes (<p>, <ul>, <li>, <em> and <code>).
-RELEASE_NOTES = ("<p>Voice notes record cleanly and play again after a pause.</p>"
+RELEASE_NOTES = ("<p>WhatsApp's page uses less memory.</p>"
                  "<ul>"
-                 "<li>A voice note no longer cracks while you record it when WhatsApp is busy: the microphone's sound is now gathered away from the page, so a busy moment only delays it</li>"
-                 "<li>A voice note you pause and play again no longer stays silent</li>"
-                 "<li>The log now notes how each voice recording and status video went, so a break can be traced</li>"
+                 "<li>WhatsApp's page starts with tighter memory settings for its JavaScript engine and its drawing, so it holds less memory and far fewer graphics buffers, at much the same speed</li>"
+                 "<li>Features WhatsApp doesn't use (3D graphics, GPU-drawn canvases, DNS prefetching, the old offline cache) are off</li>"
+                 "<li>While the window is hidden, the page lets go of its memory cache before it's moved to swap, and an early memory warning from the desktop is heeded too</li>"
+                 "<li>Programs opened from the app don't inherit these settings; NATTER_MEMORY_TUNE=0 turns them off</li>"
                  "</ul>")
 
 

@@ -81,6 +81,17 @@
   </content_rating>
 
   <releases>
+    <release version="0.1.17" date="2026-11-28">
+      <description>
+        <p>WhatsApp's page uses less memory.</p>
+        <ul>
+          <li>WhatsApp's page starts with tighter memory settings for its JavaScript engine and its drawing, so it holds less memory and far fewer graphics buffers, at much the same speed</li>
+          <li>Features WhatsApp doesn't use (3D graphics, GPU-drawn canvases, DNS prefetching, the old offline cache) are off</li>
+          <li>While the window is hidden, the page lets go of its memory cache before it's moved to swap, and an early memory warning from the desktop is heeded too</li>
+          <li>Programs opened from the app don't inherit these settings; NATTER_MEMORY_TUNE=0 turns them off</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.16" date="2026-11-22">
       <description>
         <p>Voice notes record cleanly and play again after a pause.</p>
